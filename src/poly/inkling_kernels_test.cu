@@ -2,7 +2,8 @@
 // the host in double precision, on random inputs of the model's shapes: the clips and tau, the short convolutions
 // (with and without the input-dependent taps, walked and parallel, and their state), the depth mix, the loop
 // controller, SiTU, and the attention over fp16 and Q8_0 caches, full and sliding-window (a ring), split, unsplit
-// and on the tensor cores, with and without a room past the call, for 1, 7 and more than 1,024 tokens; the calls
+// and on the tensor cores (Turing's kernel and, where it runs, attn_fa2_kernel, to the bit), with and without a
+// room past the call, for 1, 7 and more than 1,024 tokens; the calls
 // for a token of each of several sequences (Engine::step()'s rows) against a call for each row alone, to the bit;
 // and a visit's projections in one launch (native_mmvq_jobs()) and the cached experts' launches a warp a row
 // (MmvqSlots::lanes) against each matrix alone, to the bit.
@@ -407,6 +408,7 @@ void host_attend(const Cache& c, const std::vector<float>& q, const std::vector<
 // keep 2e-5.
 constexpr double kMmaRoom = 7.5e-3;
 bool mma_card = false;   // a card of Turing or newer: calls of kInklingMmaRows or more take the tensor cores
+bool fa2_card = true;    // attn_fa2_kernel runs here (InklingMma::fa2; until a call says not): held to Turing's bits
 
 // Inputs that make every path's weights exact (no sinks): mean, q = 0 and R = 0, so each visible key weighs 1 and a
 // token's result is the mean of their values; edge, q = 0, a table of zeros but for a column of row extent - 1 that
@@ -461,10 +463,27 @@ void test_attend(const AttnCase& tc, const std::vector<float>& rand_table, float
         InklingRel rel{dr, dtable, kRel, kExtent};
         const Kvq8 kq = tc.q8 ? Kvq8{c.kc, c.ks} : Kvq8{}, vq = tc.q8 ? Kvq8{c.vc, c.vs} : Kvq8{};
         const float scale = 1.f / std::sqrt((float) kDim);
-        inkling_attend(dq, c.k, c.v, kq, vq, rel, tc.sinks ? ds : nullptr, pos, rows, dout, kDim, kHeads, kKv, scale,
-                       tc.window, tc.ring, work, work_n, nullptr, tc.room ? pos + rows + 517 : 0);
-        ck(cudaGetLastError(), "attend");
+        const auto attend = [&](float* out, InklingMma mma) {
+            inkling_attend(dq, c.k, c.v, kq, vq, rel, tc.sinks ? ds : nullptr, pos, rows, out, kDim, kHeads, kKv,
+                           scale, tc.window, tc.ring, work, work_n, nullptr, tc.room ? pos + rows + 517 : 0, mma);
+            ck(cudaGetLastError(), "attend");
+        };
+        attend(dout, InklingMma::best);
         auto got = down(dout, q.size());
+        std::string tiers;   // the tensor-core path: both kernels, to the bit
+        if (mma_card && fa2_card && rows >= kInklingMmaRows) try {
+            attend(dout, InklingMma::fa2);
+            const auto b = down(dout, q.size());
+            attend(dout, InklingMma::turing);
+            const auto a = down(dout, q.size());
+            size_t diff = 0;
+            for (size_t i = 0; i < a.size(); ++i) diff += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+            if (diff) ++failures;
+            tiers = ", fa2 vs Turing's kernel " + std::to_string(diff) + " values differ" + (diff ? " FAIL" : "");
+        } catch (const std::invalid_argument&) {
+            std::printf("attn_fa2_kernel does not run on this card: Turing's kernel only\n");
+            fa2_card = false;
+        }
         std::vector<int> toks;
         for (int t = 0; t < rows; ++t) {
             const long long p = pos + t;
@@ -480,7 +499,7 @@ void test_attend(const AttnCase& tc, const std::vector<float>& rand_table, float
                       sel.begin() + i * kHeads * kDim);
         }
         const std::string name = std::string(tc.name) + ": pos " + std::to_string(pos) + " rows " +
-                                 std::to_string(rows) + " (" + std::to_string(toks.size()) + " checked)";
+                                 std::to_string(rows) + " (" + std::to_string(toks.size()) + " checked)" + tiers;
         double top = 1.0;
         for (double x : ref) top = std::max(top, std::fabs(x));
         compare(name.c_str(), sel, ref, probe ? 1e-5 : mma_card && rows >= kInklingMmaRows ? kMmaRoom * top : 2e-5);
@@ -536,7 +555,7 @@ void test_attend_alone(const std::vector<float>& table, float* dtable) {
 
 // The tensor-core path: a token's result the same, to the bit, in calls that start at other tokens (other blocks
 // and other rows of a block).
-void test_attend_mma_alone(const std::vector<float>& table, float* dtable, bool q8) {
+void test_attend_mma_alone(const std::vector<float>& table, float* dtable, bool q8, InklingMma mma) {
     const int ctx = 3000, rows = 130, shift = 23, window = 1024, ring = window + 2048;
     for (int w : {0, window}) {
         Cache c;
@@ -554,15 +573,17 @@ void test_attend_mma_alone(const std::vector<float>& table, float* dtable, bool 
         const Kvq8 kq = q8 ? Kvq8{c.kc, c.ks} : Kvq8{}, vq = q8 ? Kvq8{c.vc, c.vs} : Kvq8{};
         const float scale = 1.f / std::sqrt((float) kDim);
         inkling_attend(dq, c.k, c.v, kq, vq, {dr, dtable, kRel, kExtent}, ds, ctx, rows, o1, kDim, kHeads, kKv, scale,
-                       w, w ? ring : 0, nullptr, 0, nullptr);
+                       w, w ? ring : 0, nullptr, 0, nullptr, 0, mma);
         const size_t off = size_t(shift) * kHeads;
         inkling_attend(dq + off * kDim, c.k, c.v, kq, vq, {dr + off * kRel, dtable, kRel, kExtent}, ds + off,
-                       ctx + shift, rows - shift, o2, kDim, kHeads, kKv, scale, w, w ? ring : 0, nullptr, 0, nullptr);
+                       ctx + shift, rows - shift, o2, kDim, kHeads, kKv, scale, w, w ? ring : 0, nullptr, 0, nullptr, 0,
+                       mma);
         auto a = down(o1, q.size()), b = down(o2, q.size() - off * kDim);
         size_t diff = 0;
         for (size_t i = 0; i < b.size(); ++i) diff += a[off * kDim + i] != b[i];
-        const std::string name = std::string("attend tensor cores, ") + (q8 ? "q8_0" : "fp16") + ", " +
-                                 std::to_string(rows - shift) + " tokens in 2 calls (" + (w ? "window" : "full") + ")";
+        const std::string name = std::string("attend tensor cores") + (mma == InklingMma::fa2 ? " (fa2), " : ", ") +
+                                 (q8 ? "q8_0" : "fp16") + ", " + std::to_string(rows - shift) + " tokens in 2 calls (" +
+                                 (w ? "window" : "full") + ")";
         std::printf("%-58s %zu of %zu values differ  %s\n", name.c_str(), diff, b.size(), diff ? "FAIL" : "ok");
         if (diff) ++failures;
         cudaFree(dk), cudaFree(dv), cudaFree(dq), cudaFree(dr), cudaFree(ds), cudaFree(o1), cudaFree(o2);
@@ -634,6 +655,63 @@ void bench_attend(const std::vector<float>& table, float* dtable) {
     });
     ck(cudaDeviceSynchronize(), "bench");
     cudaFree(dk), cudaFree(kc), cudaFree(vc), cudaFree(dq), cudaFree(dr), cudaFree(ds), cudaFree(out), cudaFree(work);
+}
+
+// Timings (with `bench`): a prompt batch's attention on the tensor cores, each kernel, a 32K context (the engine's
+// calls: 1,024 tokens; 4,096 for a longer batch), in TFLOPS of the products the keys a token sees take.
+void bench_attend_tiers(const std::vector<float>& table, float* dtable) {
+    const int ctx = 32768, window = 1024;
+    auto k = randv(size_t(ctx) * kKv * kDim, 1.0f);
+    float* dk = up(k);
+    Cache f16, q8;
+    f16.alloc(ctx, false), q8.alloc(ctx, true);
+    for (int p = 0; p < ctx; p += 4096) f16.store(dk + size_t(p) * kKv * kDim, dk + size_t(p) * kKv * kDim, p, 4096, 0);
+    for (int p = 0; p < ctx; p += 4096) q8.store(dk + size_t(p) * kKv * kDim, dk + size_t(p) * kKv * kDim, p, 4096, 0);
+    const int most = 4096;
+    auto q = randv(size_t(most) * kHeads * kDim, 1.0f), r = randv(size_t(most) * kHeads * kRel, 1.0f),
+         s = randv(size_t(most) * kHeads, 1.0f);
+    float *dq = up(q), *dr = up(r), *ds = up(s), *out = nullptr;
+    ck(cudaMalloc(&out, q.size() * 4), "malloc");
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0), cudaEventCreate(&e1);
+    const float sc = 1.f / std::sqrt((float) kDim);
+    const InklingRel rel{dr, dtable, kRel, kExtent};
+    for (bool quant : {true, false})
+        for (int w : {0, window})
+            for (int rows : {4096, 1024}) {
+                const long long pos = ctx - rows;
+                double flop = 0;
+                for (int t = 0; t < rows; ++t)
+                    flop += 4.0 * kDim * kHeads * (w ? std::min<long long>(w, pos + t + 1) : pos + t + 1);
+                const Cache& c = quant ? q8 : f16;
+                const Kvq8 kq = quant ? Kvq8{c.kc, c.ks} : Kvq8{}, vq = quant ? Kvq8{c.vc, c.vs} : Kvq8{};
+                for (InklingMma mma : {InklingMma::turing, InklingMma::fa2, InklingMma::best}) {
+                    if (mma == InklingMma::fa2 && !fa2_card) continue;
+                    const auto f = [&] {
+                        inkling_attend(dq, c.k, c.v, kq, vq, rel, ds, pos, rows, out, kDim, kHeads, kKv, sc, w, 0,
+                                       nullptr, 0, nullptr, 0, mma);
+                    };
+                    f();
+                    const int reps = rows == 4096 ? 5 : 20;
+                    cudaEventRecord(e0);
+                    for (int i = 0; i < reps; ++i) f();
+                    cudaEventRecord(e1);
+                    cudaEventSynchronize(e1);
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    ms /= reps;
+                    const std::string what = std::string("prompt ") + std::to_string(rows) + " tokens at " +
+                                             std::to_string(pos) + ", " + (w ? "window 1024" : "full layer") + ", " +
+                                             (quant ? "q8_0" : "fp16") + ", " +
+                                             (mma == InklingMma::turing ? "Turing's kernel"
+                                              : mma == InklingMma::fa2  ? "fa2"
+                                                                        : "the path's choice");
+                    std::printf("bench %-74s %9.3f ms %6.1f TFLOPS\n", what.c_str(), ms, flop / ms * 1e-9);
+                }
+            }
+    ck(cudaDeviceSynchronize(), "bench");
+    f16.free_(), q8.free_();
+    cudaFree(dk), cudaFree(dq), cudaFree(dr), cudaFree(ds), cudaFree(out);
 }
 
 // ---- the fused decode steps ---------------------------------------------------------------------------------------
@@ -1467,6 +1545,11 @@ int main(int argc, char** argv) {
         {"attend swa fp16 mma ring wrap", 1024, 1024 + 300, false, {900, 300, 301, 64, 299}, true, false, true, 5},
         {"attend swa q8_0 mma ring wrap", 1024, 1024 + 512, true, {1000, 512, 100, 512, 77}, true, false, true, 5},
         {"attend swa q8_0 mma, no sinks", 1024, 1024 + 2048, true, {2048, 70}, false, false, false, 9},
+        // and about the edges of attn_fa2_kernel's blocks of 85 tokens (42 with 4 warps)
+        {"attend full fp16 mma, blocks of 42 and 85", 0, 0, false, {41, 42, 43, 84, 85, 86, 170, 171}, false, false,
+         true, 1},
+        {"attend swa q8_0 mma ring, blocks of 42 and 85", 1024, 1024 + 400, true, {900, 85, 86, 170, 341}, false,
+         false, true, 3},
         {"attend full fp16 mma probe, mean", 0, 0, false, {1000, 100}, false, false, false, 3, Probe::mean},
         {"attend swa fp16 mma probe, mean, ring wrap", 1024, 1024 + 300, false, {1200, 300}, false, false, false, 3,
          Probe::mean},
@@ -1476,8 +1559,9 @@ int main(int argc, char** argv) {
     };
     for (const AttnCase& tc : cases) test_attend(tc, table, dtable);
     test_attend_alone(table, dtable);
-    test_attend_mma_alone(table, dtable, false);
-    test_attend_mma_alone(table, dtable, true);
+    for (InklingMma mma : {InklingMma::best, InklingMma::fa2})
+        if (mma == InklingMma::best || fa2_card)
+            for (bool q8 : {false, true}) test_attend_mma_alone(table, dtable, q8, mma);
 
     for (int rows : {1, 4, 9, kInklingSeqRows}) test_clip_many_seqs(rows);
     for (bool acc : {false, true})
@@ -1546,7 +1630,7 @@ int main(int argc, char** argv) {
     test_slots_lanes(13, "Q5_K", 1280, 512, 3);
     test_slots_lanes(14, "Q6_K", 2304, 1152, 3);
     test_slots_lanes(23, "IQ4_XS", 1536, 2301, 8);
-    if (bench) bench_attend(table, dtable), bench_decode(table, dtable);
+    if (bench) bench_attend(table, dtable), bench_attend_tiers(table, dtable), bench_decode(table, dtable);
     cudaFree(dtable);
 
     ck(cudaDeviceSynchronize(), "final");

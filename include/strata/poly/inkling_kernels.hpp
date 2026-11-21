@@ -178,12 +178,16 @@ inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 ///    batch.  One block walks all the keys of 21 tokens of a group; the queries, R, the softmax's weights and the bias
 ///    table's rows are rounded to halves, the caches' values too (a Q8_0 code times its scale), and the products sum
 ///    floats (llama.cpp's flash attention rounds Q, P and V the same way); the bias stays a float.  A token's result
-///    does not depend on the tokens beside it in the call.
+///    does not depend on the tokens beside it in the call.  On an A100 (sm_80) blocks of 42 tokens take each key
+///    and value to twice the rows and copy the next keys in while they work, to the same bits; `mma` =
+///    InklingMma::turing or ::fa2 asks for one kernel or the other on any card of the path (a test, to compare them;
+///    ::fa2 throws std::invalid_argument on a card without the shared memory, 96 KB a block).
 /// Throws std::runtime_error on a launch error.
+enum class InklingMma { best, turing, fa2 };
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room = 0);
+                    int64_t room = 0, InklingMma mma = InklingMma::best);
 
 // ---- short convolutions --------------------------------------------------------------------------------------
 

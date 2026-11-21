@@ -1,6 +1,7 @@
 // src/poly/kernels_inkling.cu - Inkling 2 Mini's kernels; see include/strata/poly/inkling_kernels.hpp for the math
 // and where it comes from.  Plain float arithmetic throughout, the caches' halves (or Q8_0 codes) the only rounding,
-// but for the prompt batches' attention on the tensor cores (attn_mma_kernel), whose products take halves.
+// but for the prompt batches' attention on the tensor cores (attn_mma_kernel, attn_fa2_kernel), whose products take
+// halves.
 #include "strata/poly/inkling_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -710,6 +711,406 @@ bool mma_attention() {
 #endif
 }
 
+// ---- attention on the tensor cores, cards that sum fp16 products into floats at full rate -----------------------
+
+// attn_fa2_kernel's shape: W warps of 32 query rows (two m16 tiles that share each key and value fragment), row r
+// of the block token r / 3 and head r % 3 of the group (fa_tokens(W) tokens; the last row or two unused), keys
+// MMA_KEYS at a time, the next tile copied in while the warps work on this one.
+__host__ __device__ constexpr int fa_tokens(int w) { return 32 * w / AT_PER; }
+// the block's distances a tile
+__host__ __device__ constexpr int fa_slice(int w) { return 16 * (2 * w - 1) / AT_PER + MMA_BIAS; }
+constexpr int FA_QROW = AT_DIM + 8;                                               // a query row, halves
+
+// A tile's keys or values in shared memory: S stages of halves (2: the next tile comes in while the warps work on
+// this one), or for a Q8_0 cache S stages of codes and scales and the halves of the one being read.
+template <int S, bool Q8>
+struct FaTile {
+    half h[S][MMA_KEYS][MMA_KROW];
+};
+template <int S>
+struct FaTile<S, true> {
+    half h[1][MMA_KEYS][MMA_KROW];
+    int8_t c[S][MMA_KEYS][AT_DIM];
+    uint16_t d[S][MMA_KEYS][AT_DIM / 32];
+};
+template <int W, int S, bool KQ8, bool VQ8>
+struct __align__(16) FaSmem {
+    FaTile<S, KQ8> k;
+    FaTile<S, VQ8> v;
+    half q[32 * W][FA_QROW];          // the rows' queries, in log2 units
+    half r[32 * W][MMA_TROW];         // the rows' R, in log2 units
+    float slice[S][fa_slice(W)][16];  // the table's rows of the tile's distances, as stored
+    float bias[W][16][MMA_BIAS];      // an m16 tile's rows times its distances
+};
+
+#if INKLING_MMA
+// cp.async from Ampere on, zeros where !fill; a plain copy before (a test's only: the host takes attn_fa2_kernel
+// only on the cards fa2_attention() names)
+__device__ __forceinline__ void copy16(void* dst, const void* src, bool fill) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src), "r"(fill ? 16 : 0) : "memory");
+#else
+    *reinterpret_cast<uint4*>(dst) = fill ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+#endif
+}
+
+__device__ __forceinline__ void copy8(void* dst, const void* src, bool fill) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n"
+                 ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src), "r"(fill ? 8 : 0) : "memory");
+#else
+    *reinterpret_cast<uint2*>(dst) = fill ? *reinterpret_cast<const uint2*>(src) : make_uint2(0, 0);
+#endif
+}
+
+__device__ __forceinline__ void copy_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_all;\n" ::: "memory");
+#endif
+}
+
+// The keys or values of positions k0.. into stage st, zeros outside [lo, hi) (their cache rows may be anything)
+template <int W, int S, bool Q8>
+__device__ __forceinline__ void fa_load(FaTile<S, Q8>& t, int st, const half* f16, const Kvq8& q8, const AttnArgs& a,
+                                        int g, long long k0, long long lo, long long hi) {
+    constexpr int PER = Q8 ? 16 : 8;   // values a copy
+    for (int i = threadIdx.x; i < MMA_KEYS * AT_DIM / PER; i += W * WARP) {
+        const int r = i / (AT_DIM / PER), c = PER * (i % (AT_DIM / PER));
+        const long long key = k0 + r;
+        const bool in = key >= lo && key < hi;
+        const size_t at = (size_t(in ? (a.ring > 0 ? key % a.ring : key) : 0) * a.kv_heads + g) * AT_DIM;
+        if constexpr (Q8) {
+            copy16(&t.c[st][r][c], q8.codes + at + c, in);
+            if (c == 0) copy8(&t.d[st][r][0], q8.scales + at / 32, in);
+        } else {
+            copy16(&t.h[st][r][c], f16 + at + c, in);
+        }
+    }
+}
+
+// A Q8_0 stage's codes times their scales, as halves: half(c) * d rounds the exact product once, as attn_mma_kernel's
+// float(c) * d -> half does
+template <int W, int S>
+__device__ __forceinline__ void fa_convert(FaTile<S, true>& t, int st) {
+    for (int i = threadIdx.x; i < MMA_KEYS * AT_DIM / 8; i += W * WARP) {
+        const int r = i / (AT_DIM / 8), c = 8 * (i % (AT_DIM / 8));
+        const uint2 codes = *reinterpret_cast<const uint2*>(&t.c[st][r][c]);
+        const __half2 d = __half2half2(__ushort_as_half(t.d[st][r][c / 32]));
+        uint32_t h[4];
+        for (int j = 0; j < 4; ++j) {   // 0x64xx is the half 1024 + xx; xx = c + 128
+            const uint32_t x = __byte_perm((j < 2 ? codes.x : codes.y) ^ 0x80808080u, 0x64646464u,
+                                           j % 2 ? 0x4342 : 0x4140);
+            const __half2 c1 = __hsub2_rn(*reinterpret_cast<const __half2*>(&x), __float2half2_rn(1152.0f));
+            const __half2 v = __hmul2_rn(c1, d);
+            h[j] = *reinterpret_cast<const uint32_t*>(&v);
+        }
+        *reinterpret_cast<uint4*>(&t.h[0][r][c]) = make_uint4(h[0], h[1], h[2], h[3]);
+    }
+}
+#endif
+
+// attn_mma_kernel's arithmetic, row for row, for blocks of 128 rows: each key and value fragment feeds two m16
+// tiles, the tiles come in by cp.async while the last one is worked on, a Q8_0 tile becomes halves once for the
+// block, and only the m16 tiles a tile's diagonal, window edge or unused rows cross test each score.  Every row
+// takes the same 32-key tiles from position 0, the same steps in the same order and the same roundings as
+// attn_mma_kernel's (the online softmax's sums written out as that kernel's compile to), so the two give the same
+// bits: the tiles one kernel walks and the other skips hold no key of the row, and change nothing in it; a bias of
+// the table's zero rows (past the extent) would only add zeros.
+// Whether W warps' shared memory (fa_smem) is there on the cards this is compiled for: 8 warps' on sm_80, sm_87,
+// sm_90 and sm_100, not on Turing nor the cards of up to 99 KB a block (sm_86, sm_89, sm_120)
+__host__ __device__ constexpr bool fa_fits(int w) {
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ < 800 || __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ >= 1200)
+    return w < 8;
+#else
+    return w > 0;
+#endif
+}
+
+template <int W, int S, bool KQ8, bool VQ8>
+__device__ __forceinline__ void attn_fa2(const AttnArgs& a) {
+#if INKLING_MMA
+    constexpr int FA_TOKENS = fa_tokens(W), FA_SLICE = fa_slice(W);
+    extern __shared__ __align__(16) unsigned char fa_raw[];
+    FaSmem<W, S, KQ8, VQ8>& sm = *reinterpret_cast<FaSmem<W, S, KQ8, VQ8>*>(fa_raw);
+    constexpr float LOG2E = 1.44269504f;
+    const int lane = threadIdx.x % WARP, w = threadIdx.x / WARP, gid = lane / 4, tig = lane % 4;
+    const int g = blockIdx.y, t0 = (gridDim.x - 1 - blockIdx.x) * FA_TOKENS;   // the longest blocks first
+    const int nt = min(FA_TOKENS, a.rows - t0);
+    const long long p0 = a.pos + t0;
+    int tok[2][2], wt0[2], wt1[2];   // the thread's rows gid and gid + 8 of each m16 tile; a tile's first and last
+    bool row_ok[2][2];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int r0 = 16 * (2 * w + mt);
+        wt0[mt] = r0 / AT_PER;
+        wt1[mt] = (r0 + 15) / AT_PER;
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int r = r0 + gid + 8 * i;
+            tok[mt][i] = r / AT_PER;
+            row_ok[mt][i] = tok[mt][i] < nt;
+            const size_t th = (size_t(t0) + tok[mt][i]) * a.n_head + g * AT_PER + r % AT_PER;
+            #pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    float2 x = make_float2(0.0f, 0.0f);
+                    if (row_ok[mt][i])
+                        x = *reinterpret_cast<const float2*>(a.q + th * AT_DIM + 16 * k + 8 * u + 2 * tig);
+                    *reinterpret_cast<uint32_t*>(&sm.q[r][16 * k + 8 * u + 2 * tig]) =
+                        half2_bits(x.x * a.scale * LOG2E, x.y * a.scale * LOG2E);
+                }
+                const float* rr = a.rel.r + th * 16 + 8 * u + 2 * tig;
+                *reinterpret_cast<uint32_t*>(&sm.r[r][8 * u + 2 * tig]) =
+                    row_ok[mt][i] ? half2_bits(rr[0] * LOG2E, rr[1] * LOG2E) : 0u;
+            }
+        }
+    }
+    float o[2][16][4], m[2][2], l[2][2];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        m[mt][0] = m[mt][1] = -INFINITY;
+        l[mt][0] = l[mt][1] = 0.0f;
+        #pragma unroll
+        for (int n = 0; n < 16; ++n) o[mt][n][0] = o[mt][n][1] = o[mt][n][2] = o[mt][n][3] = 0.0f;
+    }
+    const long long hi = p0 + nt, lo = a.window > 0 ? max(0LL, p0 - a.window + 1) : 0;
+    const long long first = lo / MMA_KEYS * MMA_KEYS;
+    const int tiles = (int) ((hi - first + MMA_KEYS - 1) / MMA_KEYS);
+    const auto load = [&](int it) {
+        const long long k0 = first + (long long) it * MMA_KEYS, d0 = p0 - (k0 + MMA_KEYS - 1);
+        const int st = it % S;
+        fa_load<W, S, KQ8>(sm.k, st, a.kc, a.kq, a, g, k0, lo, hi);
+        fa_load<W, S, VQ8>(sm.v, st, a.vc, a.vq, a, g, k0, lo, hi);
+        if (d0 < a.rel.extent)   // the table's rows of distances d0 + e, zeros past the extent and before 0
+            for (int i = threadIdx.x; i < FA_SLICE * 4; i += W * WARP) {
+                const long long d = d0 + i / 4;
+                const bool in = d >= 0 && d < a.rel.extent;
+                copy16(&sm.slice[st][i / 4][4 * (i % 4)], a.rel.table + (in ? d : 0) * 16 + 4 * (i % 4), in);
+            }
+    };
+    if constexpr (S > 1) load(0);
+    for (int it = 0; it < tiles; ++it) {
+        const long long k0 = first + (long long) it * MMA_KEYS, d0 = p0 - (k0 + MMA_KEYS - 1);
+        const int st = it % S;
+        if constexpr (S == 1) {   // one stage: the last tile is read, then this one comes in
+            if (it > 0) __syncthreads();
+            load(it);
+        }
+        copy_wait();
+        __syncthreads();   // this tile is in; the last one is read, so its stage takes the next
+        if (S > 1 && it + 1 < tiles) load(it + 1);
+        if constexpr (KQ8) fa_convert<W, S>(sm.k, st);
+        if constexpr (VQ8) fa_convert<W, S>(sm.v, st);
+        if constexpr (KQ8 || VQ8) __syncthreads();
+        const half(*kt)[MMA_KROW] = sm.k.h[KQ8 ? 0 : st];
+        const half(*vt)[MMA_KROW] = sm.v.h[VQ8 ? 0 : st];
+        // per m16 tile: whether a row of it sees a key of the tile, whether some do not see some (a score test
+        // each), whether a distance is below the extent
+        bool act[2], edge[2], near[2];
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const long long own0 = p0 + wt0[mt], own1 = p0 + wt1[mt];
+            act[mt] = wt0[mt] < nt && k0 <= own1 && (a.window <= 0 || k0 + MMA_KEYS - 1 > own0 - a.window);
+            edge[mt] = wt1[mt] >= nt || k0 + MMA_KEYS - 1 > own0 || (a.window > 0 && k0 <= own1 - a.window);
+            near[mt] = d0 + wt0[mt] < a.rel.extent;
+        }
+        if (!act[0] && !act[1]) continue;
+        float s[2][MMA_KEYS / 8][4];
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (int n = 0; n < MMA_KEYS / 8; ++n) s[mt][n][0] = s[mt][n][1] = s[mt][n][2] = s[mt][n][3] = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 8; k += 2) {
+            uint32_t qf[2][2][4];   // the rows' values 16 k.. and 16 (k + 1)..
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+                    if (act[mt])
+                        ldmatrix_x4(qf[mt][h], &sm.q[16 * (2 * w + mt) + lane % 16][16 * (k + h) + 8 * (lane / 16)],
+                                    false);
+#pragma unroll
+            for (int n = 0; n < MMA_KEYS / 8; ++n) {
+                uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
+                ldmatrix_x4(b, &kt[8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+                    if (act[mt]) {
+                        mma16816(s[mt][n], qf[mt][0], b);
+                        mma16816(s[mt][n], qf[mt][1], b + 2);
+                    }
+            }
+        }
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            if (!act[mt]) continue;
+            if (near[mt]) {   // column e is distance p0 + wt0 - (k0 + MMA_KEYS - 1) + e
+                uint32_t ra[4];
+                ldmatrix_x4(ra, &sm.r[16 * (2 * w + mt) + lane % 16][8 * (lane / 16)], false);
+                #pragma unroll
+                for (int n = 0; n < MMA_BIAS / 8; ++n) {
+                    const float* tr = &sm.slice[st][wt0[mt] + 8 * n + gid][2 * tig];
+                    const uint32_t b[2] = {half2_bits(tr[0], tr[1]), half2_bits(tr[8], tr[9])};
+                    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    mma16816(c, ra, b);
+                    *reinterpret_cast<float2*>(&sm.bias[w][gid][8 * n + 2 * tig]) = make_float2(c[0], c[1]);
+                    *reinterpret_cast<float2*>(&sm.bias[w][gid + 8][8 * n + 2 * tig]) = make_float2(c[2], c[3]);
+                }
+                __syncwarp();
+            }
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int own = (int) (p0 + tok[mt][i] - k0);   // the row's position, from the tile's first key
+                const int e0 = tok[mt][i] - wt0[mt] + MMA_KEYS - 1;
+                const float* bias = sm.bias[w][gid + 8 * i];
+                float mx = -INFINITY;
+                #pragma unroll
+                for (int n = 0; n < MMA_KEYS / 8; ++n)
+                    #pragma unroll
+                    for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                        const int c = 8 * n + 2 * tig + j % 2;
+                        if (edge[mt] && (!row_ok[mt][i] || c > own || (a.window > 0 && c <= own - a.window)))
+                            s[mt][n][j] = -INFINITY;
+                        else if (near[mt])
+                            s[mt][n][j] = __fadd_rn(s[mt][n][j], bias[e0 - c]);
+                        mx = fmaxf(mx, s[mt][n][j]);
+                    }
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+                const float now = fmaxf(m[mt][i], mx), base = now == -INFINITY ? 0.0f : now;
+                const float f = exp2f(__fsub_rn(m[mt][i], base));
+                m[mt][i] = now;
+                #pragma unroll
+                for (int n = 0; n < 16; ++n) {
+                    o[mt][n][2 * i] = __fmul_rn(o[mt][n][2 * i], f);
+                    o[mt][n][2 * i + 1] = __fmul_rn(o[mt][n][2 * i + 1], f);
+                }
+                #pragma unroll
+                for (int n = 0; n < MMA_KEYS / 8; ++n)
+                    #pragma unroll
+                    for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                        s[mt][n][j] = exp2f(__fsub_rn(s[mt][n][j], base));
+                        l[mt][i] = n == 0 && j == 2 * i ? __fmaf_rn(l[mt][i], f, s[mt][n][j])
+                                                        : __fadd_rn(l[mt][i], s[mt][n][j]);
+                    }
+            }
+            if (near[mt]) __syncwarp();   // the buffer is read before the other m16 tile writes it
+        }
+        #pragma unroll
+        for (int k = 0; k < MMA_KEYS / 16; ++k) {   // keys 16 k..: the weights as an A fragment
+            uint32_t pa[2][4];
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                pa[mt][0] = half2_bits(s[mt][2 * k][0], s[mt][2 * k][1]);
+                pa[mt][1] = half2_bits(s[mt][2 * k][2], s[mt][2 * k][3]);
+                pa[mt][2] = half2_bits(s[mt][2 * k + 1][0], s[mt][2 * k + 1][1]);
+                pa[mt][3] = half2_bits(s[mt][2 * k + 1][2], s[mt][2 * k + 1][3]);
+            }
+            #pragma unroll
+            for (int n = 0; n < 16; n += 2) {
+                uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
+                ldmatrix_x4(b, &vt[16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
+                #pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+                    if (act[mt]) {
+                        mma16816(o[mt][n], pa[mt], b);
+                        mma16816(o[mt][n + 1], pa[mt], b + 2);
+                    }
+            }
+        }
+    }
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            l[mt][i] = __fadd_rn(l[mt][i], __shfl_xor_sync(0xffffffffu, l[mt][i], 1));
+            l[mt][i] = __fadd_rn(l[mt][i], __shfl_xor_sync(0xffffffffu, l[mt][i], 2));
+            if (!row_ok[mt][i]) continue;
+            const int r = 16 * (2 * w + mt) + gid + 8 * i;
+            const size_t th = (size_t(t0) + tok[mt][i]) * a.n_head + g * AT_PER + r % AT_PER;
+            float f = 1.0f;
+            if (a.sinks) {   // the sink, in log2 units like the scores
+                const float sink = a.sinks[th] * LOG2E, now = fmaxf(m[mt][i], sink);
+                f = exp2f(__fsub_rn(m[mt][i], now));
+                l[mt][i] = __fmaf_rn(l[mt][i], f, exp2f(__fsub_rn(sink, now)));
+            }
+            float* y = a.out + th * AT_DIM + 2 * tig;
+            #pragma unroll
+            for (int n = 0; n < 16; ++n)
+                *reinterpret_cast<float2*>(y + 8 * n) = make_float2(__fmul_rn(o[mt][n][2 * i], f) / l[mt][i],
+                                                                   __fmul_rn(o[mt][n][2 * i + 1], f) / l[mt][i]);
+        }
+#else
+    (void) a;   // never launched without the tensor cores (mma_attention())
+#endif
+}
+
+template <int W, int S, bool KQ8, bool VQ8>
+__global__ void __launch_bounds__(W * WARP, 1) attn_fa2_kernel(AttnArgs a) {
+    static_assert(fa_tokens(W) * AT_PER >= 32 * W - 2, "attn_fa2_kernel: at most 2 unused rows");
+    if constexpr (fa_fits(W)) attn_fa2<W, S, KQ8, VQ8>(a);   // else never launched (fa2_warps())
+}
+
+// The shared memory attn_fa2_kernel<W> needs, and the most warps a block whose shared memory the card has: 8 on
+// A100 and H100 (up to 227 KB a block), 4 on the cards of up to 99 KB (sm_86, sm_89, sm_120); 0 none.
+template <int W>
+constexpr size_t fa_smem(bool kq, bool vq) {
+    return kq ? (vq ? sizeof(FaSmem<W, 2, true, true>) : sizeof(FaSmem<W, 2, true, false>))
+              : (vq ? sizeof(FaSmem<W, 2, false, true>) : sizeof(FaSmem<W, 2, false, false>));
+}
+
+int fa2_warps(bool kq, bool vq) {
+    int dev = 0, optin = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess)
+        return 0;
+    return (size_t) optin >= fa_smem<8>(kq, vq) ? 8 : (size_t) optin >= fa_smem<4>(kq, vq) ? 4 : 0;
+}
+
+// Whether attn_fa2_kernel takes the prompt batches here instead of attn_mma_kernel: built for Ampere or newer, on
+// a card whose tensor cores sum fp16 products into floats at full rate and where it was measured faster.  sm_80 is
+// GA100 only (A100, A30, A800: 312 dense TFLOPS with fp32 accumulation, as with fp16, in NVIDIA's A100 whitepaper).
+// GeForce cards of sm_86, sm_89 and sm_120 sum into floats at half rate (the GA102, Ada and RTX Blackwell
+// whitepapers: RTX 3090 71 of 142, RTX 4090 165.2 of 330.3, RTX 5090 209.5 of 419 TFLOPS), where attn_mma_kernel is
+// already near that limit; the same chips' professional cards (RTX A6000, A40, L40, ...) and Hopper are not measured.
+bool fa2_attention() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, attn_fa2_kernel<8, 2, false, false>) != cudaSuccess || fa.ptxVersion < 80)
+        return false;
+    int dev = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess)
+        return false;
+    return major == 8 && minor == 0;
+#endif
+}
+
+template <int W, bool KQ8, bool VQ8, int S = 2>
+void launch_fa2(const AttnArgs& a, cudaStream_t st) {
+    constexpr size_t smem = sizeof(FaSmem<W, S, KQ8, VQ8>);
+    const cudaError_t e = cudaFuncSetAttribute(attn_fa2_kernel<W, S, KQ8, VQ8>,
+                                               cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("inkling_attend: shared memory: ") + cudaGetErrorString(e));
+    attn_fa2_kernel<W, S, KQ8, VQ8><<<dim3(grid(a.rows, fa_tokens(W)), a.kv_heads), W * WARP, smem, st>>>(a);
+}
+
+template <int W>
+void launch_fa2_q(const AttnArgs& a, cudaStream_t st, bool kq, bool vq) {
+    if (kq && vq) launch_fa2<W, true, true>(a, st);
+    else if (kq) launch_fa2<W, true, false>(a, st);
+    else if (vq) launch_fa2<W, false, true>(a, st);
+    else launch_fa2<W, false, false>(a, st);
+}
+
 template <int TQ, bool KQ8, bool VQ8>
 void launch_attn(const AttnArgs& a, dim3 g, cudaStream_t st) {
     constexpr size_t smem = attn_smem(TQ);
@@ -1321,7 +1722,7 @@ AttnArgs attn_args(const char* who, const float* q, const InklingRel& rel, const
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room) {
+                    int64_t room, InklingMma mma) {
     if (rows <= 0) return;
     AttnArgs a =
         attn_args("inkling_attend", q, rel, sinks, rows, out, dim, n_head, kv_heads, scale, window, ring, work);
@@ -1344,6 +1745,15 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         }
     }
     if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
+        const int fw = mma == InklingMma::fa2 || (mma == InklingMma::best && fa2_attention()) ? fa2_warps(kq, vq) : 0;
+        if (mma == InklingMma::fa2 && !fw)
+            throw std::invalid_argument("inkling_attend: no shared memory for attn_fa2_kernel on this card");
+        if (fw) {
+            if (fw == 8) launch_fa2_q<8>(a, st, kq, vq);
+            else launch_fa2_q<4>(a, st, kq, vq);
+            check_launch("inkling_attend");
+            return;
+        }
         const dim3 gm(grid(rows, MMA_TOKENS), kv_heads);
         if (kq && vq) attn_mma_kernel<true, true><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
         else if (kq) attn_mma_kernel<true, false><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
