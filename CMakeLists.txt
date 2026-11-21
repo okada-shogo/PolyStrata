@@ -2089,12 +2089,14 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   # arch-specific target, so on CUDA their instances alone are built with 12x -> 12xa, as Strata's W4A4 unit is.  A
   # Blackwell other than 12.0 has no image of them, and Mmq::fits() leaves MXFP4 out there.  NVFP4 takes this
   # instance only on a 12.0 card with STRATA_PREFILL_NVFP4=w4a4; otherwise its tiles are mmq_nvfp4.cu's int8 ones,
-  # built for the architectures as given.  On HIP there is no NVFP4 prompt product.
+  # built for the architectures as given.  mmq_nvfp4_x2.cu (STRATA_PREFILL_NVFP4=w4a4x2) is built beside it for the
+  # same reason; for a target other than 12xa, or a CUDA before 12.8, its kernels are empty and Mmq never takes them.
+  # On HIP there is no NVFP4 prompt product.
   set(_strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-mxfp4.cu)
   if(STRATA_ENABLE_HIP)
     list(APPEND _strata_poly_mmq_instances ${_strata_poly_mxfp4})
   else()
-    list(APPEND _strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-nvfp4.cu)
+    list(APPEND _strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-nvfp4.cu src/poly/mmq_nvfp4_x2.cu)
     list(APPEND _strata_poly_mmq_instances src/poly/mmq_nvfp4.cu)
     set(_strata_poly_fp4_archs ${CMAKE_CUDA_ARCHITECTURES})
     list(TRANSFORM _strata_poly_fp4_archs REPLACE "^(12[0-9])$" "\\1a")
@@ -2254,6 +2256,26 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   set_tests_properties(poly_inkling_kernels_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
   # cpu_lowbit.cpp's dot products against the dequantized rows, and with `bench` their speed from memory; needs no
   # card
+  if(STRATA_ENABLE_CUDA)
+    # the two-term FP4 activations of STRATA_PREFILL_NVFP4=w4a4x2 and its kernel's tile layout, on the host against
+    # ggml's NVFP4 rows and a double-precision product (any machine; 77 with a CUDA before 12.8, which has no FP4
+    # conversions)
+    add_executable(poly_nvfp4_x2_test src/poly/nvfp4_x2_test.cpp)
+    target_link_libraries(poly_nvfp4_x2_test PRIVATE ggml-base CUDA::cudart)
+    target_include_directories(poly_nvfp4_x2_test PRIVATE ${_strata_gg}/src)
+    if(NOT MSVC)   # the host rounds each operation once, as the card does
+      target_compile_options(poly_nvfp4_x2_test PRIVATE -ffp-contract=off)
+    endif()
+    add_test(NAME poly_nvfp4_x2_test COMMAND poly_nvfp4_x2_test)
+    set_tests_properties(poly_nvfp4_x2_test PROPERTIES SKIP_RETURN_CODE 77)
+    # the same products on the card against the host's and the default W4A8 ones, and Mmq's choice between them
+    # (an RTX 50; elsewhere the choice only, then 77)
+    add_executable(poly_nvfp4_x2_gpu_test src/poly/nvfp4_x2_gpu_test.cu)
+    target_include_directories(poly_nvfp4_x2_gpu_test PRIVATE ${_strata_gg}/src)
+    target_link_libraries(poly_nvfp4_x2_gpu_test PRIVATE strata_poly_mmq ggml-base ${_strata_gpu_runtime_target})
+    add_test(NAME poly_nvfp4_x2_gpu_test COMMAND poly_nvfp4_x2_gpu_test)
+    set_tests_properties(poly_nvfp4_x2_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   add_executable(poly_cpu_lowbit_test src/poly/cpu_lowbit_test.cpp)
   target_link_libraries(poly_cpu_lowbit_test PRIVATE strata_poly_cpu)
   add_test(NAME poly_cpu_lowbit_test COMMAND poly_cpu_lowbit_test)

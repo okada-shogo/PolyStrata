@@ -269,7 +269,8 @@ void test_q2_0_decode() {
 
 void test_q2_0_mmq(int rows) {
     const int n_in = 1152, n_out = 2304;   // Inkling's down matrix
-    check(poly::Mmq::fits(GGML_TYPE_Q2_0, n_out, n_in, true) && !poly::Mmq::fits(GGML_TYPE_Q2_0, n_out, n_in),
+    check(poly::Mmq::fits(GGML_TYPE_Q2_0, n_out, n_in, poly::Mmq::q2_0) &&
+              !poly::Mmq::fits(GGML_TYPE_Q2_0, n_out, n_in),
           "Mmq::fits(Q2_0) only when asked for");
     const auto w = random_rows(GGML_TYPE_Q2_0, n_in, n_out);
     std::vector<uint8_t> w4(ggml_row_size(GGML_TYPE_Q4_0, n_in) * n_out);

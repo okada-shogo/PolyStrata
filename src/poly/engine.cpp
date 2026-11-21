@@ -3146,11 +3146,11 @@ void Engine::alloc() {
         Layer& L = layers_[(size_t) il];
         if (!L.moe) continue;
         // a mixed layer multiplies gate and up apart (moe_rows()), each a matrix of n_ff rows
-        const bool lb = lowbit_experts_;
-        const bool gu_fits = L.mixed() ? Mmq::fits((int) L.gu_type, n_ff_exp_, n_embd_, lb) &&
-                                             Mmq::fits((int) L.u_type, n_ff_exp_, n_embd_, lb)
-                                       : Mmq::fits((int) L.gu_type, 2 * n_ff_exp_, n_embd_, lb);
-        L.mmq = opt_.gpu_experts && rows_ >= kStageRows && gu_fits && Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_, lb);
+        const Mmq::Allow ea = expert_mmq();
+        const bool gu_fits = L.mixed() ? Mmq::fits((int) L.gu_type, n_ff_exp_, n_embd_, ea) &&
+                                             Mmq::fits((int) L.u_type, n_ff_exp_, n_embd_, ea)
+                                       : Mmq::fits((int) L.gu_type, 2 * n_ff_exp_, n_embd_, ea);
+        L.mmq = opt_.gpu_experts && rows_ >= kStageRows && gu_fits && Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_, ea);
         tiles = tiles || L.mmq;
         mixed_tiles = mixed_tiles || (L.mmq && L.mixed());
         one_expert = std::max(one_expert, L.gu_step + L.d_bytes);
@@ -3182,10 +3182,10 @@ void Engine::alloc() {
         const size_t rr = n * n_used_,
                      tab = (3 * rr + 3 * (size_t) n_expert_ + 3 + kClasses * ((size_t) n_expert_ + 1) +
                             2 * kMaxStagedTiles * (2 * (size_t) n_expert_ + 2)) * sizeof(int32_t);
-        mq_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
-        mq2_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_ff_exp_), "scratch");
-        if (mixed_tiles) mqu_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
-        mqx_ = dmalloc(Mmq::q8_bytes(rows_, q_max), "scratch");
+        mq_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_, expert_mmq()), "scratch");
+        mq2_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_ff_exp_, expert_mmq()), "scratch");
+        if (mixed_tiles) mqu_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_, expert_mmq()), "scratch");
+        mqx_ = dmalloc(Mmq::q8_bytes(rows_, q_max, dense_mmq()), "scratch");
         d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
         h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
@@ -3656,15 +3656,15 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
         return gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, per, n, st_);
     }
     // a prompt batch: llama.cpp's matrix-matrix kernels read the weights once for all the tokens
-    if (mmq_ && n >= kStageRows && Mmq::fits((int) w.type, w.n_out, w.n_in, lowbit_experts_)) {
+    if (mmq_ && n >= kStageRows && Mmq::fits((int) w.type, w.n_out, w.n_in, dense_mmq())) {
         // A row too large for the halves its blocks keep their sums in goes in divided by a power of two, and x is
         // left as it was for whatever reads it next (both exact): its product comes out divided by the same.
         const bool guard = half_sum_guard_ && Mmq::half_sums((int) w.type);
         float* xs = const_cast<float*>(x);
         if (guard) guard_half_sums(xs, w.n_in, w.n_in, n, hf_, st_);
-        Mmq::quantize(x, nullptr, mqx_, (int) w.type, w.n_in, w.n_in, n, st_);
+        Mmq::quantize(x, nullptr, mqx_, (int) w.type, w.n_in, w.n_in, n, st_, dense_mmq());
         if (guard) scale_rows(xs, w.n_in, w.n_in, n, nullptr, hf_, false, st_);
-        mmq_->mul(w.p, (int) w.type, w.n_out, w.n_in, 0, 1, mqx_, nullptr, nullptr, n, n, y, w.n_out, st_);
+        mmq_->mul(w.p, (int) w.type, w.n_out, w.n_in, 0, 1, mqx_, nullptr, nullptr, n, n, y, w.n_out, st_, dense_mmq());
         if (guard) scale_rows(y, w.n_out, w.n_out, n, nullptr, hf_, false, st_);
         return;
     }
@@ -4681,20 +4681,22 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     const float limit = clamp_exp_[(size_t) il];
     const int gt = (int) L.gu_type, ut = (int) L.u_type, dt = (int) L.d_type;
     const bool guard = half_sum_guard_ && Mmq::half_sums(dt);   // the down rows keep their sums in halves
+    const Mmq::Allow ea = expert_mmq();
     const int64_t ff = n_ff_exp_, ff2 = 2 * ff;
     // A mixed layer multiplies gate and up apart, n_ff rows each, up's into the second half of a row: its rows
     // quantized for up's type too, since quantize() writes them for the matrix type they meet.
     const int64_t gu_rows = L.mixed() ? ff : ff2;
     const auto up_mul = [&](const uint8_t* w, size_t stride, int m, const int32_t* bounds, int64_t most) {
         if (L.mixed())
-            mmq_->mul(w + L.gu_bytes, ut, ff, n_embd_, stride, m, mqu_, bounds, iota_, rg, most, gu_ + ff, ff2, st_);
+            mmq_->mul(w + L.gu_bytes, ut, ff, n_embd_, stride, m, mqu_, bounds, iota_, rg, most, gu_ + ff, ff2, st_,
+                      ea);
     };
     int holds = -1;   // the round in the buffer when this call is done
     // The card's part.  With the CPU's beside it, the rows of its experts' places are left at nothing.
     const auto card = [&] {
         if (n_cpu > 0) ck(cudaMemsetAsync(dx_, 0, (size_t) rr * n_embd_ * sizeof(float), cs(st_)), "expert rows");
-        if (rg > 0) Mmq::quantize(xn_, d_tok, mq_, gt, n_embd_, n_embd_, rg, st_);
-        if (rg > 0 && L.mixed()) Mmq::quantize(xn_, d_tok, mqu_, ut, n_embd_, n_embd_, rg, st_);
+        if (rg > 0) Mmq::quantize(xn_, d_tok, mq_, gt, n_embd_, n_embd_, rg, st_, ea);
+        if (rg > 0 && L.mixed()) Mmq::quantize(xn_, d_tok, mqu_, ut, n_embd_, n_embd_, rg, st_, ea);
 
         // The cached experts whose slots lie one behind the other are the matrices of one launch, as the experts of
         // a staging round are; a launch for each class that has rows among them.  The cache is filled a layer's
@@ -4729,17 +4731,17 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         }
         for (const Run& r : runs_) {
             mmq_->mul(slot_of(r.j), gt, gu_rows, n_embd_, L.slot_bytes, r.m, mq_, d_cb + (size_t) r.c * cb_row + r.j,
-                      iota_, rg, r.most, gu_, ff2, st_);
+                      iota_, rg, r.most, gu_, ff2, st_, ea);
             up_mul(slot_of(r.j), L.slot_bytes, r.m, d_cb + (size_t) r.c * cb_row + r.j, r.most);
         }
         if (rc > 0) {
             act_rows(gu_, hx_, rc, limit, &es);
             if (guard) guard_half_sums(hx_, ff, n_ff_exp_, rc, hf_, st_);
-            Mmq::quantize(hx_, nullptr, mq2_, dt, ff, ff, rc, st_);
+            Mmq::quantize(hx_, nullptr, mq2_, dt, ff, ff, rc, st_, ea);
         }
         for (const Run& r : runs_)
             mmq_->mul(slot_of(r.j) + gu2, dt, n_embd_, ff, L.slot_bytes, r.m, mq2_, d_cb + (size_t) r.c * cb_row + r.j,
-                      d_place, rc, r.most, dx_, n_embd_, st_);
+                      d_place, rc, r.most, dx_, n_embd_, st_, ea);
         if (guard && rc > 0) scale_rows(dx_, n_embd_, n_embd_, rc, d_place, hf_, false, st_);
 
         // The round the buffer holds goes first and is not copied.  If it holds none of this call's, the experts
@@ -4779,19 +4781,19 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             };
             each_class([&](int k, int top) {
                 const int32_t* b = n_tile == 1 ? d_bounds + g0 : d_tb + (size_t) k * tile_row + (size_t) (g0 - n_cached + r);
-                mmq_->mul(stage_, gt, gu_rows, n_embd_, step, m, mq_, b, iota_, rg, top, gu_, ff2, st_);
+                mmq_->mul(stage_, gt, gu_rows, n_embd_, step, m, mq_, b, iota_, rg, top, gu_, ff2, st_, ea);
                 up_mul(stage_, step, m, b, top);
             });
             ExpertScales er = es;
             if (er.ids) er.ids += r0;
             act_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, rows, limit, &er);
             if (guard) guard_half_sums(hx_ + (size_t) r0 * ff, ff, n_ff_exp_, rows, hf_ + r0, st_);
-            Mmq::quantize(hx_ + (size_t) r0 * ff, nullptr, mq2_, dt, ff, ff, rows, st_);
+            Mmq::quantize(hx_ + (size_t) r0 * ff, nullptr, mq2_, dt, ff, ff, rows, st_, ea);
             each_class([&](int k, int top) {
                 const int32_t* b = (n_tile == 1 ? d_rel + (g0 - n_cached + r)
                                                 : d_tb + (size_t) (n_tile + k) * tile_row + (size_t) (g0 - n_cached + r));
                 mmq_->mul(stage_ + down_at, dt, n_embd_, ff, L.d_bytes, m, mq2_, b, d_place + r0, rows, top, dx_, n_embd_,
-                          st_);
+                          st_, ea);
             });
             if (guard) scale_rows(dx_, n_embd_, n_embd_, rows, d_place + r0, hf_ + r0, false, st_);
         }

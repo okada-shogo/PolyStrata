@@ -1,11 +1,15 @@
 // src/poly/mmq.cu - see the header.  The kernels are compiled from the llama.cpp checkout the build already takes
 // ggml from; src/prefill/ggml_cuda_host.cu supplies the host symbols of ggml-cuda.cu they use.
 #include "mmq.hpp"
+#if STRATA_POLY_NVFP4
+#include "nvfp4_x2.hpp"
+#endif
 
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -29,15 +33,27 @@ namespace {
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
 
 // NVFP4's prompt products: on RTX 50, with STRATA_PREFILL_NVFP4=w4a4, FP4 x FP4 on its FP4 tensor cores (the
-// instance built for 12.0a, as MXFP4's); otherwise, as on every other card, the weights decoded to int8 times Q8_1
-// rows (mmq_nvfp4.cu).
-bool nvfp4_fp4(int cc) {
-    static const bool asked = [] {
+// instance built for 12.0a, as MXFP4's); with STRATA_PREFILL_NVFP4=w4a4x2 on a 12.x card, the weights times
+// activations of two FP4 terms on the same tensor cores (mmq_nvfp4_x2.cu); otherwise, as on every other card, the
+// weights decoded to int8 times Q8_1 rows (mmq_nvfp4.cu).
+const std::string& nvfp4_mode() {
+    static const std::string mode = [] {
         const char* v = std::getenv("STRATA_PREFILL_NVFP4");
-        return v != nullptr && std::string(v) == "w4a4";
+        return std::string(v ? v : "");
     }();
-    return asked && cc == GGML_CUDA_CC_BLACKWELL;
+    return mode;
 }
+
+bool nvfp4_fp4(int cc) { return nvfp4_mode() == "w4a4" && cc == GGML_CUDA_CC_BLACKWELL; }
+
+#if STRATA_POLY_NVFP4
+// A matrix of w_cols columns takes the two-term products: the caller allows them (Inkling 2 for its routed experts;
+// another family takes them by setting Engine::nvfp4_x2_experts_), the variable asks for them, its rows are whole
+// kK-value steps (Inkling 2's 2304 and 1152), and the card has them.  The card is asked last, and once.
+bool takes_x2(Mmq::Allow allow, int64_t w_cols) {
+    return (allow & Mmq::nvfp4_x2) && nvfp4_mode() == "w4a4x2" && w_cols % x2::kK == 0 && nvfp4_x2_built();
+}
+#endif
 
 // The float each row of NVFP4's FP4 rows carries (quantize_mmq_fp4_cuda's scale) goes behind the blocks and the
 // tiles' tail, in the room q8_bytes() leaves: FP4 blocks take half the bytes of Q8_1's.
@@ -70,10 +86,10 @@ void Mmq::reserve_fixup() {
 // step they read on into what lies behind it, and multiply that by the zeros quantize() pads the rows of x with.
 // So what lies behind a matrix must be readable and must not be read as an infinite block scale: the engine keeps
 // zero bytes there (kTail in runtime.hpp), as ggml-cuda does behind its tensors.
-bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols, bool q2_0) {
+bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols, Allow allow) {
     const ggml_type t = (ggml_type) type;
     const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
-    if (t == GGML_TYPE_Q2_0 && !q2_0) return false;
+    if (t == GGML_TYPE_Q2_0 && !(allow & q2_0)) return false;
     switch (t) {
 #define X(T) case GGML_TYPE_##T:
         STRATA_POLY_MMQ_TYPES(X)
@@ -82,6 +98,7 @@ bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols, bool q2_0) {
 #if STRATA_POLY_NVFP4
         case GGML_TYPE_NVFP4:
             if (w_cols % QK_NVFP4 != 0) return false;
+            if (takes_x2(allow, w_cols)) return true;
             if (!nvfp4_fp4(dev.cc)) return nvfp4_w4a8_fits(w_rows, dev.cc, dev.smpbo);
             break;
 #endif
@@ -99,7 +116,13 @@ bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols, bool q2_0) {
 }
 
 // the kernels read whole tiles, so the last rows need room behind them
-size_t Mmq::q8_bytes(int64_t rows, int64_t cols) {
+size_t Mmq::q8_bytes(int64_t rows, int64_t cols, Allow allow) {
+#if STRATA_POLY_NVFP4
+    if (takes_x2(allow, cols))
+        return std::max(x2::rows_bytes(rows, cols),
+                        (size_t) rows * (size_t) (pad512(cols) / QK8_1_MMQ) * sizeof(block_q8_1_mmq) +
+                            128 * sizeof(block_q8_1_mmq));
+#endif
     return (size_t) rows * (size_t) (pad512(cols) / QK8_1_MMQ) * sizeof(block_q8_1_mmq) + 128 * sizeof(block_q8_1_mmq);
 }
 
@@ -110,11 +133,15 @@ bool Mmq::half_sums(int type) {
 
 // launch_mul_mat_q's choice for each tile width: with stream-k the blocks share the tiles' sums out by the number
 // of tiles, and a fixup adds the parts
-bool Mmq::split_exact(int type, int64_t w_rows) {
+bool Mmq::split_exact(int type, int64_t w_rows, Allow allow) {
     const ggml_type t = (ggml_type) type;
     const bool fallback = w_rows % 128 != 0;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 #if STRATA_POLY_NVFP4
+    // The two-term products sum a row's whole K in one block.  There is no column count here: the answer is theirs
+    // for any NVFP4 matrix the caller allows them for, which is right only for rows of whole kK-value steps (the
+    // header says so; Inkling 2's are).
+    if (t == GGML_TYPE_NVFP4 && takes_x2(allow, x2::kK)) return true;
     if (t == GGML_TYPE_NVFP4 && !nvfp4_fp4(cc)) return !nvfp4_w4a8_stream_k(w_rows, cc);
 #endif
     for (int J = 8; J <= 128; J += 8) {
@@ -125,9 +152,15 @@ bool Mmq::split_exact(int type, int64_t w_rows) {
 }
 
 void Mmq::quantize(const float* x, const int32_t* ids, void* xq, int type, int64_t cols, int64_t ld, int64_t rows,
-                   void* stream) {
+                   void* stream, Allow allow) {
     if (rows <= 0) return;
     const ggml_type t = (ggml_type) type;
+#if STRATA_POLY_NVFP4
+    if (t == GGML_TYPE_NVFP4 && takes_x2(allow, cols)) {
+        nvfp4_x2_quantize(x, ids, xq, cols, ld, rows, stream);
+        return;
+    }
+#endif
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     // On Blackwell llama.cpp's MXFP4 tiles take the rows as FP4 blocks, half the bytes of Q8_1's (mmq.cu's
     // use_native_fp4), and so do NVFP4's FP4 ones; the rows of another type, or another card, are Q8_1.
@@ -145,9 +178,15 @@ void Mmq::quantize(const float* x, const int32_t* ids, void* xq, int type, int64
 
 void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t stride, int n, const void* xq,
               const int32_t* bounds, const int32_t* ids, int64_t total_rows, int64_t max_rows, float* dst,
-              int64_t ld_dst, void* stream) {
+              int64_t ld_dst, void* stream, Allow allow) {
     if (n <= 0 || max_rows <= 0) return;
     const ggml_type t = (ggml_type) type;
+#if STRATA_POLY_NVFP4
+    if (t == GGML_TYPE_NVFP4 && takes_x2(allow, w_cols)) {
+        nvfp4_x2_mul(w, w_rows, w_cols, stride, n, xq, bounds, ids, total_rows, max_rows, dst, ld_dst, stream);
+        return;
+    }
+#endif
     // the matrices are the channels of x; the tokens' rows are the columns of y and of dst
     mmq_args a = {};
     a.x = (const char*) w;

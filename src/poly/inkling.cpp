@@ -172,6 +172,7 @@ void Inkling::load_geometry() {
 #if !defined(STRATA_USE_HIP)
     lane_slots_ = true;       // the cached experts' launches through MmvqSlots::lanes' kernels (measured on CUDA)
 #endif
+    nvfp4_x2_experts_ = true;   // Xylolabs' NVFP4 files: STRATA_PREFILL_NVFP4=w4a4x2 may take the two-term products
     situ_ = Situ{shape_f("activation.situ_beta"), shape_f("activation.situ_linear_beta")};
     need(situ_->beta > 0.f, "bad activation.situ_beta");
     const MetaValue* real = find("vocab_size_unpadded");

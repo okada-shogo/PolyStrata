@@ -15,6 +15,7 @@
 #pragma once
 
 #include "cpu_experts.hpp"
+#include "mmq.hpp"
 #include "strata/poly/kernels.hpp"
 
 #include <atomic>
@@ -198,8 +199,6 @@ struct Stats {
 
 /// The most likely token of n logits: the first of the largest.
 int most_likely(const float* logits, int n);
-
-class Mmq;
 
 /// A picture in a sequence: n rows that stand where n tokens would, each the vision encoder's output for a patch,
 /// as wide as a token's embedding.  The patches come line after line, nx to a line.
@@ -752,6 +751,16 @@ protected:
     /// the cached experts' launches through kernels::MmvqSlots::lanes' kernels (the same bits): Inkling 2's, measured
     /// there; off, the other families' launches as they were
     bool lane_slots_ = false;
+    /// NVFP4 routed experts may take the two-term FP4 prompt products (Mmq::nvfp4_x2) when
+    /// STRATA_PREFILL_NVFP4=w4a4x2 asks for them.  Inkling 2's (measured there); another family takes them by setting
+    /// it.  Off, its experts' products are the default ones whatever the variable says.  The dense matrices (lin())
+    /// never take them.
+    bool nvfp4_x2_experts_ = false;
+    /// What MMQ may take for the routed experts and for the dense matrices: the same value to every call for them.
+    Mmq::Allow expert_mmq() const {
+        return Mmq::Allow((lowbit_experts_ ? Mmq::q2_0 : Mmq::none) | (nvfp4_x2_experts_ ? Mmq::nvfp4_x2 : Mmq::none));
+    }
+    Mmq::Allow dense_mmq() const { return lowbit_experts_ ? Mmq::q2_0 : Mmq::none; }
     std::vector<float> clamp_exp_, clamp_shexp_;   ///< a layer's SwiGLU limits: the routed experts', the shared one's
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.
