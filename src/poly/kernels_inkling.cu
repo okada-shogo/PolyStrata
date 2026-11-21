@@ -1745,7 +1745,10 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         }
     }
     if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
-        const int fw = mma == InklingMma::fa2 || (mma == InklingMma::best && fa2_attention()) ? fa2_warps(kq, vq) : 0;
+        // attn_fa2_kernel for full layers only: in a window layer attn_mma_kernel was the faster (A100, q8_0, 4,096
+        // tokens at 28,672: 0.99 against 1.32 ms), and both give the same bits
+        const bool fa2 = mma == InklingMma::fa2 || (mma == InklingMma::best && window <= 0 && fa2_attention());
+        const int fw = fa2 ? fa2_warps(kq, vq) : 0;
         if (mma == InklingMma::fa2 && !fw)
             throw std::invalid_argument("inkling_attend: no shared memory for attn_fa2_kernel on this card");
         if (fw) {
