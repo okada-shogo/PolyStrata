@@ -47,6 +47,12 @@ the 302- and 1,500-token rows two runs each, old and new taken in turn, 256 toke
 Writing does not run on the tensor cores (a token at a time takes the split path); single runs differ by up to
 4.5% both ways, the means of two runs by at most 1.5%.
 
+`STRATA_FAST_ATTN=1` (opt-in, off by default) takes a prompt batch's attention of the 8 full-attention layers by a
+kernel tiled as FlashAttention-2 is (64 keys a tile, 2^x by the special-function unit, the bias summed into the scores
+on the tensor cores; on cards other than the A100, H100 and B200 a tile's weighted values summed in halves). It trades
+the default's bits for speed: the answers can part from the default's at near-ties. Window layers and written tokens
+are unchanged. Its speed and how far it moves the answers are not measured yet.
+
 IQ4_NL's speed depends on its expert profile (`--expert-profile`, which the server keeps up to date): it chooses the
 experts the card holds. On 100 questions (50 GSM8K, 50 MMLU-Pro, greedy, medium reasoning) IQ4_NL got 49 and 44
 right, UD-Q2_K_XL 48 and 41; the two gave the same answer to 92 of the 100.

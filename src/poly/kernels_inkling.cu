@@ -1,7 +1,7 @@
 // src/poly/kernels_inkling.cu - Inkling 2 Mini's kernels; see include/strata/poly/inkling_kernels.hpp for the math
 // and where it comes from.  Plain float arithmetic throughout, the caches' halves (or Q8_0 codes) the only rounding,
-// but for the prompt batches' attention on the tensor cores (attn_mma_kernel, attn_fa2_kernel), whose products take
-// halves.
+// but for the prompt batches' attention on the tensor cores (attn_mma_kernel, attn_fa2_kernel, attn_fast_kernel),
+// whose products take halves.
 #include "strata/poly/inkling_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -1111,6 +1111,343 @@ void launch_fa2_q(const AttnArgs& a, cudaStream_t st, bool kq, bool vq) {
     else launch_fa2<W, false, false>(a, st);
 }
 
+// ---- attention on the tensor cores, the opt-in fast kernel (InklingMma::fast; STRATA_FAST_ATTN=1) ----------------
+
+// attn_fast_kernel's shape: FT_WARPS warps of 16 query rows (row r of the block token r / 3 and head r % 3 of the
+// group, FT_TOKENS tokens, the last row unused), keys FT_KEYS at a time; a tile's Q8_0 blocks FT_BLOCKS.
+constexpr int FT_WARPS = 4, FT_THREADS = FT_WARPS * WARP, FT_KEYS = 64, FT_TOKENS = 16 * FT_WARPS / AT_PER;
+constexpr int FT_SLICE = (16 * FT_WARPS - 1) / AT_PER + FT_KEYS;   // the block's distances a tile
+constexpr int FT_BLOCKS = FT_KEYS * AT_DIM / 32;
+static_assert(FT_BLOCKS % FT_THREADS == 0 && FT_THREADS % 16 == 0, "attn_fast_kernel: the tiles' copies a thread");
+
+// A Q8_0 tile's codes and scales as copied in, each block by the thread that converts it (so no barrier between).
+template <bool Q8>
+struct FtRaw {
+    int8_t c[FT_BLOCKS][32];
+    uint32_t d[FT_BLOCKS];   // the 4 aligned bytes that hold the block's scale (and its neighbour's)
+};
+template <>
+struct FtRaw<false> {};
+
+template <bool Q8>
+struct __align__(16) FtSmem {
+    half k[FT_KEYS][MMA_KROW], v[FT_KEYS][MMA_KROW];
+    half slice[FT_SLICE][MMA_TROW];   // the table's rows of the tile's distances, as halves
+    FtRaw<Q8> raw;
+};
+
+#if INKLING_MMA
+__device__ __forceinline__ void copy4(void* dst, const void* src, bool fill) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+                 ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src), "r"(fill ? 4 : 0) : "memory");
+#else
+    *reinterpret_cast<uint32_t*>(dst) = fill ? *reinterpret_cast<const uint32_t*>(src) : 0u;
+#endif
+}
+
+// 2^x by the special-function unit (ex2.approx: ~2 ulp, subnormals flushed; 2^-inf = 0)
+__device__ __forceinline__ float ex2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+// The m16n8k16 step summing into halves (two of k = 8 on Turing): full rate on the cards that sum floats at half
+__device__ __forceinline__ void mma16816h(uint32_t* c, const uint32_t* a, const uint32_t* b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(b[0]));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a[2]), "r"(a[3]), "r"(b[1]));
+#else
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+#endif
+
+// The prompt batches' attention as FlashAttention-2 takes it, where other bits are allowed (opt-in): a warp's 16
+// rows keep their queries in registers; 64 keys a tile; the values of a tile come in by cp.async while the warps
+// take its scores, the next keys while they take its weights and values (one buffer each, two barriers a tile, so
+// three blocks fit an SM); a Q8_0 tile is copied in as codes and turned to halves once for the block, each thread
+// its own blocks; scores in log2 units and 2^x by the special-function unit; each row's sum and output rescaled
+// only when its max moves; the score tests only on the warps a tile's diagonal or window edge crosses (an unused
+// row's scores are finite: its queries are zeros, as are the keys outside [lo, hi), and its output is not written).
+// The bias goes straight into the scores: for each token u of a warp, R with the other tokens' rows zeroed times
+// the table's rows of u's distances to the tile's keys (halves), only on tiles with a distance below the extent.
+// HACC sums a tile's weighted values in halves (on the tensor cores at full rate where floats go at half) and adds
+// them to the float output.  The tiles are counted from position 0, so a token's result does not depend on the
+// tokens beside it in the call.
+template <bool KQ8, bool VQ8, bool HACC>
+__global__ void __launch_bounds__(FT_THREADS, 2) attn_fast_kernel(AttnArgs a) {
+#if INKLING_MMA
+    __shared__ FtSmem<KQ8 || VQ8> sm;
+    constexpr float LOG2E = 1.44269504f;
+    const int tid = threadIdx.x, lane = tid % WARP, w = tid / WARP, gid = lane / 4, tig = lane % 4;
+    const int g = blockIdx.y, t0 = (gridDim.x - 1 - blockIdx.x) * FT_TOKENS;   // the longest blocks first
+    const int nt = min(FT_TOKENS, a.rows - t0), wt0 = 16 * w / AT_PER, wt1 = (16 * w + 15) / AT_PER;
+    const long long p0 = a.pos + t0;
+    int tok[2];   // the thread's rows gid and gid + 8 of the warp's, as tokens of the block
+    bool row_ok[2];
+    uint32_t qa[8][4], ra[4];   // a block of 16 values a step, in log2 units; R the same
+    for (int i = 0; i < 2; ++i) {
+        const int r = 16 * w + gid + 8 * i;
+        tok[i] = r / AT_PER;
+        row_ok[i] = tok[i] < nt;
+        const size_t th = (size_t(t0) + tok[i]) * a.n_head + g * AT_PER + r % AT_PER;
+        for (int u = 0; u < 2; ++u) {
+            for (int k = 0; k < 8; ++k) {
+                float2 x = make_float2(0.0f, 0.0f);
+                if (row_ok[i]) x = *reinterpret_cast<const float2*>(a.q + th * AT_DIM + 16 * k + 8 * u + 2 * tig);
+                qa[k][i + 2 * u] = half2_bits(x.x * a.scale * LOG2E, x.y * a.scale * LOG2E);
+            }
+            const float* rr = a.rel.r + th * 16 + 8 * u + 2 * tig;
+            ra[i + 2 * u] = row_ok[i] ? half2_bits(rr[0] * LOG2E, rr[1] * LOG2E) : 0u;
+        }
+    }
+    float o[16][4], m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int n = 0; n < 16; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+
+    // the block's tokens attend positions [lo, hi); positions outside are zeros (their cache rows may be anything)
+    const long long hi = p0 + nt, lo = a.window > 0 ? max(0LL, p0 - a.window + 1) : 0;
+    const long long first = lo / FT_KEYS * FT_KEYS;
+    const int tiles = (int) ((hi - first + FT_KEYS - 1) / FT_KEYS);
+    const auto row_of = [&](long long key) { return size_t(a.ring > 0 ? key % a.ring : key) * a.kv_heads + g; };
+    // fp16: 16 bytes a copy, the thread's column 8 (tid % 16) of keys tid / 16 + 8 j
+    const auto load_halves = [&](half(*dst)[MMA_KROW], const half* src, long long k0) {
+#pragma unroll
+        for (int j = 0; j < FT_KEYS * 16 / FT_THREADS; ++j) {
+            const int r = tid / 16 + FT_THREADS / 16 * j, c = 8 * (tid % 16);
+            const long long key = k0 + r;
+            const bool in = key >= lo && key < hi;
+            copy16(&dst[r][c], src + (in ? row_of(key) : 0) * AT_DIM + c, in);
+        }
+    };
+    // Q8_0: the thread's blocks b = tid + FT_THREADS j, key b / 4, values 32 (b % 4)..
+    const auto load_codes = [&](const Kvq8& q8, long long k0) {
+        if constexpr (KQ8 || VQ8) {
+#pragma unroll
+            for (int j = 0; j < FT_BLOCKS / FT_THREADS; ++j) {
+                const int b = tid + FT_THREADS * j;
+                const long long key = k0 + b / 4;
+                const bool in = key >= lo && key < hi;
+                const size_t at = (in ? row_of(key) : 0) * AT_DIM + 32 * (b % 4);
+                copy16(&sm.raw.c[b][0], q8.codes + at, in);
+                copy16(&sm.raw.c[b][16], q8.codes + at + 16, in);
+                copy4(&sm.raw.d[b], q8.scales + (at / 32 & ~size_t(1)), in);
+            }
+        }
+    };
+    // the thread's own blocks to halves once its copies are in: half(c) * d, as fa_convert()
+    const auto convert = [&](half(*dst)[MMA_KROW]) {
+        if constexpr (KQ8 || VQ8) {
+            copy_wait();
+#pragma unroll
+            for (int j = 0; j < FT_BLOCKS / FT_THREADS; ++j) {
+                const int b = tid + FT_THREADS * j;
+                const __half2 d = __half2half2(__ushort_as_half((unsigned short) (sm.raw.d[b] >> (16 * (b % 2)))));
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const uint2 codes = *reinterpret_cast<const uint2*>(&sm.raw.c[b][8 * q]);
+                    uint32_t h[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {   // 0x64xx is the half 1024 + xx; xx = c + 128
+                        const uint32_t x = __byte_perm((i < 2 ? codes.x : codes.y) ^ 0x80808080u, 0x64646464u,
+                                                       i % 2 ? 0x4342 : 0x4140);
+                        const __half2 v = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&x),
+                                                          __float2half2_rn(1152.0f)), d);
+                        h[i] = *reinterpret_cast<const uint32_t*>(&v);
+                    }
+                    *reinterpret_cast<uint4*>(&dst[b / 4][32 * (b % 4) + 8 * q]) = make_uint4(h[0], h[1], h[2], h[3]);
+                }
+            }
+        }
+    };
+
+    if constexpr (KQ8) {
+        load_codes(a.kq, first);
+        convert(sm.k);
+    } else {
+        load_halves(sm.k, a.kc, first);
+    }
+    for (int it = 0; it < tiles; ++it) {
+        const long long k0 = first + (long long) it * FT_KEYS;
+        copy_wait();
+        __syncthreads();   // the tile's keys are in; the last tile's values and slice are read
+        if constexpr (VQ8) load_codes(a.vq, k0);
+        else load_halves(sm.v, a.vc, k0);
+        const long long own0 = p0 + wt0, own1 = p0 + wt1;
+        // whether a row of the warp sees a key of the tile, whether some do not see some (a score test each),
+        // whether a distance is below the extent (the warp's, the block's)
+        const bool act = wt0 < nt && k0 <= own1 && (a.window <= 0 || k0 + FT_KEYS - 1 > own0 - a.window);
+        const bool edge = k0 + FT_KEYS - 1 > own0 || (a.window > 0 && k0 <= own1 - a.window);
+        const bool near = own0 - (k0 + FT_KEYS - 1) < a.rel.extent, any_near = p0 - (k0 + FT_KEYS - 1) < a.rel.extent;
+        float s[FT_KEYS / 8][4];
+#pragma unroll
+        for (int n = 0; n < FT_KEYS / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+        if (act)
+#pragma unroll
+            for (int k = 0; k < 8; k += 2)
+#pragma unroll
+                for (int n = 0; n < FT_KEYS / 8; ++n) {
+                    uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
+                    ldmatrix_x4(b, &sm.k[8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
+                    mma16816(s[n], qa[k], b);
+                    mma16816(s[n], qa[k + 1], b + 2);
+                }
+        if constexpr (VQ8) convert(sm.v);
+        if (any_near) {   // the table's rows of distances p0 - (k0 + FT_KEYS - 1) + e, zeros past the extent and before 0
+            const long long d0 = p0 - (k0 + FT_KEYS - 1);
+            for (int i = tid; i < FT_SLICE * 8; i += FT_THREADS) {
+                const int e = i / 8, j = 2 * (i % 8);
+                const long long d = d0 + e;
+                float2 x = make_float2(0.0f, 0.0f);
+                if (d >= 0 && d < a.rel.extent) x = *reinterpret_cast<const float2*>(a.rel.table + d * 16 + j);
+                *reinterpret_cast<uint32_t*>(&sm.slice[e][j]) = half2_bits(x.x, x.y);
+            }
+        }
+        copy_wait();
+        __syncthreads();   // the tile's values and slice are in; its keys are read
+        if (it + 1 < tiles) {
+            if constexpr (KQ8) load_codes(a.kq, k0 + FT_KEYS);
+            else load_halves(sm.k, a.kc, k0 + FT_KEYS);
+        }
+        if (act) {
+            if (near)   // token u's rows of R times the table's rows of its distances u + FT_KEYS - 1 - c to key c
+                for (int u = wt0; u <= wt1; ++u) {
+                    const uint32_t au[4] = {tok[0] == u ? ra[0] : 0u, tok[1] == u ? ra[1] : 0u,
+                                            tok[0] == u ? ra[2] : 0u, tok[1] == u ? ra[3] : 0u};
+#pragma unroll
+                    for (int n = 0; n < FT_KEYS / 8; ++n) {
+                        const half* tr = &sm.slice[u + FT_KEYS - 1 - (8 * n + gid)][2 * tig];
+                        const uint32_t b[2] = {*reinterpret_cast<const uint32_t*>(tr),
+                                               *reinterpret_cast<const uint32_t*>(tr + 8)};
+                        mma16816(s[n], au, b);
+                    }
+                }
+            float f[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int own = (int) (p0 + tok[i] - k0);   // the row's position, from the tile's first key
+                float mx = -INFINITY;
+#pragma unroll
+                for (int n = 0; n < FT_KEYS / 8; ++n)
+#pragma unroll
+                    for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                        const int c = 8 * n + 2 * tig + j % 2;
+                        if (edge && (c > own || (a.window > 0 && c <= own - a.window)))
+                            s[n][j] = -INFINITY;
+                        mx = fmaxf(mx, s[n][j]);
+                    }
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+                const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.0f : now;
+                f[i] = ex2(m[i] - base);
+                m[i] = now;
+                float sum = 0.0f;
+#pragma unroll
+                for (int n = 0; n < FT_KEYS / 8; ++n)
+#pragma unroll
+                    for (int j = 2 * i; j < 2 * i + 2; ++j) sum += s[n][j] = ex2(s[n][j] - base);
+                l[i] = l[i] * f[i] + sum;
+            }
+            if constexpr (HACC) {
+                uint32_t t[16][2] = {};   // the tile's weighted values in halves, rows gid and gid + 8
+#pragma unroll
+                for (int k = 0; k < FT_KEYS / 16; ++k) {   // keys 16 k..: the weights as an A fragment
+                    const uint32_t pa[4] = {half2_bits(s[2 * k][0], s[2 * k][1]), half2_bits(s[2 * k][2], s[2 * k][3]),
+                                            half2_bits(s[2 * k + 1][0], s[2 * k + 1][1]),
+                                            half2_bits(s[2 * k + 1][2], s[2 * k + 1][3])};
+#pragma unroll
+                    for (int n = 0; n < 16; n += 2) {
+                        uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
+                        ldmatrix_x4(b, &sm.v[16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
+                        mma16816h(t[n], pa, b);
+                        mma16816h(t[n + 1], pa, b + 2);
+                    }
+                }
+#pragma unroll
+                for (int n = 0; n < 16; ++n) {
+                    const float2 x = __half22float2(*reinterpret_cast<const __half2*>(&t[n][0]));
+                    const float2 y = __half22float2(*reinterpret_cast<const __half2*>(&t[n][1]));
+                    o[n][0] = fmaf(o[n][0], f[0], x.x);
+                    o[n][1] = fmaf(o[n][1], f[0], x.y);
+                    o[n][2] = fmaf(o[n][2], f[1], y.x);
+                    o[n][3] = fmaf(o[n][3], f[1], y.y);
+                }
+            } else {
+                if (!__all_sync(0xffffffffu, f[0] == 1.0f && f[1] == 1.0f))
+#pragma unroll
+                    for (int n = 0; n < 16; ++n) {
+                        o[n][0] *= f[0];
+                        o[n][1] *= f[0];
+                        o[n][2] *= f[1];
+                        o[n][3] *= f[1];
+                    }
+#pragma unroll
+                for (int k = 0; k < FT_KEYS / 16; ++k) {
+                    const uint32_t pa[4] = {half2_bits(s[2 * k][0], s[2 * k][1]), half2_bits(s[2 * k][2], s[2 * k][3]),
+                                            half2_bits(s[2 * k + 1][0], s[2 * k + 1][1]),
+                                            half2_bits(s[2 * k + 1][2], s[2 * k + 1][3])};
+#pragma unroll
+                    for (int n = 0; n < 16; n += 2) {
+                        uint32_t b[4];
+                        ldmatrix_x4(b, &sm.v[16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
+                        mma16816(o[n], pa, b);
+                        mma16816(o[n + 1], pa, b + 2);
+                    }
+                }
+            }
+        }
+        if constexpr (KQ8)
+            if (it + 1 < tiles) convert(sm.k);   // the next keys: sm.k was read before the barrier
+    }
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        if (!row_ok[i]) continue;
+        const int r = 16 * w + gid + 8 * i;
+        const size_t th = (size_t(t0) + tok[i]) * a.n_head + g * AT_PER + r % AT_PER;
+        float f = 1.0f;
+        if (a.sinks) {   // the sink, in log2 units like the scores
+            const float sink = a.sinks[th] * LOG2E, now = fmaxf(m[i], sink);
+            f = ex2(m[i] - now);
+            l[i] = l[i] * f + ex2(sink - now);
+        }
+        const float scale = f / l[i];
+        float* y = a.out + th * AT_DIM + 2 * tig;
+#pragma unroll
+        for (int n = 0; n < 16; ++n)
+            *reinterpret_cast<float2*>(y + 8 * n) = make_float2(o[n][2 * i] * scale, o[n][2 * i + 1] * scale);
+    }
+#else
+    (void) a;   // never launched without the tensor cores (mma_attention())
+#endif
+}
+
+// HACC where the tensor cores sum fp16 products into floats at half rate: every card but the data-center parts
+// that do it at full rate (sm_80 GA100, sm_90 Hopper, sm_100 Blackwell; their whitepapers' dense FP16 TFLOPS with
+// FP32 accumulation equal those with FP16)
+bool fast_halves() {
+    int dev = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess)
+        return true;
+    return !((major == 8 && minor == 0) || major == 9 || major == 10);
+}
+
+template <bool HACC>
+void launch_fast(const AttnArgs& a, cudaStream_t st, bool kq, bool vq) {
+    const dim3 gm(grid(a.rows, FT_TOKENS), a.kv_heads);
+    if (kq && vq) attn_fast_kernel<true, true, HACC><<<gm, FT_THREADS, 0, st>>>(a);
+    else if (kq) attn_fast_kernel<true, false, HACC><<<gm, FT_THREADS, 0, st>>>(a);
+    else if (vq) attn_fast_kernel<false, true, HACC><<<gm, FT_THREADS, 0, st>>>(a);
+    else attn_fast_kernel<false, false, HACC><<<gm, FT_THREADS, 0, st>>>(a);
+}
+
 template <int TQ, bool KQ8, bool VQ8>
 void launch_attn(const AttnArgs& a, dim3 g, cudaStream_t st) {
     constexpr size_t smem = attn_smem(TQ);
@@ -1745,6 +2082,12 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         }
     }
     if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
+        if (mma == InklingMma::fast) {
+            if (fast_halves()) launch_fast<true>(a, st, kq, vq);
+            else launch_fast<false>(a, st, kq, vq);
+            check_launch("inkling_attend");
+            return;
+        }
         // attn_fa2_kernel for full layers only: in a window layer attn_mma_kernel was the faster (A100, q8_0, 4,096
         // tokens at 28,672: 0.99 against 1.32 ms), and both give the same bits
         const bool fa2 = mma == InklingMma::fa2 || (mma == InklingMma::best && window <= 0 && fa2_attention());

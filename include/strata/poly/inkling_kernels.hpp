@@ -182,8 +182,13 @@ inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 ///    take each key and value to twice the rows and copy the next keys in while they work, to the same bits; `mma` =
 ///    InklingMma::turing or ::fa2 asks for one kernel or the other on any card of the path (a test, to compare them;
 ///    ::fa2 throws std::invalid_argument on a card without the shared memory, 96 KB a block).
+///    InklingMma::fast (opt-in, STRATA_FAST_ATTN=1) takes FlashAttention-2's tiling instead, to other bits: 64 keys
+///    a tile, 2^x by the special-function unit, the bias summed into the scores on the tensor cores, and on cards
+///    that sum fp16 products into floats at half rate (all but sm_80, sm_90 and sm_100) a tile's weighted values
+///    summed in halves before they join the float output.  Still a token's result does not depend on the tokens
+///    beside it in the call.
 /// Throws std::runtime_error on a launch error.
-enum class InklingMma { best, turing, fa2 };
+enum class InklingMma { best, turing, fa2, fast };
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,

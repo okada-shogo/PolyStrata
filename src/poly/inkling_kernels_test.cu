@@ -2,8 +2,9 @@
 // the host in double precision, on random inputs of the model's shapes: the clips and tau, the short convolutions
 // (with and without the input-dependent taps, walked and parallel, and their state), the depth mix, the loop
 // controller, SiTU, and the attention over fp16 and Q8_0 caches, full and sliding-window (a ring), split, unsplit
-// and on the tensor cores (Turing's kernel and, where it runs, attn_fa2_kernel, to the bit), with and without a
-// room past the call, for 1, 7 and more than 1,024 tokens; the calls
+// and on the tensor cores (Turing's kernel and, where it runs, attn_fa2_kernel, to the bit; the opt-in
+// attn_fast_kernel within its own bound), with and without a room past the call, for 1, 7 and more than 1,024
+// tokens; the calls
 // for a token of each of several sequences (Engine::step()'s rows) against a call for each row alone, to the bit;
 // and a visit's projections in one launch (native_mmvq_jobs()) and the cached experts' launches a warp a row
 // (MmvqSlots::lanes) against each matrix alone, to the bit.
@@ -407,6 +408,10 @@ void host_attend(const Cache& c, const std::vector<float>& q, const std::vector<
 // hide inside that bound, so the probes (Probe) make the weights exact and hold every path to 1e-5.  The other paths
 // keep 2e-5.
 constexpr double kMmaRoom = 7.5e-3;
+// The opt-in fast kernel (InklingMma::fast) takes 2^x by the special-function unit and, on cards that sum floats at
+// half rate, a tile's weighted values in halves: twice that bound, and 2e-3 on the probes (a tile's 64 weights of 1
+// times values summed in halves; a wrong mask or distance at a few hundred keys moves a token by more).
+constexpr double kFastRoom = 1.5e-2, kFastProbe = 2e-3;
 bool mma_card = false;   // a card of Turing or newer: calls of kInklingMmaRows or more take the tensor cores
 bool fa2_card = true;    // attn_fa2_kernel runs here (InklingMma::fa2; until a call says not): held to Turing's bits
 
@@ -484,6 +489,11 @@ void test_attend(const AttnCase& tc, const std::vector<float>& rand_table, float
             std::printf("attn_fa2_kernel does not run on this card: Turing's kernel only\n");
             fa2_card = false;
         }
+        std::vector<float> fast;   // the opt-in fast kernel, against the same reference
+        if (mma_card && rows >= kInklingMmaRows) {
+            attend(dout, InklingMma::fast);
+            fast = down(dout, q.size());
+        }
         std::vector<int> toks;
         for (int t = 0; t < rows; ++t) {
             const long long p = pos + t;
@@ -491,18 +501,24 @@ void test_attend(const AttnCase& tc, const std::vector<float>& rand_table, float
             if (t % tc.check_every == 0 || t == rows - 1 || edge) toks.push_back(t);
         }
         std::vector<double> ref(toks.size() * kHeads * kDim);
-        std::vector<float> sel(ref.size());
+        std::vector<float> sel(ref.size()), fsel(fast.empty() ? 0 : ref.size());
         for (size_t i = 0; i < toks.size(); ++i) {
             host_attend(c, q, r, table, tc.sinks ? &s : nullptr, pos, toks[i], tc.window, tc.ring,
                         ref.data() + i * kHeads * kDim);
-            std::copy(got.begin() + size_t(toks[i]) * kHeads * kDim, got.begin() + size_t(toks[i] + 1) * kHeads * kDim,
-                      sel.begin() + i * kHeads * kDim);
+            const size_t at = size_t(toks[i]) * kHeads * kDim;
+            std::copy(got.begin() + at, got.begin() + at + kHeads * kDim, sel.begin() + i * kHeads * kDim);
+            if (!fast.empty())
+                std::copy(fast.begin() + at, fast.begin() + at + kHeads * kDim, fsel.begin() + i * kHeads * kDim);
         }
         const std::string name = std::string(tc.name) + ": pos " + std::to_string(pos) + " rows " +
                                  std::to_string(rows) + " (" + std::to_string(toks.size()) + " checked)" + tiers;
         double top = 1.0;
         for (double x : ref) top = std::max(top, std::fabs(x));
         compare(name.c_str(), sel, ref, probe ? 1e-5 : mma_card && rows >= kInklingMmaRows ? kMmaRoom * top : 2e-5);
+        if (!fast.empty())
+            compare((std::string(tc.name) + ": pos " + std::to_string(pos) + " rows " + std::to_string(rows) +
+                     ", fast kernel").c_str(),
+                    fsel, ref, probe ? kFastProbe : kFastRoom * top);
         cudaFree(dq), cudaFree(dk), cudaFree(dv), cudaFree(dr), cudaFree(ds), cudaFree(dout);
         pos += rows;
     }
@@ -581,7 +597,8 @@ void test_attend_mma_alone(const std::vector<float>& table, float* dtable, bool 
         auto a = down(o1, q.size()), b = down(o2, q.size() - off * kDim);
         size_t diff = 0;
         for (size_t i = 0; i < b.size(); ++i) diff += a[off * kDim + i] != b[i];
-        const std::string name = std::string("attend tensor cores") + (mma == InklingMma::fa2 ? " (fa2), " : ", ") +
+        const std::string name = std::string("attend tensor cores") +
+                                 (mma == InklingMma::fa2 ? " (fa2), " : mma == InklingMma::fast ? " (fast), " : ", ") +
                                  (q8 ? "q8_0" : "fp16") + ", " + std::to_string(rows - shift) + " tokens in 2 calls (" +
                                  (w ? "window" : "full") + ")";
         std::printf("%-58s %zu of %zu values differ  %s\n", name.c_str(), diff, b.size(), diff ? "FAIL" : "ok");
@@ -685,7 +702,7 @@ void bench_attend_tiers(const std::vector<float>& table, float* dtable) {
                     flop += 4.0 * kDim * kHeads * (w ? std::min<long long>(w, pos + t + 1) : pos + t + 1);
                 const Cache& c = quant ? q8 : f16;
                 const Kvq8 kq = quant ? Kvq8{c.kc, c.ks} : Kvq8{}, vq = quant ? Kvq8{c.vc, c.vs} : Kvq8{};
-                for (InklingMma mma : {InklingMma::turing, InklingMma::fa2, InklingMma::best}) {
+                for (InklingMma mma : {InklingMma::turing, InklingMma::fa2, InklingMma::fast, InklingMma::best}) {
                     if (mma == InklingMma::fa2 && !fa2_card) continue;
                     const auto f = [&] {
                         inkling_attend(dq, c.k, c.v, kq, vq, rel, ds, pos, rows, out, kDim, kHeads, kKv, sc, w, 0,
@@ -705,6 +722,7 @@ void bench_attend_tiers(const std::vector<float>& table, float* dtable) {
                                              (quant ? "q8_0" : "fp16") + ", " +
                                              (mma == InklingMma::turing ? "Turing's kernel"
                                               : mma == InklingMma::fa2  ? "fa2"
+                                              : mma == InklingMma::fast ? "fast (STRATA_FAST_ATTN)"
                                                                         : "the path's choice");
                     std::printf("bench %-74s %9.3f ms %6.1f TFLOPS\n", what.c_str(), ms, flop / ms * 1e-9);
                 }
@@ -1559,8 +1577,8 @@ int main(int argc, char** argv) {
     };
     for (const AttnCase& tc : cases) test_attend(tc, table, dtable);
     test_attend_alone(table, dtable);
-    for (InklingMma mma : {InklingMma::best, InklingMma::fa2})
-        if (mma == InklingMma::best || fa2_card)
+    for (InklingMma mma : {InklingMma::best, InklingMma::fa2, InklingMma::fast})
+        if (mma != InklingMma::fa2 || fa2_card)
             for (bool q8 : {false, true}) test_attend_mma_alone(table, dtable, q8, mma);
 
     for (int rows : {1, 4, 9, kInklingSeqRows}) test_clip_many_seqs(rows);

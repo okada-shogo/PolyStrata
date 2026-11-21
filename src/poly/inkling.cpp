@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -320,6 +321,13 @@ void Inkling::alloc_caches() {
     size_t one = 0;   // a position's bytes in a visit's planes together
     for (int i = 0; i < planes(); ++i) one += plane_row(i);
     if (q8()) std::fprintf(stderr, "strata-poly: q8_0 KV cache: %zu bytes a row\n", one / 2);
+    // STRATA_FAST_ATTN=1 takes a prompt batch's attention of a full layer by attn_fast_kernel (InklingMma::fast).
+    // Opt-in: other arithmetic, so other bits; window layers and written tokens are unchanged.
+    if (const char* e = std::getenv("STRATA_FAST_ATTN"); e && std::atoi(e) != 0 && !fast_attn_) {
+        fast_attn_ = true;
+        std::fprintf(stderr, "strata-poly: STRATA_FAST_ATTN: a prompt batch's full-layer attention by the fast "
+                             "kernel\n");
+    }
     size_t rings = 0;
     for (int v = 0; v < (int) blocks_.size(); ++v)
         if (runs(v) && blocks_[(size_t) v].swa) rings += (size_t) ring_ * one;
@@ -491,7 +499,8 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         dump("Rcur", v, rel_, n_head_ * n_rel_, n);
         const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n));
         inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
-                       scale, window, ring, awork_, awork_n_, st_, c.room);
+                       scale, window, ring, awork_, awork_n_, st_, c.room,
+                       fast_attn_ && !B.swa ? InklingMma::fast : InklingMma::best);
     }
     dump("kqv_out", v, att_, hq, n);
     mul_sigmoid(att_, gate_, hq, n, hq, false, st_);
