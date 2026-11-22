@@ -2,7 +2,8 @@
 // made-up caches of Inkling 2 Mini's shape (24 query heads on 8 key heads of 128 values, 16 relative values).
 //   hash <file>   a battery of calls (fp16, q8_0, and FP8 where the card takes it, full and window layers, 1 to 7
 //                 rows, positions on the host and on the card, gate and q8 output on and off): one FNV-1a hash of each
-//                 call's output bytes a line.  Two builds' files are the same iff their outputs are the same bits.
+//                 call's output bytes a line.  Two builds' files differ where their outputs differ; equal files mean the same bits
+//                 (but for a hash collision).  Exit 1 if a call's output is not finite.
 //   bench         one token of a full layer, rooms 32K to 1M: microseconds a call and the caches' bytes a second.
 // Needs a card; run by hand.
 #include "inkling2_kernels.hpp"
@@ -101,9 +102,9 @@ struct Bufs {
 };
 
 constexpr int kMaxRows = 8;
-constexpr int64_t kMaxKeys = 1 << 20;
 
-Bufs make_bufs(int64_t keys) {
+// scores for `rows` rows of `keys` keys (the bench takes one row)
+Bufs make_bufs(int64_t keys, int rows = kMaxRows) {
     Bufs b{};
     b.q = up(randf((size_t) kMaxRows * kHeads * kDim, 1.5f));
     b.r = up(randf((size_t) kMaxRows * kHeads * kRel, 1.0f));
@@ -114,7 +115,7 @@ Bufs make_bufs(int64_t keys) {
     ck(cudaMalloc(&b.out, (size_t) kMaxRows * kHeads * kDim * 4), "malloc");
     ck(cudaMalloc(&b.q8, (size_t) kHeads * kDim / 32 * 36 + 64), "malloc");
     ck(cudaMalloc(&b.at, (size_t) 2 * kMaxRows * sizeof(long long)), "malloc");
-    b.score_n = ink_attend_floats(kHeads, kKv, kDim, keys) * kMaxRows;
+    b.score_n = ink_attend_floats(kHeads, kKv, kDim, keys) * rows;
     ck(cudaMalloc(&b.score, b.score_n * 4), "malloc");
     return b;
 }
@@ -157,7 +158,7 @@ int run_hash(const char* path) {
     const int rowss[] = {1, 2, 3, 7};
     std::vector<float> h((size_t) kMaxRows * kHeads * kDim);
     std::vector<uint8_t> hq((size_t) kHeads * kDim / 32 * 36);
-    int cases = 0;
+    int cases = 0, nonfinite = 0;
     for (Fmt fm : fmts) {
         uint8_t *kf = make_cache(fm, ctx + kMaxRows), *vf = make_cache(fm, ctx + kMaxRows);
         uint8_t *kw = make_cache(fm, ring), *vw = make_cache(fm, ring);
@@ -198,12 +199,17 @@ int run_hash(const char* path) {
                         std::fprintf(f, "%s %s pos %lld rows %d mode %d %016llx%s\n", fmt_name(fm),
                                      win ? "window" : "full", (long long) pos, rows, mode, (unsigned long long) x,
                                      finite ? "" : " NONFINITE");
+                        nonfinite += !finite;
                         ++cases;
                     }
-        cudaFree(kf), cudaFree(vf), cudaFree(kw), cudaFree(vw);
+        (void) cudaFree(kf), (void) cudaFree(vf), (void) cudaFree(kw), (void) cudaFree(vw);
     }
     std::fclose(f);
     std::printf("hash: %d calls written to %s\n", cases, path);
+    if (nonfinite) {
+        std::fprintf(stderr, "hash: %d calls gave a value that is not finite (NONFINITE in the file)\n", nonfinite);
+        return 1;
+    }
     return 0;
 }
 
@@ -218,10 +224,10 @@ int run_bench() {
         for (int64_t r : rooms)
             if ((double) r * row_bytes(fm) * 2 < (double) free_b * 0.8) most = r;
         if (!most) continue;
-        Bufs b = make_bufs(most);
+        Bufs b = make_bufs(most, 1);
         uint8_t *k = make_cache(fm, most), *v = make_cache(fm, most);
         cudaEvent_t e0, e1;
-        cudaEventCreate(&e0), cudaEventCreate(&e1);
+        ck(cudaEventCreate(&e0), "event"), ck(cudaEventCreate(&e1), "event");
         for (int64_t room : rooms) {
             if (room > most) break;
             InkAttn a = base(b, k, v, fm);
@@ -233,17 +239,17 @@ int run_bench() {
             a.q8 = b.q8;
             for (int i = 0; i < 3; ++i) ink_attend(a, nullptr);
             const int reps = room >= 524288 ? 20 : 50;
-            cudaEventRecord(e0);
+            ck(cudaEventRecord(e0), "event");
             for (int i = 0; i < reps; ++i) ink_attend(a, nullptr);
-            cudaEventRecord(e1);
+            ck(cudaEventRecord(e1), "event");
             ck(cudaEventSynchronize(e1), "bench");
             float ms = 0.0f;
-            cudaEventElapsedTime(&ms, e0, e1);
+            ck(cudaEventElapsedTime(&ms, e0, e1), "event");
             const double us = 1000.0 * ms / reps, bytes = (double) room * row_bytes(fm) * 2;
             std::printf("bench %s full room %lld: %.1f us a call, %.0f GB/s of the caches\n", fmt_name(fm),
                         (long long) room, us, bytes / us / 1000.0);
         }
-        cudaFree(k), cudaFree(v);
+        (void) cudaFree(k), (void) cudaFree(v);
     }
     return 0;
 }
