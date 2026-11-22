@@ -3192,6 +3192,16 @@ void Engine::load(const Options& o) {
     // allocation each (kv_alloc()) and the expert cache still gives VRAM to other programs and takes it back
     // (mind_vram()): refilled in one allocation instead, it only ever got smaller.
     ck(cudaGetDevice(&device_), "cudaGetDevice");
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+    // ROCm keeps a file descriptor open for each VMM handle (its dmabuf; librocdxg under WSL2): with --vram-pool's
+    // 2 MiB handles the usual soft limit of 1,024 descriptors held an RX 9070 XT's pool to 2 GiB ("fail to import fd",
+    // and the map fails as a card without VRAM does).  The soft limit goes up to the hard one (at most 2^20), as a
+    // process may, and never down.
+    if (rlimit r{}; getrlimit(RLIMIT_NOFILE, &r) == 0 && r.rlim_cur < r.rlim_max) {
+        r.rlim_cur = std::max(r.rlim_cur, std::min<rlim_t>(r.rlim_max, rlim_t(1) << 20));
+        (void) setrlimit(RLIMIT_NOFILE, &r);
+    }
+#endif
     CUdevice dev = 0;
     int vmm = 0;
     if (cuDeviceGet(&dev, device_) == CUDA_SUCCESS &&
