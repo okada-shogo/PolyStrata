@@ -33834,6 +33834,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_POLY_CARD_GBS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 611,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "0.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/models/inkling.md:133"
+   ],
+   "first_commit": "652e1154ba",
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": "652e1154ba",
+   "last_date": "2026-11-23",
+   "status": "research",
+   "owner": "poly",
+   "note": "with --layer-split auto: a,b,... gives each card's memory bandwidth in GB/s for the split plan, instead of the clock and bus width the card reports (HIP and Metal report none)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_POLY_MIRROR",
    "backends": [
     "cuda"
