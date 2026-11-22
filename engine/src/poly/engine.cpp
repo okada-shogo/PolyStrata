@@ -17,6 +17,7 @@
 #include "mmq.hpp"
 #include "qwen35.hpp"
 #include "runtime.hpp"
+#include "split_plan.hpp"
 #include "strata/poly/kernels.hpp"
 #if defined(STRATA_GPU_METAL)
 #include "strata/core/conversation_memory.hpp"
@@ -604,14 +605,37 @@ private:
     std::exception_ptr err_;
 };
 
+// A card's memory bandwidth in GB/s for split_plan.hpp, from its peak memory clock and bus width; 0 where it is not
+// known (Metal; HIP, whose clocks are not read this way yet).  STRATA_POLY_CARD_GBS=a,b,... gives each card's.
+double card_gbs(int d) {
+    if (const char* v = std::getenv("STRATA_POLY_CARD_GBS"); v && *v) {
+        const char* at = v;
+        for (int k = 0; k < d && at; ++k) at = std::strchr(at, ',') ? std::strchr(at, ',') + 1 : nullptr;
+        return at ? std::max(0.0, std::atof(at)) : 0.0;
+    }
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
+    return 0;
+#else
+    int khz = 0, bits = 0;
+    if (cudaDeviceGetAttribute(&khz, cudaDevAttrMemoryClockRate, d) != cudaSuccess ||
+        cudaDeviceGetAttribute(&bits, cudaDevAttrGlobalMemoryBusWidth, d) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return 2.0 * khz * 1e3 * (bits / 8.0) / 1e9;   // double data rate
+#endif
+}
+
 // The first layer of each card's share of n_layer layers, for Options::layer_split on `cards` cards; empty: no
 // split.  "auto" shares the layers' bytes out by each card's free VRAM, less what every card's engine takes beside
 // its layers and, on the last card, the output and the draft block.  Then every card caches about the same share
 // of its layers' experts, which is where a byte of VRAM on one is worth as much as on another.  No card starts
 // inside [keep_lo, keep_hi) but at keep_lo: those layers run on one card (Inkling 2's loop); "auto" takes the
-// nearer of keep_lo and keep_hi by the layers' bytes.
+// nearer of keep_lo and keep_hi by the layers' bytes.  With such a range run `loop_runs` times a token on two cards
+// of different speeds, "auto" may take another start and swap the cards (*swap: the second device takes the first
+// layers) where split_plan.hpp estimates that clearly faster: the loop on the faster card.
 std::vector<int> layer_starts(const std::string& split, const Shards& file, int n_layer, int cards, int keep_lo = 0,
-                              int keep_hi = 0) {
+                              int keep_hi = 0, int loop_runs = 1, bool* swap = nullptr) {
     if (split.empty() || cards < 2) return {};
     const auto inside = [&](int il) { return il > keep_lo && il < keep_hi; };
     std::vector<int> starts{0};
@@ -641,11 +665,15 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
     }
     if (n_layer < 2 * cards) throw std::runtime_error("the model has too few layers to split them on " + std::to_string(cards) + " cards");
     std::vector<double> before((size_t) n_layer + 1, 0.0);   // the bytes of the layers before each one
+    std::vector<SplitLayer> layers((size_t) n_layer);         // split_plan.hpp's
     double head = 0;
     file.each([&](const TensorInfo& t) {
         int il = -1;
-        if (std::sscanf(t.name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && il < n_layer)
+        if (std::sscanf(t.name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && il < n_layer) {
             before[(size_t) il + 1] += (double) file.payload(t);
+            (t.name.find("_exps.") != std::string::npos ? layers[(size_t) il].experts : layers[(size_t) il].dense) +=
+                (double) file.payload(t);
+        }
         else if (il >= n_layer || t.name == "output.weight")   // the draft block, the output
             head += (double) file.payload(t);
     });
@@ -654,13 +682,17 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
     for (int il = 0; il < n_layer; ++il) before[(size_t) il + 1] += before[(size_t) il];
     constexpr double kBeside = 1.5 * double(1ull << 30);   // scratch, the staging buffer and the reserve, about
     std::vector<double> room((size_t) cards);
+    SplitCard two[2];
     double all_room = 0;
-    for (int d = 0; d < cards; ++d) {
+    int devices = 1;
+    ck(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
+    for (int d = 0; d < cards; ++d) {   // (STRATA_POLY_CARDS: parts on the devices there are, in turn)
         size_t free_b = 0, total_b = 0;
-        ck(cudaSetDevice(d), "cudaSetDevice");
+        ck(cudaSetDevice(d % devices), "cudaSetDevice");
         ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
         room[(size_t) d] = std::max((double) free_b - kBeside - (d == cards - 1 ? head : 0.0), double(1ull << 28));
         all_room += room[(size_t) d];
+        if (d < 2) two[d] = SplitCard{std::max((double) free_b - kBeside, 0.0), card_gbs(d)};
     }
     double share = 0;
     for (int d = 1; d < cards; ++d) {
@@ -679,6 +711,26 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
                                                                                                           : keep_hi;
         }
         starts.push_back(il);
+    }
+    if (swap && cards == 2 && keep_hi > keep_lo && loop_runs > 1) {   // Inkling 2's loop on the faster card
+        for (int il = keep_lo; il < keep_hi; ++il) layers[(size_t) il].runs = loop_runs;
+        const std::string arch = file.get("general.architecture") ? file.get("general.architecture")->s : "";
+        const MetaValue* used = file.get(arch + ".expert_used_count");
+        const MetaValue* all = file.get(arch + ".expert_count");
+        const double reads = used && all && all->u > 0 ? double(used->u) / double(all->u) : 1.0 / 16;
+        const SplitPlan plan = loop_split(layers, head, two, keep_lo, keep_hi, starts[1], reads);
+        if (plan.cut != starts[1] || plan.swap) {
+            const bool first = plan.cut >= keep_hi;   // the first part has the loop
+            std::fprintf(stderr,
+                         "strata-poly: layer split auto: the loop (layers %d to %d, %d runs a token) on the faster "
+                         "card, device %d (%.0f GB/s, the other %.0f): the second part from layer %d%s, %.1f ms a "
+                         "token estimated where %d in the devices' order is %.1f\n",
+                         keep_lo, keep_hi - 1, loop_runs, first != plan.swap ? 0 : 1, two[first != plan.swap ? 0 : 1].gbs,
+                         two[first != plan.swap ? 1 : 0].gbs, plan.cut, plan.swap ? ", the devices swapped" : "",
+                         plan.ms, starts[1], split_ms(layers, head, two, starts[1], false, reads));
+        }
+        starts[1] = plan.cut;
+        *swap = plan.swap;
     }
     return starts;
 }
@@ -1930,23 +1982,26 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     // STRATA_POLY_CARDS=N: a split's N parts on the devices there are, in turn, so that a split is tried on one card
     if (const char* v = std::getenv("STRATA_POLY_CARDS"); v && !o.layer_split.empty()) cards = std::max(1, std::atoi(v));
     std::vector<int> starts;
+    bool swap = false;   // "auto" put the first layers on the second device (layer_starts())
     if (cards > 1) {
         const MetaValue* blocks = file.get(name + ".block_count");
         const MetaValue* nextn = file.get(name + ".nextn_predict_layers");
         if (!blocks) throw std::runtime_error("the GGUF has no " + name + ".block_count");
         // Inkling 2's loop runs on one card: a later pass of it runs the core's layers again (Inkling2::next_layer())
-        int keep_lo = 0, keep_hi = 0;
+        int keep_lo = 0, keep_hi = 0, loop_runs = 1;
         if (name == "inkling2_loop") {
             const MetaValue* lo = file.get(name + ".loop.start");
             const MetaValue* hi = file.get(name + ".loop.end");
+            const MetaValue* count = file.get(name + ".loop.count");
             if (!lo || !hi) throw std::runtime_error("unsupported model: no " + name + ".loop.start and .loop.end");
             keep_lo = (int) lo->u;
             keep_hi = (int) hi->u;
+            loop_runs = count ? (int) count->u : 1;
         }
         int was = 0;
         ck(cudaGetDevice(&was), "cudaGetDevice");
         starts = layer_starts(o.layer_split, file, (int) blocks->u - (nextn ? (int) nextn->u : 0), cards, keep_lo,
-                              keep_hi);
+                              keep_hi, loop_runs, &swap);
         ck(cudaSetDevice(was), "cudaSetDevice");
     }
     if (starts.empty()) {
@@ -1973,7 +2028,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         e->lo_ = starts[k];
         e->end_ = last ? -1 : starts[k + 1];
         e->split_ = true;
-        ck(cudaSetDevice((int) k % devices), "cudaSetDevice");
+        ck(cudaSetDevice((swap ? 1 - (int) k : (int) k) % devices), "cudaSetDevice");
         try {
             e->load(so);
         } catch (const std::runtime_error& err) {
@@ -1988,7 +2043,8 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     int k = 0;
     for (const Engine* e = first.get(); e; e = e->next_.get(), ++k)
         std::fprintf(stderr, "strata-poly: layers %d to %d on card %d: %d of %d routed experts in VRAM (%.1f GiB)\n",
-                     e->lo_, e->hi_ - 1, k, e->cached_, e->n_moe_ * e->n_expert_, double(e->exp_at_) / double(1ull << 30));
+                     e->lo_, e->hi_ - 1, swap ? e->device_ : k, e->cached_, e->n_moe_ * e->n_expert_,
+                     double(e->exp_at_) / double(1ull << 30));
     return first;
 }
 

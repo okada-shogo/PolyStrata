@@ -55,6 +55,8 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME poly_q35_scratch_arena_test COMMAND poly_q35_scratch_arena_test)
   add_executable(poly_stream_stage_test src/poly/stage_copy_test.cpp)
   add_test(NAME poly_stream_stage_test COMMAND poly_stream_stage_test)
+  add_executable(poly_split_plan_test src/poly/split_plan_test.cpp)
+  add_test(NAME poly_split_plan_test COMMAND poly_split_plan_test)
 endif()
 
 # Shared prepared-input GDN recurrence on the tensor cores (gdn_mma_tiles.cuh has the tiles it takes from llama.cpp's

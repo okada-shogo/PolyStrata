@@ -158,6 +158,13 @@ The installer downloads the files under the repository's `Mainline_Support` fold
 Each card keeps its layers' weights, attention caches and expert cache. The loop's twelve layers (6 to 17, which
 run three times a token) stay on one card, so the second card starts at layer 1 to 6 or 18 to 22; a number inside
 the loop is refused. `"auto"` shares the layers by each card's free VRAM and takes 6 or 18, whichever is nearer.
+On two cards whose memory bandwidth differs by more than 5%, `"auto"` also estimates a token's time for every
+place to start the second card and both card orders, counting the loop's layers three times, and takes the fastest
+when it is at least 3% faster: the loop then goes to the faster card, whatever order the cards are listed in. The
+log line `layer split auto: the loop ... on the faster card` says when it did. Equal cards get the plain layout.
+`STRATA_POLY_CARD_GBS=a,b` gives the cards' bandwidths in GB/s where the driver's figure is wrong (on AMD cards it
+is not read, so they get the plain layout unless it is set). This has not been run on two unequal cards yet. The
+idea of keeping the loop on the faster card comes from cobra91 and kuraneko1 (Strata PR #6506).
 Once a token, a card hands the next one the token's residual streams and the loop's inputs, 64.5 KB. The DSpark
 drafter (`--draft-model`) runs on one card only.
 
