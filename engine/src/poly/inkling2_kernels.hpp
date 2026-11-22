@@ -111,6 +111,7 @@ struct InkClips {
     uint16_t* cache[4] = {};
     int ring = 0;
     bool kv8 = false;   ///< the caches are FP8 (InkAttn::kv8)
+    bool kvq8 = false;  ///< the caches are Q8_0 (InkAttn::kvq8)
 };
 void ink_clips(const InkClips& c, void* stream);
 
@@ -168,6 +169,7 @@ struct InkQkv {
     float qk_thr = 0.f, rel_thr = 0.f, alpha = 0.f, floor = 1.f, eps = 0.f;
     int n_head = 0, n_kv = 0, dim = 0, n_rel = 0, taps = 0, ring = 0;
     bool kv8 = false;   ///< the caches are FP8 (InkAttn::kv8)
+    bool kvq8 = false;  ///< the caches are Q8_0 (InkAttn::kvq8)
 };
 void ink_qkv(const InkQkv& a, void* stream);
 
@@ -200,6 +202,9 @@ struct InkAttn {
     /// the caches are FP8 E4M3: a row the n_kv heads' dim codes, then a float scale a head (its largest magnitude
     /// over 448), ink_kv8_row() bytes; else fp16, n_kv * dim halves a row
     bool kv8 = false;
+    /// the caches are Q8_0: a row the n_kv heads' dim int8 codes, then a half scale for each block of 32 values in
+    /// the codes' order (a block's largest magnitude over 127), ink_kvq8_row() bytes
+    bool kvq8 = false;
 };
 void ink_attend(const InkAttn& a, void* stream);
 /// ink_attend() of a prompt batch on the tensor cores, its scores never written out (FlashAttention-2's way): the
@@ -210,6 +215,8 @@ bool ink_attend_batch(const InkAttn& a, void* stream);
 
 /// An FP8 cache row's bytes.
 inline size_t ink_kv8_row(int n_kv, int dim) { return (size_t) n_kv * dim + (size_t) n_kv * sizeof(float); }
+/// A Q8_0 cache row's bytes (InkAttn::kvq8): n_kv * dim codes, then n_kv * dim / 32 half scales.
+inline size_t ink_kvq8_row(int n_kv, int dim) { return (size_t) n_kv * dim + (size_t) n_kv * dim / 32 * sizeof(uint16_t); }
 /// Whether ink_attend_batch() runs here (FP8 caches need it: attend_batch() reads fp16 only).
 bool ink_kv8_ok();
 

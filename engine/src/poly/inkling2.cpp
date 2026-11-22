@@ -37,7 +37,8 @@ void Inkling2::load_geometry() {
     opt_.draft = false;
     need(opt_.batch == 0, "Inkling 2 runs one sequence (--batch is not supported for it yet)");
     need(opt_.layer_split.empty(), "Inkling 2 runs on one card (--layer-split is not supported for it yet)");
-    need(opt_.kv_format == KvFmt::kFp16 || opt_.kv_format == KvFmt::kFp8, "Inkling 2's attention caches are fp16 or fp8");
+    need(opt_.kv_format == KvFmt::kFp16 || opt_.kv_format == KvFmt::kFp8 || opt_.kv_format == KvFmt::kQ8_0,
+         "Inkling 2's attention caches are fp16, fp8 or q8_0");
     load_shape();
     auto find = [&](const char* key) { return meta_in(*gg_, key); };
     auto first_u = [&](const char* key) {   // a number, or a list's first where every layer has the same
@@ -104,6 +105,16 @@ void Inkling2::load_geometry() {
     kv8_ = opt_.kv_format == KvFmt::kFp8;
     need(!kv8_ || (ink_kv8_ok() && head_dim_ == 128 && n_rel_ == 16),
          "--kv fp8 needs ink_attend_batch(): an NVIDIA card from Ampere on, STRATA_INK_FLASH not 0");
+    // --kv q8_0: the caches in Q8_0, a half scale for each block of 32 values (ink_kvq8_row()): 1,088 bytes a row
+    // for Inkling 2 Mini's 8 heads of 128, where fp16 takes 2,048.  Unlike fp8 it needs no FP8 conversions, so it
+    // works on every card, Turing and HIP included: the token kernels and the flash kernel turn the codes into
+    // floats as they read them, and attend_batch() dequantizes a block of rows at a time into kvw_ (halves) for its
+    // products.  Opt-in, off by default: the codes round the keys and values.
+    kvq8_ = opt_.kv_format == KvFmt::kQ8_0;
+    need(!kvq8_ || head_dim_ % 32 == 0, "--kv q8_0 needs heads of a multiple of 32 values");
+#if defined(STRATA_GPU_METAL)
+    need(!kvq8_, "--kv q8_0 has no Metal kernels for Inkling 2 yet");
+#endif
 
     const MetaValue* pattern = find("attention.sliding_window_pattern");
     need(pattern && pattern->type == MetaType::ARRAY && (int) pattern->items.size() >= n_layer_,
@@ -599,6 +610,11 @@ void Inkling2::assign_scratch() {
     zeros_ = fbuf((size_t) n_head_);
     xqo_ = fbuf((kernels::native_q8_1_bytes(n_head_ * head_dim_) + sizeof(float) - 1) / sizeof(float));
     if (rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
+    if (rows_ >= kStageRows && kvq8_ && !ink_kv8_ok()) {
+        // attend_batch()'s fp16 rows of a Q8_0 cache, keys then values: a block of kKvq8WorkRows rows a product
+        kvw_halves_ = (size_t) std::min<int64_t>(opt_.max_context, kKvq8WorkRows) * n_kv_ * head_dim_;
+        kvw_ = fbuf(kvw_halves_);   // 2 * kvw_halves_ halves
+    }
     if (ds_file_) {   // the drafter's: a call's features and mixes, and a block's rows
         const size_t E = (size_t) n_embd_, hq = (size_t) n_head_ * head_dim_, kv = (size_t) n_kv_ * head_dim_,
                      B = (size_t) ds_block_, V = (size_t) n_vocab_, R = (size_t) ds_rank_;
@@ -1038,6 +1054,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         c.taps = taps_;
         c.ring = B.swa ? ring_ : 0;
         c.kv8 = kv8_;
+        c.kvq8 = kvq8_;
         ink_qkv(c, st_);
     } else {
         if (n <= kConvFew) {   // a window's K and V convolutions in one launch
@@ -1076,6 +1093,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         c.cache[2] = S.vals;
         c.ring = B.swa ? ring_ : 0;
         c.kv8 = kv8_;
+        c.kvq8 = kvq8_;
         ink_clips(c, st_);
     }
     InkAttn a;
@@ -1102,6 +1120,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     a.scale = 1.f / std::sqrt((float) head_dim_);
     a.gate = gate_;   // the output gate in the join's launch, or the flash kernel's
     a.kv8 = kv8_;
+    a.kvq8 = kvq8_;
     if (n >= kStageRows && ink_attend_batch(a, st_)) {
         // a prompt batch on the tensor cores with no score written out: attend_batch()'s path below wrote 1.6e11
         // scores of a 30,954-token read and read them back, 8.9 of its 16.8 s of attention on the RTX 4070 Laptop
@@ -1116,8 +1135,16 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         bias.n_rel = n_rel_;
         bias.extent = B.extent;
         ck(cudaMemsetAsync(zeros_, 0, (size_t) n_head_ * sizeof(float), cs(st_)), "attention");
-        attend_batch(blas_, q_, S.keys, S.vals, pos_, n, score_, score_n_, awork_, att_, head_dim_, n_head_, n_kv_,
-                     a.scale, st_, a.window, a.ring, false, {}, {}, nullptr, nullptr, 0, zeros_, nullptr, &bias);
+        // a Q8_0 cache: a row's codes, then its scales (Kvq8::ss), the products reading rows dequantized into kvw_
+        const size_t row = kv_row(), codes = (size_t) n_kv_ * head_dim_;
+        const auto q8 = [&](const uint16_t* c) {
+            return kvq8_ ? Kvq8{(const int8_t*) c, (const uint16_t*) ((const uint8_t*) c + codes), row, row / 2}
+                         : Kvq8{};
+        };
+        uint16_t* kw = kvq8_ ? (uint16_t*) kvw_ : nullptr;
+        attend_batch(blas_, q_, kvq8_ ? nullptr : S.keys, kvq8_ ? nullptr : S.vals, pos_, n, score_, score_n_, awork_,
+                     att_, head_dim_, n_head_, n_kv_, a.scale, st_, a.window, a.ring, false, q8(S.keys), q8(S.vals),
+                     kw, kw ? kw + kvw_halves_ : nullptr, kvw_halves_, zeros_, nullptr, &bias);
         ink_mul_sigmoid(att_, gate_, (size_t) n * hq, st_);
     } else {
         if (n == 1) a.q8 = xqo_;   // and the output quantized for wo

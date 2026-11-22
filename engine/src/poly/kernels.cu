@@ -4356,11 +4356,11 @@ void merge_attn_piece(float* acc_out, float* acc_ml, const float* piece_out, con
 // instead: out[r * width + i] = (float)codes[row + r][i] * __half2float(scales[row + r][i / 32]).  blockIdx.y is
 // the row of the block (blockIdx.x the columns).  A block never wraps a ring: it ends where a ring starts over.
 __global__ void dequant_q8_kernel(const int8_t* __restrict__ codes, const uint16_t* __restrict__ scales,
-                                  half* __restrict__ out, int width, long long row, size_t rs) {
+                                  half* __restrict__ out, int width, long long row, size_t rs, size_t ss) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= width) return;
     const size_t r = (size_t) (row + blockIdx.y), at = r * rs;
-    const float d = __half2float(__ushort_as_half(scales[r * (rs >> 5) + (i >> 5)]));
+    const float d = __half2float(__ushort_as_half(scales[r * ss + (i >> 5)]));
     out[(size_t) blockIdx.y * width + i] = __float2half((float) codes[at + i] * d);
 }
 
@@ -5170,10 +5170,12 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
             // a q8 cache's rows are dequantized into the workspace the products read as an fp16 cache
             if (kq)
                 dequant_q8_kernel<<<dim3(grid(width, 256), m), 256, 0, cs(stream)>>>(
-                    kq8.codes, kq8.scales, (half*) kwork, width, row, kq8.rs ? kq8.rs : size_t(width));
+                    kq8.codes, kq8.scales, (half*) kwork, width, row, kq8.rs ? kq8.rs : size_t(width),
+                    kq8.ss ? kq8.ss : (kq8.rs ? kq8.rs : size_t(width)) >> 5);
             if (vq)
                 dequant_q8_kernel<<<dim3(grid(width, 256), m), 256, 0, cs(stream)>>>(
-                    vq8.codes, vq8.scales, (half*) vwork, width, row, vq8.rs ? vq8.rs : size_t(width));
+                    vq8.codes, vq8.scales, (half*) vwork, width, row, vq8.rs ? vq8.rs : size_t(width),
+                    vq8.ss ? vq8.ss : (vq8.rs ? vq8.rs : size_t(width)) >> 5);
             const half* krow = kq ? (const half*) kwork : (const half*) kcache + size_t(row) * width;
             const half* vrow = vq ? (const half*) vwork : (const half*) vcache + size_t(row) * width;
             // A product a group: its heads' queries of every token of the chunk against the group's keys.  cuBLAS
