@@ -605,8 +605,9 @@ __device__ __align__(4) int8_t mxfp4_values[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -
 
 // Eight four-bit codes of q4 looked up in a codebook of 16: the even nibbles' values in .x, the odd ones' in .y.
 __device__ __forceinline__ int2 table16_lookup(const int8_t* table, int q4) {
-#if defined(STRATA_HIP_GFX906)
-    // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values
+#if defined(__HIPCC__)
+    // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values, and 2 to pick
+    // the halves - the same bytes as the __byte_perm sequence below, which was slower on RDNA4
     const uint32_t* v32 = reinterpret_cast<const uint32_t*>(table);
     const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
     const uint32_t el = __builtin_amdgcn_perm(v32[1], v32[0], q_even & 0x07070707u);
