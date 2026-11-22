@@ -126,8 +126,8 @@ rows took 3.4 s.
 | **Disk** | 9.1 to 17.6 GB for the model file. |
 | **System** | Linux or Windows 10 / 11, and a current NVIDIA driver; or macOS 15 or newer. |
 
-Not run yet: an AMD card, two cards (`--expert-gpu`, built but not run; `--layer-split`, below, checked with two
-parts on one card only), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
+Not run yet: an AMD card, two cards (`--expert-gpu`, built but not run; `--layer-split`, below, run only as two
+parts on one card, where a split at layer 6 still hangs), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
 on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on
 the CPU. The draft file is an
 option (`--draft-model`). The engine takes one request at a time
@@ -165,6 +165,8 @@ log line `layer split auto: the loop ... on the faster card` says when it did. E
 `STRATA_POLY_CARD_GBS=a,b` gives the cards' bandwidths in GB/s where the driver's figure is wrong (on AMD cards it
 is not read, so they get the plain layout unless it is set). This has not been run on two unequal cards yet. The
 idea of keeping the loop on the faster card comes from cobra91 and kuraneko1 (Strata PR #6506).
+Known bug, not fixed yet: a card that starts at layer 6 (`--layer-split 6` or `6,18`, and `"auto"` when it takes
+6) hangs before the first token; use 18 until it is fixed.
 Once a token, a card hands the next one the token's residual streams and the loop's inputs, 64.5 KB. The DSpark
 drafter (`--draft-model`) runs on one card only.
 
