@@ -610,8 +610,9 @@ void Inkling2::assign_scratch() {
     zeros_ = fbuf((size_t) n_head_);
     xqo_ = fbuf((kernels::native_q8_1_bytes(n_head_ * head_dim_) + sizeof(float) - 1) / sizeof(float));
     if (rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
-    if (rows_ >= kStageRows && kvq8_ && !ink_kv8_ok()) {
+    if (rows_ >= kStageRows && kvq8_) {
         // attend_batch()'s fp16 rows of a Q8_0 cache, keys then values: a block of kKvq8WorkRows rows a product
+        // (16 MiB for Inkling 2 Mini), where ink_attend_batch() does not take the batch
         kvw_halves_ = (size_t) std::min<int64_t>(opt_.max_context, kKvq8WorkRows) * n_kv_ * head_dim_;
         kvw_ = fbuf(kvw_halves_);   // 2 * kvw_halves_ halves
     }

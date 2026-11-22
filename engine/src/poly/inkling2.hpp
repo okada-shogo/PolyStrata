@@ -221,7 +221,7 @@ private:
           *fc_ = nullptr, *score_ = nullptr, *zeros_ = nullptr, *awork_ = nullptr;
     size_t score_n_ = 0;
     static constexpr int64_t kKvq8WorkRows = 4096;   ///< the rows of a Q8_0 cache attend_batch() dequantizes at once
-    float* kvw_ = nullptr;                           ///< their halves, keys then values (kvq8_ without the flash kernel)
+    float* kvw_ = nullptr;                           ///< their halves, keys then values (kvq8_)
     size_t kvw_halves_ = 0;
 };
 
