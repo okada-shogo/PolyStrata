@@ -49036,6 +49036,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_VMM_EQUAL_PIECES",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 950,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/AMD_HIP.md:518"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "poly",
+   "note": "[reviewed] HIP on Linux (STRATA_VMM_EQUAL_PIECES builds): every piece of a VRAM reservation is one size; on by default under WSL2 (/dev/dxg without /dev/kfd), where ROCm 7.2.4 with librocdxg refuses hipMemSetAccess on a piece mapped after a larger one; =1 or =0 forces it on or off (engine/src/poly/engine.cpp:948, docs/AMD_HIP.md:518)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_VMM_SETTLE",
    "backends": [
     "cuda-hip"

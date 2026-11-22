@@ -512,6 +512,10 @@ before it installs a model.
   The engine now waits after it maps a piece (`Engine::vmm_settle()`: an ordinary allocation, which the kernel does
   wait for). `STRATA_VMM_SETTLE=0` leaves the wait out. An engine from before that runs there with
   `--vram-reserve-mib 512`, which keeps the cache from growing.
+- Under WSL2 (ROCm 7.2.4 with librocdxg: `/dev/dxg` and no `/dev/kfd`) ROCm refuses `hipMemSetAccess` on a piece
+  mapped after a larger one in the same reservation, so every piece of a reservation is made one size there (the
+  expert cache had lost its last 64 MiB piece, and an attention cache grown to its end failed).
+  `STRATA_VMM_EQUAL_PIECES=1` or `=0` turns that on or off on any Linux HIP build.
 - Opt-in `--vram-pool` (strata-poly, VMM): the engine claims the card's VRAM once at load, as 2 MiB
   handles, and keeps it for the whole run. The attention caches and the expert cache trade handles of that pool as the
   context grows and shrinks, and nothing is released to the card, so the "released VRAM never returns" above does not
