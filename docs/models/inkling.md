@@ -126,7 +126,8 @@ rows took 3.4 s.
 | **Disk** | 9.1 to 17.6 GB for the model file. |
 | **System** | Linux or Windows 10 / 11, and a current NVIDIA driver; or macOS 15 or newer. |
 
-Not run yet: an AMD card, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
+Not run yet: an AMD card, two cards (`--expert-gpu`, built but not run; `--layer-split`, below, checked with two
+parts on one card only), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
 on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on
 the CPU. The draft file is an
 option (`--draft-model`). The engine takes one request at a time
@@ -150,6 +151,15 @@ Add `--model UD-Q3_K_XL` or `--model UD-Q2_K_XL` for a smaller size.
 
 The installer downloads the files under the repository's `Mainline_Support` folder, the layout llama.cpp runs
 (`inkling2_loop`). The files at the top of the repository are another layout, which the engine refuses by name.
+
+## Two or more cards
+
+`--layer-split` puts the first layers on one card and the rest on the next, as for the other strata-poly models.
+Each card keeps its layers' weights, attention caches and expert cache. The loop's twelve layers (6 to 17, which
+run three times a token) stay on one card, so the second card starts at layer 1 to 6 or 18 to 22; a number inside
+the loop is refused. `"auto"` shares the layers by each card's free VRAM and takes 6 or 18, whichever is nearer.
+Once a token, a card hands the next one the token's residual streams and the loop's inputs, 64.5 KB. The DSpark
+drafter (`--draft-model`) runs on one card only.
 
 ## How does it work?
 

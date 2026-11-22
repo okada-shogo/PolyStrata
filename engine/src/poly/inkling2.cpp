@@ -41,7 +41,10 @@ void Inkling2::load_geometry() {
     // a short prompt that had few (RTX 5090, UD-Q4_K_XL, --window 4).  With it a window is its block.
     opt_.draft = false;
     need(opt_.batch == 0, "Inkling 2 runs one sequence (--batch is not supported for it yet)");
-    need(opt_.layer_split.empty(), "Inkling 2 runs on one card (--layer-split is not supported for it yet)");
+    // On several cards (--layer-split) a card runs a run of the layers, and the loop's (core_start_ to core_end_ - 1)
+    // are on one card: next_layer() runs them again for a later pass.  Engine::open() starts no card inside them.
+    // The drafter stays on one card: its features are three layer runs' inputs, which may be another card's.
+    need(!split_ || opt_.draft_model.empty(), "Inkling 2's --draft-model runs on one card (no --layer-split)");
     need(opt_.kv_format == KvFmt::kFp16 || opt_.kv_format == KvFmt::kFp8, "Inkling 2's attention caches are fp16 or fp8");
     load_shape();
     auto find = [&](const char* key) { return meta_in(*gg_, key); };
@@ -92,6 +95,8 @@ void Inkling2::load_geometry() {
              core_end_ <= n_layer_ && core_start_ % blk_ == 0 && core_end_ % blk_ == 0,
          "bad loop");
     need((core_end_ - core_start_) / blk_ - 1 <= 1, "a loop core of more than two blocks is not supported");
+    const auto inside = [&](int il) { return il > core_start_ && il < core_end_; };
+    need(!inside(lo_) && !(end_ >= 0 && inside(end_)), "a card of a split starts inside the loop");
     // every expert's scale goes on its joined gate and up product, whatever the experts' type
     joined_scales_ = true;
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
@@ -489,9 +494,10 @@ void Inkling2::load_layer(int il) {
     };
     const int64_t e = n_embd_, hq = (int64_t) n_head_ * head_dim_, kv = (int64_t) n_kv_ * head_dim_;
 
-    if (il == 0) {
-        tok_norm_ = upload(gg_->find("token_embd_norm.weight"), "token_embd_norm.weight", e, 1, kF32);
-        out_query_ = upload(gg_->find("output_res_query.weight"), "output_res_query.weight", e, 1, kF32);
+    if (il == lo_) {   // beside the card's first layer: the input's norm on the first card, the output's mix on the last
+        if (lo_ == 0) tok_norm_ = upload(gg_->find("token_embd_norm.weight"), "token_embd_norm.weight", e, 1, kF32);
+        if (hi_ == n_layer_)
+            out_query_ = upload(gg_->find("output_res_query.weight"), "output_res_query.weight", e, 1, kF32);
     }
     B.swa = swa_[(size_t) il];
     L.fixed = true;    // the launches read the position on the card when they are recorded (head_key(), tail_key())
@@ -1317,6 +1323,10 @@ size_t Inkling2::extra_bytes() const {
     for (const Slot& s : slots_) n += blocks_[(size_t) s.il].swa ? 1 : 0;
     return n * 2 * (size_t) keep_ * row;
 }
+
+// On a layer split the next card goes on from these and r_: what crosses is the stream, the four blocks' starts the
+// mixes read and the loop's bank (64.5 KB a token at Inkling 2 Mini's width).
+float* Inkling2::carried(int i) { return i < kBlocks ? bl_[i] : i == kBlocks ? bank_ : bank_out_; }
 
 void Inkling2::carry_at(float* at) {
     const auto place = [&](int i) { return at ? at + (size_t) i * rows_ * n_embd_ : home_[i]; };

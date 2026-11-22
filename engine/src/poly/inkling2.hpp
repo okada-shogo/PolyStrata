@@ -54,6 +54,7 @@ protected:
     // the runs a group at a time.  Not with the drafter, whose taps of three runs are a call's too.
     int carry_rows() const override { return ds_file_ ? 0 : kBlocks + 2; }
     void carry_at(float* at) override;
+    float* carried(int i) override;
     void save_run(int il, int64_t pos, uint8_t* dst) override;
     void output_rows(int first, int rows, float* h) override;
     void finish_logits(float* logits, int rows) override;

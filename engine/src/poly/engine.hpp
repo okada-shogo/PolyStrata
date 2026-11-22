@@ -529,6 +529,9 @@ protected:
     /// buffers of them at a call's: carry_rows() blocks of rows_ rows each from `at`, or back at its own with null.
     virtual int carry_rows() const { return 0; }
     virtual void carry_at(float* at) { (void) at; }
+    /// The architecture's block i of those rows as they are now (carry_at()), rows_ rows.  On a layer split they cross
+    /// to the next card beside the rows of r_ (carry_out(), carry_in()).
+    virtual float* carried(int i) { (void) i; return nullptr; }
     /// A token's experts outside VRAM may go to the host's threads through the doorbell (h_bell_): the architecture
     /// routes on the card (route_card()) and sums a token's experts in moe_card() when moe_sum_later() is false.
     virtual bool bells() const { return false; }
@@ -642,6 +645,10 @@ protected:
     /// The rows a call of n tokens leaves in r_, to h (pinned) for the next card's engine, which goes on from them.
     void hand_on(int64_t pos, int n, float* h);
     float* pass_rows(int n);
+    /// The carried rows (carry_rows()) of a call's n tokens to h, behind their rows of r_ there, for the next card;
+    /// and on that card, the ones of its call of n tokens from row `from` of what the card before handed on.
+    void carry_out(float* h, int n);
+    void carry_in(int64_t from, int n);
     /// kGuessMat: quantized again to guess_type_ (Q4_0, Q5_0 or IQ4_NL), for a matrix only guesses are made with: a
     /// guess is checked, so a less exact one costs a wrong guess now and then and no token.  (Inkling 2 reads its
     /// attention's matrices so with --attn-requant: inkling2.cpp.)
@@ -843,6 +850,7 @@ protected:
     int64_t read_draft_calls_ = 0;               ///< read_draft_calls_for_test()
     const float* pass_ = nullptr;
     int64_t pass_at_ = 0;
+    int pass_n_ = 0;                      ///< the rows the card before handed on at pass_ (carry_in())
     float* h_pass_ = nullptr;             ///< pinned; h_pass_rows_ tokens' rows
     int h_pass_rows_ = 0;
     mutable Stats all_stats_;             ///< stats() of every card's engine together
