@@ -94,16 +94,17 @@ rows took 3.4 s.
 | **Disk** | 9.1 to 17.6 GB for the model file. |
 | **System** | Linux or Windows 10 / 11, and a current NVIDIA driver; or macOS 15 or newer. |
 
-**AMD (HIP), experimental, not ready:** the engine builds for RDNA3 and RDNA4 (gfx1100, gfx1200, gfx1201), and main's
-HIP tests pass on an RX 7900 XT (15 of 16) and on an RX 9070 XT (11 of 16), both under ROCm 7.2.4 in a container that
-reaches the card through librocdxg. Known problems there: a prompt with some experts in RAM can hang (the engine waits
-forever, at full CPU load); on the RX 9070 XT the prompt products' library gave a NaN and results that differ run to run
-in its test. Use an NVIDIA card or a Mac for now.
+**AMD (HIP), experimental, not ready:** the engine builds for RDNA3 and RDNA4 (gfx1100, gfx1200, gfx1201). It has run
+on an RX 7900 XT (gfx1100) and an RX 9070 XT (gfx1201), ROCm 7.2.4, in containers that reach the card through
+librocdxg: the HIP tests pass (16 of 16) and so does the Inkling 2 kernel test. Two failures of the first runs are
+fixed: the first prompt never finished on any AMD card, and with some experts in RAM the RX 9070 XT crashed. With every
+expert on the CPU the answers match an RTX 2070 Super's: on the RX 7900 XT the same most likely token at 61 to 64 of
+64 steps after a 302-token prompt, and at 15 to 16 of 16 after 2,048 tokens. Still open: after 2,048 tokens the RX
+9070 XT's answers differ from CUDA's more than the RX 7900 XT's do. Use an NVIDIA card or a Mac for now.
 
-Not run yet: a desktop AMD card on native Linux or Windows, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
-on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on
-the CPU. The draft file is an
-option (`--draft-model`). The engine takes one request at a time
+Not run yet: an AMD card on native Linux or Windows, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the
+8 GB card and UD-Q4_K_XL on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or
+the card; on a Mac, on the CPU. The draft file is an option (`--draft-model`). The engine takes one request at a time
 for this model, and the installer writes `"parallel": 1`. Its license is Apache 2.0.
 
 ## Install
