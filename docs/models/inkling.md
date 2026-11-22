@@ -105,6 +105,12 @@ a 32K context.
 `--kv fp8` needs an NVIDIA card from Ampere on. `--kv q8_0` saves about the same (Q8_0 blocks: 8-bit codes and a
 16-bit scale for every 32 values) without FP8 hardware: checked on Turing by its kernel test; AMD not run yet, and a
 Mac refuses it. Both are opt-in and change the answers slightly.
+With `--kv q8_0`, `STRATA_KV_INT8=1` (the name of Kolibri's opt-in) takes the attention scores of a written token that
+reads 32,768 keys or more (only the full-attention layers' tokens do) by `__dp4a`, with the queries quantized to Q8_0
+codes too. The softmax, the values, window layers, shorter contexts and the prompt are left as they are. On an RTX
+2080 Ti one such layer's attention of a token at 131K went from 1.76 to 1.57 ms; with the IQ4_NL file, a 131K
+context and the experts held fixed, KL against the default was about 1e-6 a token at prompts of 40K to 131K. Off by
+default: it changes the arithmetic.
 
 On a Mac it runs on strata-poly's Metal engine, as a beta. Measured on an Apple M5 Ultra with 256 GB of unified memory,
 UD-Q3_K_XL, the README's benchmark on setup's settings with a 40,960-token context: 256 tokens written, the most likely

@@ -19032,6 +19032,12 @@
    ],
    "reads": [
     {
+     "file": "engine/src/poly/inkling2.cpp",
+     "line": 122,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
      "file": "engine/src/poly/kolibri1.cpp",
      "line": 200,
      "backend": "cuda-hip",
@@ -19047,7 +19053,9 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [
-    "docs/Q8_KV.md:18"
+    "docs/Q8_KV.md:18",
+    "docs/Q8_KV.md:21",
+    "docs/models/inkling.md:76"
    ],
    "first_commit": null,
    "first_date": null,
@@ -19056,7 +19064,7 @@
    "last_date": null,
    "status": "opt-in",
    "owner": "poly",
-   "note": "[reviewed] Kolibri 1: =1 reads the q8_0 cache with the int8 dp4a kernel (the queries quantized too), for decode and the prompt; changes the arithmetic, off by default (engine/src/poly/kolibri1.cpp:197, docs/Q8_KV.md:18)",
+   "note": "[reviewed] Kolibri 1: =1 reads the q8_0 cache with the int8 dp4a kernel (the queries quantized too), for decode and the prompt; changes the arithmetic, off by default (engine/src/poly/kolibri1.cpp:197, docs/Q8_KV.md:18); Inkling 2: with --kv q8_0, =1 takes a decoded token's scores by __dp4a once it reads 32,768 keys or more (full layers only), the queries quantized too; off by default (engine/src/poly/inkling2.cpp:122, docs/models/inkling.md)",
    "retire_after": "",
    "retired_in": ""
   },

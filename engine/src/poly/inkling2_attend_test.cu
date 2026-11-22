@@ -4,6 +4,9 @@
 //                 rows, positions on the host and on the card, gate and q8 output on and off): one FNV-1a hash of each
 //                 call's output bytes a line.  Two builds' files differ where their outputs differ; equal files mean the same bits
 //                 (but for a hash collision).  Exit 1 if a call's output is not finite.
+//   hash <file> int8   the same with InkAttn::int8_dot (STRATA_KV_INT8) on every call: the same hashes as without
+//                 it but for q8_0 full layers' tokens of 32,768 keys or more
+//   int8          int8_dot against the default, q8_0 full layers past 32K: how far the outputs move
 //   bench         one token of a full layer, rooms 32K to 1M: microseconds a call and the caches' bytes a second.
 // Needs a card; run by hand.
 #include "inkling2_kernels.hpp"
@@ -34,6 +37,7 @@ void ck(cudaError_t e, const char* w) {
 
 constexpr int kHeads = 24, kKv = 8, kDim = 128, kRel = 16;
 std::mt19937 rng(77);
+bool g_int8 = false;   // InkAttn::int8_dot (STRATA_KV_INT8) on every call
 
 std::vector<float> randf(size_t n, float sd) {
     std::normal_distribution<float> d(0.0f, sd);
@@ -137,6 +141,7 @@ InkAttn base(const Bufs& b, const uint8_t* k, const uint8_t* v, Fmt f) {
     a.scale = 1.0f / std::sqrt((float) kDim);
     a.kv8 = f == kF8;
     a.kvq8 = f == kQ8;
+    a.int8_dot = g_int8;
     return a;
 }
 
@@ -213,6 +218,45 @@ int run_hash(const char* path) {
     return 0;
 }
 
+// int8_dot against the default on q8_0 caches, full layers, rooms past 32K: the outputs' largest difference and
+// their difference's RMS over the default's RMS.  Fails past 3% (made-up caches of wide scores).
+int run_int8() {
+    const int64_t ctx = 140000;
+    Bufs b = make_bufs(ctx + kMaxRows);
+    uint8_t *k = make_cache(kQ8, ctx + kMaxRows), *v = make_cache(kQ8, ctx + kMaxRows);
+    const size_t n = (size_t) kMaxRows * kHeads * kDim;
+    std::vector<float> h0(n), h1(n);
+    int bad = 0;
+    for (int64_t pos : {32767LL, 32768LL, 40000LL, 65535LL, 131071LL, 139990LL})
+        for (int rows : {1, 3}) {
+            for (int i = 0; i < 2; ++i) {
+                g_int8 = i == 1;
+                InkAttn a = base(b, k, v, kQ8);
+                a.rel_bias = b.bias_full;
+                a.extent = 1024;
+                a.pos = pos;
+                a.rows = rows;
+                ink_attend(a, nullptr);
+                ck(cudaDeviceSynchronize(), "run");
+                ck(cudaMemcpy(i ? h1.data() : h0.data(), b.out, (size_t) rows * kHeads * kDim * 4,
+                              cudaMemcpyDeviceToHost), "download");
+            }
+            double se = 0, s0 = 0, mx = 0;
+            for (size_t i = 0; i < (size_t) rows * kHeads * kDim; ++i) {
+                const double d = (double) h1[i] - h0[i];
+                se += d * d, s0 += (double) h0[i] * h0[i], mx = std::max(mx, std::fabs(d));
+            }
+            const double rel = std::sqrt(se / std::max(s0, 1e-30));
+            const bool ok = rel < 0.03 && std::isfinite(rel);
+            bad += !ok;
+            std::printf("int8 q8_0 full pos %lld rows %d: largest diff %.3g, rms rel %.3g %s\n", (long long) pos, rows,
+                        mx, rel, ok ? "ok" : "FAIL");
+        }
+    g_int8 = false;
+    std::printf("int8: %s\n", bad ? "FAILED" : "PASSED");
+    return bad ? 1 : 0;
+}
+
 int run_bench() {
     const int64_t rooms[] = {32768, 131072, 262144, 524288, 1048576};
     size_t free_b = 0, total_b = 0;
@@ -230,7 +274,10 @@ int run_bench() {
         ck(cudaEventCreate(&e0), "event"), ck(cudaEventCreate(&e1), "event");
         for (int64_t room : rooms) {
             if (room > most) break;
+          for (int i8 = 0; i8 < (fm == kQ8 ? 2 : 1); ++i8) {
+            g_int8 = i8 == 1;
             InkAttn a = base(b, k, v, fm);
+            g_int8 = false;
             a.rel_bias = b.bias_full;
             a.extent = 1024;
             a.pos = room - 1;
@@ -246,8 +293,9 @@ int run_bench() {
             float ms = 0.0f;
             ck(cudaEventElapsedTime(&ms, e0, e1), "event");
             const double us = 1000.0 * ms / reps, bytes = (double) room * row_bytes(fm) * 2;
-            std::printf("bench %s full room %lld: %.1f us a call, %.0f GB/s of the caches\n", fmt_name(fm),
-                        (long long) room, us, bytes / us / 1000.0);
+            std::printf("bench %s%s full room %lld: %.1f us a call, %.0f GB/s of the caches\n", fmt_name(fm),
+                        a.int8_dot ? " int8_dot" : "", (long long) room, us, bytes / us / 1000.0);
+          }
         }
         (void) cudaFree(k), (void) cudaFree(v);
     }
@@ -262,8 +310,12 @@ int main(int argc, char** argv) {
         std::printf("no card: skipped\n");
         return 77;
     }
-    if (argc >= 3 && std::string(argv[1]) == "hash") return run_hash(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "hash") {
+        g_int8 = argc >= 4 && std::string(argv[3]) == "int8";
+        return run_hash(argv[2]);
+    }
+    if (argc >= 2 && std::string(argv[1]) == "int8") return run_int8();
     if (argc >= 2 && std::string(argv[1]) == "bench") return run_bench();
-    std::fprintf(stderr, "usage: poly_inkling2_attend_test hash <file> | bench\n");
+    std::fprintf(stderr, "usage: poly_inkling2_attend_test hash <file> [int8] | int8 | bench\n");
     return 2;
 }

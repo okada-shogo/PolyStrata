@@ -185,6 +185,10 @@ __device__ void kv8_store(const float* v, uint8_t* cache, long long cell, int n_
 // scale is its largest magnitude over 127 and a code round(x / scale), as llama.cpp's quantize_row_q8_0 makes them.
 // A row's codes start 4-aligned (dp4a can read them as they lie) and its scales 2-aligned. ----
 constexpr int kKvF16 = 0, kKvFp8 = 1, kKvQ8 = 2;   // the token kernels' cache formats (InkAttn::kv8, ::kvq8)
+// ink_score_kernel() of a Q8_0 cache with InkAttn::int8_dot (STRATA_KV_INT8): a token that reads kInt8From keys or
+// more takes its scores by __dp4a, its queries quantized to Q8_0 codes too; the other tokens kKvQ8's way
+constexpr int kKvQ8Dot = 3;
+constexpr int kInt8From = 32768;
 __device__ __forceinline__ size_t kvq8_row(int n_kv, int dim) { return (size_t) n_kv * dim + (size_t) n_kv * dim / 16; }
 __device__ __forceinline__ const uint16_t* kvq8_scales(const uint8_t* row, int n_kv, int dim) {
     return reinterpret_cast<const uint16_t*>(row + (size_t) n_kv * dim);
@@ -938,6 +942,16 @@ __device__ __forceinline__ void lane_q8(const void* cache, long long row, int n_
     for (int c = 0; c < kLaneHalves; ++c) out[c] = c < n ? (float) p[c] * d : 0.0f;
 }
 
+// A lane's n (2 or 4) codes of row `row`'s head g in a Q8_0 cache as one word for __dp4a (the rest of it 0), and
+// their block's scale
+__device__ __forceinline__ int lane_q8_codes(const void* cache, long long row, int n_kv, int dim, int g, int lane,
+                                             int n, float* d) {
+    const uint8_t* r = (const uint8_t*) cache + (size_t) row * kvq8_row(n_kv, dim);
+    const size_t at = (size_t) g * dim + lane * n;
+    *d = __half2float(__ushort_as_half(kvq8_scales(r, n_kv, dim)[at >> 5]));
+    return n == 4 ? *reinterpret_cast<const int*>(r + at) : (int) *reinterpret_cast<const uint16_t*>(r + at);
+}
+
 __device__ __forceinline__ void lane_halves(const __half* head, int lane, int n, float* out) {
     const __half2* p = (const __half2*) (head + lane * n);
 #pragma unroll
@@ -964,6 +978,80 @@ constexpr int kScoreShares = 32 / kScoreLanes;   // a lane's shares of a score
 constexpr int kScoreSteps = 8;                   // a warp's steps of kScoreKeys keys
 constexpr int kScoreBlockKeys = kScoreWarps * kScoreKeys * kScoreSteps;
 static_assert(kScoreShares == 4, "a lane adds the butterfly's first two rounds itself");
+
+// ink_score_kernel()'s steps for a token of kInt8From keys or more with InkAttn::int8_dot (STRATA_KV_INT8), Q8_0
+// keys: each lane's LH values of a query head (already times the scale), at the shares it takes, become Q8_0 codes,
+// a 32-value block's delta its largest |value| / 127 and a code the value times 1 / delta rounded to the nearest
+// (about as llama.cpp's flash-attention kernels quantize their queries for a quantized K).  A share is then the bias's
+// product plus one __dp4a of its codes with the key's times the two deltas; the shares and lanes are added as in the
+// default steps.  Other arithmetic, so other bits.
+template <int LH>
+__device__ __forceinline__ void score_int8(const InkAttn& a, const float* qs, const float (&rr)[kMaxPer][kScoreShares],
+                                           float* s, const float* sinks, int per, int g, long long p, long long lo,
+                                           int nk, int nk_max, int j, long long row, int sub, int mine) {
+    // a 32-value block is 32 / LH shares: in this lane's 8 for LH 4; for LH 2 also the lane's other share of it
+    int qc[kMaxPer][kScoreShares];
+    float qd[kMaxPer][kScoreShares];
+#pragma unroll
+    for (int hp = 0; hp < kMaxPer; ++hp) {
+        float x[kScoreShares][LH], amax[kScoreShares];
+#pragma unroll
+        for (int k = 0; k < kScoreShares; ++k) {
+            const int vl = sub + kScoreLanes * k;
+            amax[k] = 0.0f;
+#pragma unroll
+            for (int c = 0; c < LH; ++c) {
+                x[k][c] = hp < per ? qs[hp * a.dim + vl * LH + c] : 0.0f;
+                amax[k] = fmaxf(amax[k], fabsf(x[k][c]));
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < kScoreShares; ++k) {
+            float m = LH == 2 ? fmaxf(amax[k], amax[k ^ 1]) : amax[k];
+#pragma unroll
+            for (int o = 1; o < kScoreLanes; o <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o, WARP));
+            const float d = m / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+            int w = 0;
+#pragma unroll
+            for (int c = 0; c < LH; ++c) w |= (int(roundf(x[k][c] * id)) & 0xff) << (8 * c);
+            qc[hp][k] = w;
+            qd[hp][k] = d;
+        }
+    }
+    for (int st = 0; st < kScoreSteps; ++st) {
+        const int jw = j - mine;   // the step's first key
+        if (jw >= nk) break;       // (a whole warp)
+        const bool here = j < nk;
+        const long long dist = p - (lo + j);
+        const bool far = p - (lo + jw + kScoreKeys - 1) >= a.extent;   // (the whole warp)
+        int kc[kScoreShares];
+        float kd[kScoreShares], rb[kScoreShares];
+#pragma unroll
+        for (int k = 0; k < kScoreShares; ++k) {
+            const int vl = sub + kScoreLanes * k;
+            kc[k] = 0, kd[k] = 0.0f;
+            if (here) kc[k] = lane_q8_codes(a.keys, row, a.n_kv, a.dim, g, vl, LH, &kd[k]);
+            rb[k] = !far && here && vl < a.n_rel && dist < a.extent ? a.rel_bias[size_t(dist) * a.n_rel + vl] : 0.0f;
+        }
+#pragma unroll
+        for (int hp = 0; hp < kMaxPer; ++hp) {
+            if (hp < per) {
+                float sh[kScoreShares];
+#pragma unroll
+                for (int k = 0; k < kScoreShares; ++k)
+                    sh[k] = rb[k] * rr[hp][k] + (float) __dp4a(qc[hp][k], kc[k], 0) * (qd[hp][k] * kd[k]);
+                float v = (sh[0] + sh[2]) + (sh[1] + sh[3]);
+#pragma unroll
+                for (int o = kScoreLanes / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o, WARP);
+                if (sub == 0 && here) s[size_t(hp) * nk_max + j] = v - sinks[hp];
+            }
+        }
+        j += kScoreWarps * kScoreKeys;
+        row += kScoreWarps * kScoreKeys;
+        if (a.ring > 0)
+            while (row >= a.ring) row -= a.ring;
+    }
+}
 
 template <int KV, int LH>
 __global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, int t0, int nk_max) {
@@ -999,6 +1087,10 @@ __global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, 
     // the warp's first key and its cache row; a ring's row is advanced, not divided for, from step to step
     int j = jb + warp * kScoreKeys + mine;
     long long row = a.ring > 0 ? (lo + j) % a.ring : lo + j;
+    if (KV == kKvQ8Dot && nk >= kInt8From) {   // (the whole block)
+        score_int8<LH>(a, qs, rr, s, sinks, per, g, p, lo, nk, nk_max, j, row, sub, mine);
+        return;
+    }
     for (int st = 0; st < kScoreSteps; ++st) {
         const int jw = j - mine;   // the step's first key
         if (jw >= nk) break;       // (a whole warp)
@@ -1012,7 +1104,7 @@ __global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, 
             const int vl = sub + kScoreLanes * k;
             if (here) {
                 if (KV == kKvFp8) lane_fp8(a.keys, row, a.n_kv, a.dim, g, vl, LH, kx[k]);
-                else if (KV == kKvQ8) lane_q8(a.keys, row, a.n_kv, a.dim, g, vl, LH, kx[k]);
+                else if (KV == kKvQ8 || KV == kKvQ8Dot) lane_q8(a.keys, row, a.n_kv, a.dim, g, vl, LH, kx[k]);
                 else lane_halves((const __half*) a.keys + (size_t(row) * a.n_kv + g) * a.dim, vl, LH, kx[k]);
             } else {
 #pragma unroll
@@ -2004,6 +2096,7 @@ static int value_warps(int n_head, int n_kv, int dim) {
 
 // ink_score_kernel() for a call's caches and heads
 template <int LH> static auto score_kernel_lh(const InkAttn& a) {
+    if (a.kvq8 && a.int8_dot) return ink_score_kernel<kKvQ8Dot, LH>;
     return a.kvq8 ? ink_score_kernel<kKvQ8, LH> : a.kv8 ? ink_score_kernel<kKvFp8, LH> : ink_score_kernel<kKvF16, LH>;
 }
 static auto score_kernel(const InkAttn& a) { return a.dim == 128 ? score_kernel_lh<4>(a) : score_kernel_lh<2>(a); }
