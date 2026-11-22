@@ -234,7 +234,8 @@ too small for the blocks' E4M3 scales, and llama.cpp multiplies the product by t
   MMA is CUDA's alone). Inkling 2 takes them by default, as on CUDA (`Engine::nvfp4_int8_`, `Mmq::nvfp4_int8`);
   another family takes them with `STRATA_PREFILL_NVFP4=w4a8`, read by `nvfp4_int8_on()` in `src/poly/mmq.cu`, and
   keeps the decode kernels for its batch, and its previous bits, without it. w4a4 and w4a4x2 leave that choice as it
-  is, and any other value of the switch keeps the tiles out (Inkling 2's too). Measured on an RX 9060 XT (gfx1200):
+  is, and any other value of the switch keeps the tiles out (Inkling 2's too). Measured on an RX 9060 XT (gfx1200,
+  ROCm 10.1):
   Inkling 2 Mini UD-Q2_K_XL, a 2,048-token prompt 177.3 -> 402.3 tok/s when the nine of its eighteen MoE
   layers whose down matrix is NVFP4 stopped going through the decode kernels a token at a time; 286 tokens 174.7 ->
   390.7. Greedy ids identical over 32 tokens at both sizes. On an RX 9070 XT (gfx1201, ROCm 7.2.4), 3,072 of 3,072

@@ -176,7 +176,7 @@ class Main(unittest.TestCase):
     def test_windows_is_asked(self):
         code, out, _ = self.main(win=True, family="inkling", ram=64.0, vram=31.84)
         self.assertEqual(code, 0, out)                # --yes takes the risk
-        self.assertIn("Inkling 2 Mini has not been built or run on Windows", out)
+        self.assertIn("Inkling 2 Mini ran on Windows for one user on an earlier build", out)
         self.assertNotIn("has been run on Linux only", out)
 
     def test_cards(self):

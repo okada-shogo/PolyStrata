@@ -882,7 +882,8 @@ FAMILIES = {
     # Offered on NVIDIA cards only ("cuda_only"; "cuda_only_why" is the reason setup gives): the engine builds and runs
     # it on AMD cards with HIP too (an RX 9070 XT with ROCm 7.2.4, an RX 9060 XT), but its prompt speed there is not
     # tuned yet, so setup does not offer it there.
-    # It was not built or run on Windows (docs/models/inkling.md, "What you need").  Several cards split its
+    # On Windows it ran for one user (an earlier build, MSVC, an RTX 4060 Laptop) but is not re-checked there each
+    # round, so setup still asks first (docs/models/inkling.md, "What you need").  Several cards split its
     # layers as the other families' (the loop's twelve on one card); "parallel" (--batch) as for them too; its attention
     # caches are fp16 or q8_0 (POLY_KV).  Measured on an RTX 2070 Super 8 GB with 62 GB of RAM (IQ4_NL): about 3.1 GiB
     # of VRAM beside the experts at 8K in fp16, so "vram_beside_gb" 4.0 at 32K (the rows of the 8 full-attention passes:
@@ -909,7 +910,7 @@ FAMILIES = {
                 "experimental": True, "windows": False, "cuda_only": True, "ran_on_gb": 8, "row_bytes": 32768,
                 "cuda_only_why": "its prompt speed on AMD cards is not tuned yet",
                 "laptop_tps": {32768: "28"},
-                "windows_risk": "Inkling 2 Mini has not been built or run on Windows",
+                "windows_risk": "Inkling 2 Mini ran on Windows for one user on an earlier build, but it is not re-checked there",
                 "sampling": {"temperature": 1.0, "top_k": 50, "top_p": 1.0},
                 "dspark": {"hf": hf("unsloth/Inkling-2-Mini-GGUF"), "file": "dspark-Inkling-2-Mini-Q8_0.gguf",
                            "gb": 0.4, "vram_gb": 0.4, "row_bytes": 4096},

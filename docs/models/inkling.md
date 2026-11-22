@@ -92,7 +92,7 @@ About 4.6 GiB of experts fit on the 8 GB card. At most 7.5 GiB of VRAM was in us
 | **Graphics card** | An **NVIDIA** card, or several that split its layers ([Two or more cards](#two-or-more-cards)). About 3.1 GiB of VRAM before any expert at an 8K context (measured on an 8 GB card), about 4 GiB at 32K. |
 | **RAM** | About **22 GB** (IQ4_NL), **14 GB** (UD-Q2_K_XL) or **32 GB** (Q8_0) beside an 8 GB card, setup's estimate (the engine itself used 16.5 GiB with IQ4_NL, 9.1 GiB with UD-Q2_K_XL). The experts the card does not hold stay in RAM. Beside a 24 GB card the IQ4_NL file's experts fit in VRAM by the same estimate. |
 | **Disk** | 17.6, 9.1 or 27.8 GB for the model file. |
-| **System** | Linux and a current NVIDIA driver. Setup asks before it installs it on Windows: it was not built or run there. |
+| **System** | Linux and a current NVIDIA driver. On Windows it ran for one user on an earlier build (MSVC, an RTX 4060 Laptop), but it is not re-checked there, so setup asks before it installs it. |
 
 Setup does not offer it on AMD or Intel cards or on a Mac. The engine builds and runs it on AMD cards with HIP (an
 RX 9070 XT with ROCm 7.2.4, and an RX 9060 XT), but its prompt speed there is not tuned yet. Two or
