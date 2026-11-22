@@ -3750,8 +3750,16 @@ void Engine::alloc() {
                      work = floats_bytes + (need.halves * 2 + 255) / 256 * 256;
         // The buffers only a call of kStageRows rows or more uses (moe_rows(), lin_raw()'s products), side by side:
         // where they can be mapped apart (VMM) and the answer's calls never have that many rows, the expert cache
-        // has their VRAM between prompts (lend_prompt()), 300 MB of Qwen3.6's at a prompt batch of 2,048.
+        // has their VRAM between prompts (lend_prompt()), 300 MB of Qwen3.6's at a prompt batch of 2,048.  Not on ROCm
+        // on Linux, which gives VRAM back only with its addresses (vmm_unmap()), as the staging buffer's widening is
+        // not: with the buffers lent, strata-poly crashed (SIGSEGV inside hipLaunchKernel, the dequantize launch of a
+        // prompt's dense product into the lent work memory) in 15 of 16 runs of Inkling 2 Mini IQ4_NL on an RX 9070 XT
+        // with 2,443 of its 3,072 experts in VRAM, ROCm 7.2.4.
+#ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
+        prompt_lends_ = false;
+#else
         prompt_lends_ = vmm_ && !split_ && std::max(opt_.window, most_step) < kStageRows;
+#endif
         const size_t sizes[] = {rr * 2 * n_ff_exp_ * sizeof(float), rr * n_ff_exp_ * sizeof(float),
                                 rr * n_embd_ * sizeof(float), rr * sizeof(float),
                                 Mmq::q8_bytes((int64_t) rr, n_embd_), Mmq::q8_bytes((int64_t) rr, n_ff_exp_),
