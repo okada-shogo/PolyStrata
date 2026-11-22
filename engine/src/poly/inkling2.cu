@@ -1640,11 +1640,11 @@ void ink_moe_conv_add(const float* x, const float* w, const float* scale, const 
 
 #if defined(__HIPCC__)
 // HIP: ink_clips() as the launches its contract names (ink_clip(), ink_head_rms() and fp16 stores of its jobs), and
-// ink_qkv() as ink_conv() of K and V and then those.  ink_clips_kernel and ink_qkv_kernel never finished on an
-// RX 7900 XT (gfx1100) or an RX 9070 XT (gfx1201) under ROCm 7.2.4, the first prompt or token of Inkling 2 Mini
-// with them, and the same code built with any change to ink_clips_kernel finished: the compiler's code for these
-// two kernels, not their arithmetic.  The separate kernels give the same bits (poly_inkling2_test's clips and qkv
-// cases compare them).
+// ink_qkv() as ink_conv() of K and V and then those; the fused kernels are not built there.  ink_clips_kernel and
+// ink_qkv_kernel never finished on an RX 7900 XT (gfx1100) or an RX 9070 XT (gfx1201) under ROCm 7.2.4, the first
+// prompt or token of Inkling 2 Mini with them, and the same code built with any change to ink_clips_kernel finished:
+// the compiler's code for these two kernels, not their arithmetic.  The separate kernels give the same bits
+// (poly_inkling2_test's clips and qkv cases compare them).
 static void clips_apart(const InkClips& c, void* stream) {
     if (c.kv8) throw std::logic_error("ink_clips: no FP8 caches under HIP");
     for (int j = 0; j < 4; ++j) {
@@ -1668,6 +1668,7 @@ void ink_qkv(const InkQkv& a, void* stream) {
     if (a.dim > 128 || a.n_rel > 128 || a.taps < 2 || a.taps > 8 || a.n_kv < 1)
         throw std::invalid_argument("ink_qkv: heads of up to 128 values, 2 to 8 taps");
 #if defined(__HIPCC__)
+    if (a.kv8) throw std::logic_error("ink_qkv: no FP8 caches under HIP");
     const int kv = a.n_kv * a.dim;
     ink_conv(a.kraw, a.kstate, a.kw, a.kdyn, a.k, kv, a.n_kv, a.taps, 1, stream);
     ink_conv(a.vraw, a.vstate, a.vw, a.vdyn, a.v, kv, a.n_kv, a.taps, 1, stream);
@@ -1691,13 +1692,13 @@ void ink_qkv(const InkQkv& a, void* stream) {
     c.ring = a.ring;
     c.kv8 = a.kv8;
     clips_apart(c, stream);
-    return;
-#endif
+#else
     QkvArgs g{a, 1.0f / std::sqrt((float) ((a.kdyn ? 2 : 1) * a.taps + 1)),
               1.0f / std::sqrt((float) ((a.vdyn ? 2 : 1) * a.taps + 1))};
     launch_pdl(a.kv8 ? ink_qkv_kernel<true> : ink_qkv_kernel<false>, dim3(2 * a.n_head + 2 * a.n_kv), dim3(128), 0,
                cs(stream), g);
     launched("ink_qkv");
+#endif
 }
 
 void ink_clip(float* x, const float* scale, float thr, int dim, int heads, int rows, int64_t pos, float alpha,
@@ -1711,11 +1712,12 @@ void ink_clip(float* x, const float* scale, float thr, int dim, int heads, int r
 void ink_clips(const InkClips& c, void* stream) {
     if (c.rows <= 0) return;
 #if defined(__HIPCC__)
-    return clips_apart(c, stream);
-#endif
+    clips_apart(c, stream);
+#else
     auto* k = c.kv8 ? ink_clips_kernel<true> : ink_clips_kernel<false>;
     k<<<c.rows * (c.heads[0] + c.heads[1] + c.heads[2] + c.heads[3]), 128, 0, cs(stream)>>>(c);
     launched("ink_clips");
+#endif
 }
 
 void ink_head_rms(float* x, int dim, int heads, int rows, float eps, void* stream) {
