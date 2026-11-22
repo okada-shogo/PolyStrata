@@ -82,7 +82,7 @@ std::vector<float> store(uint8_t* cache, const std::vector<float>& raw, long lon
     ink_clips(c, nullptr);
     ck(cudaDeviceSynchronize(), "ink_clips");
     std::vector<float> normed = download(x, raw.size());
-    cudaFree(x);
+    (void) cudaFree(x);
     return normed;
 }
 
@@ -334,8 +334,8 @@ int main() {
         const bool same = std::memcmp(f16.data(), all.data(), f16.size() * sizeof(float)) == 0;
         std::printf("%-34s %s\n", "attend_batch, q8 = fp16 of halves", same ? "same bits  ok" : "DIFF  FAIL");
         failures += !same;
-        cudaFree(kh);
-        cudaFree(vh);
+        (void) cudaFree(kh);
+        (void) cudaFree(vh);
     }
     if (ink_attend_batch(attn_of(d, kf, vf, pos, kRows, 0, 0, c), nullptr)) {
         ck(cudaDeviceSynchronize(), "ink_attend_batch");
