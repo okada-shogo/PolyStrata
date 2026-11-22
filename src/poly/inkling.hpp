@@ -57,6 +57,10 @@ protected:
     int head_key(int il, int n) const override;
     /// A call's visits are recorded only as one, when its routed experts are all on the card (Engine::run()).
     bool layer_graphs() const override { return false; }
+    /// A thread a core: on a Ryzen 7 7800X3D (8 cores, 16 CPUs) beside an RX 9070 XT, IQ4_NL wrote 45.5 to 47.2
+    /// tokens/s with 8 threads and 42.1 to 44.7 with the 11 of 70%; on a Ryzen 5 3600XT beside an RTX 2070 Super,
+    /// 6, 8, 11 and 12 threads were the same.
+    bool thread_a_core() const override { return true; }
     /// A window of guesses is routed on the card (Engine::moe_card()) with every expert in VRAM, so that it is
     /// recorded as one too: --window 5 to 8 have more rows than kSumRows.
     bool windows_on_card() const override { return true; }

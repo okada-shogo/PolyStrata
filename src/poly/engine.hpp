@@ -514,6 +514,9 @@ protected:
     /// Which recording of a layer's head fits n tokens from pos().  Launches that are sized by the rows they read
     /// are recorded once for each size (room()), and the architecture numbers the sizes from 0.
     virtual int head_key(int il, int n) const { (void) il, (void) n; return 0; }
+    /// The CPU threads when Options::threads is 0.  false (the default): 70% of the usable CPUs (all of them under a
+    /// container's CPU quota); true: one a physical core of them.
+    virtual bool thread_a_core() const { return false; }
     /// run() records a fixed layer's head and tail apart when a call's layers are not one recording (its routed
     /// experts are not all on the card).  false: only the one recording of every layer.
     virtual bool layer_graphs() const { return true; }

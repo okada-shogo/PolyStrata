@@ -122,15 +122,46 @@ int usable_cpus(bool* quota_set = nullptr) {
     return (int) std::max(n, 1LL);
 }
 
+// The physical cores of the CPUs this process may use, or 0 when the topology cannot be read: a core's CPUs are
+// counted once, by the first CPU of its list.
+int physical_cores() {
+#ifdef __linux__
+    cpu_set_t may, cores;
+    if (sched_getaffinity(0, sizeof(may), &may) != 0) return 0;
+    CPU_ZERO(&cores);
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &may)) continue;
+        char path[96];
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_cpus_list", c);
+        FILE* f = std::fopen(path, "r");
+        if (!f) {
+            std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+            f = std::fopen(path, "r");
+        }
+        if (!f) return 0;
+        int first = -1;
+        const bool read = std::fscanf(f, "%d", &first) == 1;
+        std::fclose(f);
+        if (!read || first < 0 || first >= CPU_SETSIZE) return 0;
+        CPU_SET(first, &cores);
+    }
+    return CPU_COUNT(&cores);
+#else
+    return 0;
+#endif
+}
+
 // The CPU threads when --threads names none: 70% of the usable CPUs, so that the PC's other programs keep the
 // rest.  With a thread for every CPU the CPU was 90 to 94% busy while an answer was written, on 16 cores of a
 // Xeon beside a card held to 8 GB; 22 threads of 32 left it 66% busy, wrote as fast, and 19 to 23% faster
 // beside another program's load on 8 CPUs, since a layer waits for its slowest thread and a thread that has to
 // share its CPU is the slowest.  A container with a CPU quota keeps them all: that is a server with no desktop
 // to leave CPU to, and GLM 5.3 Flash's CPU experts there take 15 ms a token with 18 threads where 12.8 with 24.
-int default_threads() {
+// With `by_cores` (Engine::thread_a_core()), one a physical core of them, or that rule when the cores are unknown.
+int default_threads(bool by_cores) {
     bool quota = false;
     const int n = usable_cpus(&quota);
+    if (const int cores = by_cores ? physical_cores() : 0; cores > 0) return std::min(cores, n);
     return quota ? n : std::max(1, (n * 7 + 5) / 10);
 }
 
@@ -3125,7 +3156,7 @@ void Engine::load_experts() {
             }
         }
     }
-    const int threads = opt_.threads > 0 ? opt_.threads : default_threads();
+    const int threads = opt_.threads > 0 ? opt_.threads : default_threads(thread_a_core());
     mind_memory();
     // the routed experts in the mapped files, and of them the ones the CPU reads through the mapping: those the
     // card does not have, as many as Options::ram_experts_mib keeps
