@@ -51,7 +51,20 @@ Writing does not run on the tensor cores (a token at a time takes the split path
 kernel tiled as FlashAttention-2 is (64 keys a tile, 2^x by the special-function unit, the bias summed into the scores
 on the tensor cores; on cards other than the A100, H100 and B200 a tile's weighted values summed in halves). It trades
 the default's bits for speed: the answers can part from the default's at near-ties. Window layers and written tokens
-are unchanged. Its speed and how far it moves the answers are not measured yet.
+are unchanged. Experimental: it is not part of the default build's guarantees.
+
+> **Measured on:** one attention layer at 28-32K positions, q8_0 caches; whole prompts with every expert on the card,
+> q8_0 caches, one run each, against the same tree without the flag.
+
+| | Kernel, full layer, 4,096 rows | Whole prompt, 8K / 32K / 128K |
+| --- | ---: | ---: |
+| A100 PCIe 40 GB | 33.6 -> 17.6 ms (46 -> 88 TFLOPS) | UD-Q2_K_XL +9% / +6% / +8%; IQ4_NL at 32K -1% |
+| RTX 3090 | 33.9 -> 27.4 ms (45 -> 56.5 TFLOPS) | UD-Q2_K_XL +1% / +3.5% / +9% |
+
+Against the default's logits on real prompts (short, medium, long, ~19.5K and ~30K tokens): mean KL 0.0002-0.011,
+the likeliest token the same in 62 to 65 of 65 positions and in 32 or 33 of 33, but single logits off by up to ~9 and
+one position's cosine down to 0.78 at 30K; greedy answers part from the default's after a few lines. Attention is a
+small share of a prompt's time on both cards, so the whole-prompt gain stays small.
 
 IQ4_NL's speed depends on its expert profile (`--expert-profile`, which the server keeps up to date): it chooses the
 experts the card holds. On 100 questions (50 GSM8K, 50 MMLU-Pro, greedy, medium reasoning) IQ4_NL got 49 and 44
