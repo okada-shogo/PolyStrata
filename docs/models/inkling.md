@@ -71,8 +71,8 @@ the bus once for the group instead of once for every call and every pass of the 
 `--kv fp8` keeps the attention caches in 8 bits instead of 16, which leaves about 0.7 GB more VRAM for the experts at
 a 32K context.
 `--kv fp8` needs an NVIDIA card from Ampere on. `--kv q8_0` saves about the same (Q8_0 blocks: 8-bit codes and a
-16-bit scale for every 32 values) on every card, Turing and AMD included. Both are opt-in and change the answers
-slightly.
+16-bit scale for every 32 values) without FP8 hardware: checked on Turing by its kernel test; AMD not run yet, and a
+Mac refuses it. Both are opt-in and change the answers slightly.
 
 On a Mac it runs on strata-poly's Metal engine, as a beta. Measured on an Apple M5 Ultra with 256 GB of unified memory,
 UD-Q3_K_XL, the README's benchmark on setup's settings with a 40,960-token context: 256 tokens written, the most likely

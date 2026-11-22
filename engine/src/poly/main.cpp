@@ -1648,7 +1648,7 @@ void usage() {
                  "  --kv fmt               the K and V attention caches' format, opt-in: fp16 (default,\n"
                  "                         unchanged); q8_0 (ggml Q8_0 blocks: half the KV VRAM, slightly\n"
                  "                         different answers; qwen35moe's, kolibri1's, Flint's and Inkling 2's,\n"
-                 "                         which takes it on every card); q4_0 (ggml Q4_0\n"
+                 "                         which takes it on CUDA and HIP, not Metal); q4_0 (ggml Q4_0\n"
                  "                         blocks: 4-bit KV cache, 47%% smaller Host/PCIe footprint with --kv-resident);\n"
                  "                         int8 / int8k (Gemma 4's:\n"
                  "                         the same Q8_0 rule with the codes and their deltas in two arrays, so a\n"
