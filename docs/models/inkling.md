@@ -94,7 +94,13 @@ rows took 3.4 s.
 | **Disk** | 9.1 to 17.6 GB for the model file. |
 | **System** | Linux or Windows 10 / 11, and a current NVIDIA driver; or macOS 15 or newer. |
 
-Not run yet: an AMD card, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
+**AMD (HIP), experimental, not ready:** the engine builds for RDNA3 and RDNA4 (gfx1100, gfx1200, gfx1201), and main's
+HIP tests pass on an RX 7900 XT (15 of 16) and on an RX 9070 XT (11 of 16), both under ROCm 7.2.4 in a container that
+reaches the card through librocdxg. Known problems there: a prompt with some experts in RAM can hang (the engine waits
+forever, at full CPU load); on the RX 9070 XT the prompt products' library gave a NaN and results that differ run to run
+in its test. Use an NVIDIA card or a Mac for now.
+
+Not run yet: a desktop AMD card on native Linux or Windows, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
 on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on
 the CPU. The draft file is an
 option (`--draft-model`). The engine takes one request at a time
