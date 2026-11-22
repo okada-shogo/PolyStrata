@@ -5320,7 +5320,9 @@ void Engine::run(const int32_t* tokens, int n) {
         else layer_head(L, il, m);
         if (!routed(L) || batched(layers_[(size_t) home_of(il)], m)) return;
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-        if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
+        // a model whose heads are not recorded apart (layer_graphs()) has its shared expert launched as it is too: a
+        // graph launch for a launch or two (Inkling's is one memset) costs the host more than the launches
+        if (replay && layer_graphs()) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
         else moe_shared(L, il, m);
     };
     const auto tail = [&](int il, int m, size_t rec) {
