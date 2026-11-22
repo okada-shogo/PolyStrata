@@ -20,8 +20,9 @@ void gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int
 void gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows,
                void* stream);
 /// The same for the many rows of a prompt batch, as a cuBLAS product on the stream of `blas` (blas_create), one
-/// for each group of rows_per_x outputs.  It sums in another order than gemv_f32, so a row does not come out
-/// to the last bit as it does there.  Throws std::runtime_error.
+/// for each group of rows_per_x outputs; one group of up to 256 outputs in kernels of its own on that stream, each
+/// output one fmaf after the other in the inputs' order.  It sums in another order than gemv_f32, so a row does not
+/// come out to the last bit as it does there.  Throws std::runtime_error.
 void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows);
 /// n BF16 values as floats, for gemm_f32.
 void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream);

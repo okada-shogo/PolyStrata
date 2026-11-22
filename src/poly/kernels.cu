@@ -162,54 +162,136 @@ gemm_small_kernel(const float* __restrict__ w, const float* __restrict__ x, floa
     if (t < rows && o < n_out) y[size_t(t) * n_out + o] = acc;
 }
 
-// gemm_small_kernel for more outputs (a router's 128 or 256): a block TILE_TOK tokens and TILE_OUT outputs, a thread
-// 4 of each, so a value read from shared memory serves 4 products where it served one.  For 2,048 tokens of 2,048
-// values and 256 outputs gemm_small_kernel took 0.34 ms on an RTX 5090, 241 ms of the 3.7 s Flint read a prompt of
-// 29,816 tokens in.  Each output is still one fmaf after the other in the inputs' order: the same bits.
-constexpr int TILE_TOK = 32, TILE_OUT = 64, TILE_K = 32;
-
-__global__ void __launch_bounds__(TILE_TOK * TILE_OUT / 16)
+// gemm_small_kernel for more outputs (a router's 128 or 256, the controllers' 64): a block TOK tokens and OUT
+// outputs, a thread TT tokens and TO outputs of them, so a value read from shared memory serves TT or TO products
+// where it served one.  The block takes the inputs K at a time, and reads the inputs and weights of a step two steps
+// ahead into registers.  Each output is still one fmaf after the other in the inputs' order: the same bits whatever
+// the tile.
+template<int TOK, int OUT, int TT, int TO, int K>
+__global__ void __launch_bounds__((TOK / TT) * (OUT / TO))
 gemm_tile_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
                  int rows) {
-    constexpr int THREADS = TILE_TOK * TILE_OUT / 16;
-    // a step's inputs and weights by input, so a thread reads its 4 tokens' and 4 outputs' values as one float4
-    __shared__ __align__(16) float sx[TILE_K][TILE_TOK + 4], sw[TILE_K][TILE_OUT + 4];
-    const int t0 = blockIdx.x * TILE_TOK, o0 = blockIdx.y * TILE_OUT;
-    const int to = 4 * (threadIdx.x / (TILE_OUT / 4)), oo = 4 * (threadIdx.x % (TILE_OUT / 4));
-    float acc[4][4];
+    constexpr int THREADS = (TOK / TT) * (OUT / TO), XS = TOK * K / THREADS, WS = OUT * K / THREADS;
+    static_assert(XS * THREADS == TOK * K && WS * THREADS == OUT * K, "a step's values spread over the threads");
+    static_assert(TOK % 8 == 0 && OUT % 8 == 0 && (TT == 2 || TT == 4 || TT == 8) && (TO == 2 || TO == 4 || TO == 8),
+                  "rows of a multiple of 4 floats, an odd one of them past a multiple of 32 banks");
+    // a step's inputs and weights by input (a row TOK + 4 floats, so a warp's 4 tokens of 8 inputs fill 32 banks),
+    // twice over
+    __shared__ __align__(16) float sx[2][K][TOK + 4], sw[2][K][OUT + 4];
+    const int t0 = blockIdx.x * TOK, o0 = blockIdx.y * OUT;
+    // a thread's tokens and outputs: TT (TO) in a row, or two runs of 4 half a tile apart, so that a quarter of a
+    // warp reads its float4s from 128 bytes in a row
+    const int tr = threadIdx.x / (OUT / TO), orr = threadIdx.x % (OUT / TO);
+    const int tb = TT == 8 ? 4 * tr : TT * tr, ob = TO == 8 ? 4 * orr : TO * orr;
+    constexpr int TH = TT == 8 ? TOK / 2 : 0, OH = TO == 8 ? OUT / 2 : 0;
+    // what a thread reads of a step: one input of a token (an output) and of every RS-th one on, so that a warp
+    // reads 4 tokens' (outputs') runs of 8 inputs
+    static_assert(THREADS % (4 * K) == 0, "a thread's input the same at every place of its step");
+    constexpr int RS = THREADS / K;
+    const int kq = threadIdx.x / 4 % K, rq = threadIdx.x % 4 + 4 * (threadIdx.x / (4 * K));
+    const float* const xb = x + size_t(t0) * n_in;
+    const float* const wb = w + size_t(o0) * n_in;
+    const int xn = rows - t0, wn = n_out - o0;
+    // a step's values in registers: two steps' worth, so that what a thread reads has a whole step to arrive
+    struct Regs {
+        float x[XS], w[WS];
+    } ra, rb;
+    const auto fetch = [&](Regs& r, int k0) {
+        const int k = k0 + kq;
+        const bool in = k < n_in;
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < XS; ++j) {
+            const int t = rq + j * RS;
+            r.x[j] = in && t < xn ? xb[t * n_in + k] : 0.0f;
+        }
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
-    for (int k0 = 0; k0 < n_in; k0 += TILE_K) {
-        for (int i = threadIdx.x; i < TILE_TOK * TILE_K; i += THREADS) {
-            const int t = t0 + i / TILE_K, k = k0 + i % TILE_K;
-            sx[i % TILE_K][i / TILE_K] = t < rows && k < n_in ? x[size_t(t) * n_in + k] : 0.0f;
+        for (int j = 0; j < WS; ++j) {
+            const int o = rq + j * RS;
+            r.w[j] = in && o < wn ? wb[o * n_in + k] : 0.0f;
         }
-        for (int i = threadIdx.x; i < TILE_OUT * TILE_K; i += THREADS) {
-            const int o = o0 + i / TILE_K, k = k0 + i % TILE_K;
-            sw[i % TILE_K][i / TILE_K] = o < n_out && k < n_in ? w[size_t(o) * n_in + k] : 0.0f;
+    };
+    const auto store = [&](const Regs& r, int b) {
+#pragma unroll
+        for (int j = 0; j < XS; ++j) sx[b][kq][rq + j * RS] = r.x[j];
+#pragma unroll
+        for (int j = 0; j < WS; ++j) sw[b][kq][rq + j * RS] = r.w[j];
+    };
+    // n floats from 16 (n = 2: 8) bytes on: 4 of them and 4 more `half` floats on for n = 8
+    const auto read = [](const float* p, int half, float* v, int n) {
+        if (n == 2) {
+            const float2 a = *reinterpret_cast<const float2*>(p);
+            v[0] = a.x, v[1] = a.y;
+            return;
         }
-        __syncthreads();
+        const float4 a = *reinterpret_cast<const float4*>(p);
+        v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w;
+        if (n == 8) {
+            const float4 b = *reinterpret_cast<const float4*>(p + half);
+            v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+        }
+    };
+    float acc[TT][TO];
+#pragma unroll
+    for (int i = 0; i < TT; ++i)
+#pragma unroll
+        for (int j = 0; j < TO; ++j) acc[i][j] = 0.0f;
+    // step s works on shared half s % 2, stores step s + 1's values into the other one (read during step s - 1)
+    // and reads step s + 2's into the registers that held them
+    const auto step = [&](Regs& next, Regs& later, int k0, int b) {
+        fetch(next, k0 + 2 * K);
 #pragma unroll 8
-        for (int c = 0; c < TILE_K; ++c) {
-            const float4 a = *reinterpret_cast<const float4*>(&sx[c][to]);
-            const float4 b = *reinterpret_cast<const float4*>(&sw[c][oo]);
-            const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+        for (int c = 0; c < K; ++c) {
+            float av[TT], bv[TO];
+            read(&sx[b][c][tb], TH, av, TT);
+            read(&sw[b][c][ob], OH, bv, TO);
 #pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < TT; ++i)
 #pragma unroll
-                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+                for (int j = 0; j < TO; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
         }
+        store(later, b ^ 1);
         __syncthreads();
+    };
+    fetch(ra, 0);
+    fetch(rb, K);
+    store(ra, 0);
+    __syncthreads();
+    for (int k0 = 0; k0 < n_in; k0 += 2 * K) {
+        step(ra, rb, k0, 0);
+        if (k0 + K < n_in) step(rb, ra, k0 + K, 1);
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < TT; ++i)
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int t = t0 + to + i, o = o0 + oo + j;
+        for (int j = 0; j < TO; ++j) {
+            const int t = t0 + tb + (TT == 8 ? i / 4 * TH + i % 4 : i), o = o0 + ob + (TO == 8 ? j / 4 * OH + j % 4 : j);
             if (t < rows && o < n_out) y[size_t(t) * n_out + o] = acc[i][j];
         }
+}
+
+template<int TOK, int OUT, int TT, int TO, int K>
+void gemm_tile(const float* w, const float* x, float* y, int n_in, int n_out, int rows, cudaStream_t stream) {
+    gemm_tile_kernel<TOK, OUT, TT, TO, K><<<dim3((rows + TOK - 1) / TOK, (n_out + OUT - 1) / OUT),
+                                            (TOK / TT) * (OUT / TO), 0, stream>>>(w, x, y, n_in, n_out, rows);
+}
+
+// The largest tile that still gives half the card's SMs a block: more work a block reads its inputs fewer times
+// and keeps more threads at work, and a tile half as large is faster where it gives twice the SMs one.  On an RTX
+// 2070 Super (40 SMs), us a call, against gemm_small_kernel for 64 outputs and the one 32 x 64 tile for 128:
+//   4,608 inputs -> 64 (the controllers):  333 rows 360 -> 196, 1,024 rows 826 -> 261, 4,096 rows 3,062 -> 713
+//   2,304 inputs -> 128 (the router):      333 rows 214 -> 131, 1,024 rows 261 -> 202, 4,096 rows   848 -> 579
+// each the fastest of the 19 (64 outputs) and 27 (128) tiles measured there, every one with the same bits.
+void gemm_tiles(const float* w, const float* x, float* y, int n_in, int n_out, int rows, cudaStream_t stream) {
+    int dev = 0, sms = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    const auto blocks = [&](int tok, int out) {
+        return 2 * ((rows + tok - 1) / tok) * ((n_out + out - 1) / out) >= sms;
+    };
+    if (n_out > 64 && blocks(64, 128)) return gemm_tile<64, 128, 8, 8, 16>(w, x, y, n_in, n_out, rows, stream);
+    if (blocks(64, 64)) return gemm_tile<64, 64, 8, 4, 16>(w, x, y, n_in, n_out, rows, stream);
+    if (blocks(32, 64)) return gemm_tile<32, 64, 4, 4, 32>(w, x, y, n_in, n_out, rows, stream);
+    gemm_tile<32, 32, 2, 4, 32>(w, x, y, n_in, n_out, rows, stream);
 }
 
 // Where a row's Q8_1 blocks would keep a sum past the halves' range: a power of two to divide the row by, 1 for
@@ -2689,9 +2771,8 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
     if (groups == 1 && n_out <= 8 * SMALL_OUT) {
         cudaStream_t stream = nullptr;
         blas_ck(cublasGetStream(h, &stream), "cublasGetStream");
-        if (n_out > 2 * SMALL_OUT)
-            gemm_tile_kernel<<<dim3((rows + TILE_TOK - 1) / TILE_TOK, (n_out + TILE_OUT - 1) / TILE_OUT),
-                               TILE_TOK * TILE_OUT / 16, 0, stream>>>(w, x, y, n_in, n_out, rows);
+        if (n_out > SMALL_OUT)
+            gemm_tiles(w, x, y, n_in, n_out, rows, stream);
         else
             gemm_small_kernel<<<dim3((rows + SMALL_TOK - 1) / SMALL_TOK, (n_out + SMALL_OUT - 1) / SMALL_OUT),
                                 SMALL_TOK * WARP, 0, stream>>>(w, x, y, n_in, n_out, rows);
