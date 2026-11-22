@@ -4913,6 +4913,9 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
                 bf16_to_f32((const uint16_t*) w.p, wf_, count, st_);
                 wf = wf_;
             }
+#if !defined(STRATA_GPU_METAL)
+            if (f32_tiles_ && per == w.n_out) return gemm_f32_tiles(blas_, wf, x, y, w.n_in, w.n_out, n);
+#endif
             return gemm_f32(blas_, wf, x, y, w.n_in, w.n_out, per, n);
         }
         if (w.type == kTypeF32) return gemv_f32(fp(w), x, y, w.n_in, w.n_out, per, n, st_);

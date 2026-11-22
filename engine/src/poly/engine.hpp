@@ -1068,6 +1068,9 @@ protected:
     /// (about 100 KB) waited behind the layer's experts on their way to the staging buffer.  Inkling 2's on CUDA
     /// unless STRATA_INK_KERNEL_TABLES=0, else off.
     bool kernel_tables_ = false;
+    /// a prompt batch's F32 (and widened BF16) products of one group of 33 to 256 outputs go to gemm_f32_tiles(),
+    /// with the same bits as gemm_f32().  On for Inkling 2 Mini, whose controllers and routers it was measured on.
+    bool f32_tiles_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
     Dev out_norm_, output_;

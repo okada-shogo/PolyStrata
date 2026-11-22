@@ -31,6 +31,9 @@ void gemv_set(const float* const* w, const float* const* x, float* const* y, con
 /// for each group of rows_per_x outputs.  It sums in another order than gemv_f32, so a row does not come out
 /// to the last bit as it does there.  Throws std::runtime_error.
 void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows);
+/// gemm_f32() of one group (rows_per_x = n_out), 33 to 256 outputs in larger tiles that read their values two steps
+/// ahead: the same bits.  Inkling 2 Mini's prompt batches (Engine::f32_tiles_).  CUDA and HIP only.
+void gemm_f32_tiles(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows);
 /// n BF16 values as floats, for gemm_f32.
 void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream);
 /// Before a Q8_1 quantization whose blocks keep their sums in halves (llama.cpp's MMQ for Q4_K, Q5_K, Q2_K, Q4_1,
