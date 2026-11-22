@@ -5071,10 +5071,13 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
     const int work_rows_f = width > 0 ? (int) std::min<size_t>(work_halves / 2 / (size_t) width, (size_t) INT_MAX) : 0;
     const size_t chunk_max = std::max<size_t>(16, kAttendResults / (size_t(n_head) * dim * sizeof(float)));
     const size_t cells_f = ((score_floats > qres ? score_floats - qres : 0) / 2) & ~size_t(3);   // a multiple of 4: the floats are read 4 at a time
+    // Both read a q8 cache as rows of width codes and width / 32 scales in two arrays (dequant_q8_f32_kernel, gemm_q8):
+    // a cache with its own row strides (Inkling 2's, codes and scales in one row) keeps the half path, which takes them.
+    const bool strided = kq8.rs || kq8.ss || vq8.rs || vq8.ss;
     // level 2: the head's values in whole blocks of 32 for the scales, and a block of at least 64 keys at the largest chunk
-    const bool own = level == 2 && kq && vq && dim % 32 == 0 && width % 32 == 0 && score_floats >= 4 * qres &&
+    const bool own = level == 2 && kq && vq && !strided && dim % 32 == 0 && width % 32 == 0 && score_floats >= 4 * qres &&
                      cells_f / n_head >= 64 * chunk_max;
-    const bool f32 = own || (level >= 1 && kq && vq && work_rows_f >= 256 && score_floats >= 4 * qres);
+    const bool f32 = own || (level >= 1 && kq && vq && !strided && work_rows_f >= 256 && score_floats >= 4 * qres);
     const size_t cells = f32 ? cells_f : score_floats / 3 * 2;
     float* weight32 = score + cells;
     float* qg32 = score + 2 * cells;   // the grouped queries as floats, in the scratch past the scores and weights
