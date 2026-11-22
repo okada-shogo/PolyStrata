@@ -768,13 +768,10 @@ __global__ void ink_head_rms_kernel(float* x, int dim, int heads, float eps) {
     rms_head(x + size_t(blockIdx.x) * dim, dim, eps, part);
 }
 
-__global__ void ink_conv_add_kernel(const float* x, float* state, const float* __restrict__ w,
-                                    float* __restrict__ out, float* acc, float* keep, float a, int mode, int channels,
-                                    int taps, float norm) {
-    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-    pdl_wait();
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= channels) return;
+// ink_conv_add()'s channel c of one token
+__device__ __forceinline__ void conv_add_at(const float* x, float* state, const float* __restrict__ w,
+                                            float* __restrict__ out, float* acc, float* keep, float a, int mode,
+                                            int channels, int taps, float norm, int c) {
     const float y = conv_value(x, state, w, nullptr, channels, 1, taps, 0, c, norm);
     out[c] = y;
     conv_state_at(x, state, channels, taps, 1, c);
@@ -784,6 +781,29 @@ __global__ void ink_conv_add_kernel(const float* x, float* state, const float* _
         if (mode == 1) keep[c] = acc[c];
         acc[c] = y;
     }
+}
+
+__global__ void ink_conv_add_kernel(const float* x, float* state, const float* __restrict__ w,
+                                    float* __restrict__ out, float* acc, float* keep, float a, int mode, int channels,
+                                    int taps, float norm) {
+    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    conv_add_at(x, state, w, out, acc, keep, a, mode, channels, taps, norm, c);
+}
+
+// ink_conv_add_rows(): token blockIdx.y's channels, a row of them on, with its own state
+__global__ void ink_conv_add_rows_kernel(const float* x, InkStateRows state, const float* __restrict__ w,
+                                         float* __restrict__ out, float* acc, float* keep, float a, int mode,
+                                         int channels, int taps, float norm) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const size_t t = size_t(blockIdx.y) * channels;
+    conv_add_at(x + t, state.p[blockIdx.y], w, out + t, acc + t, keep ? keep + t : nullptr, a, mode, channels, taps,
+                norm, c);
 }
 
 __global__ void ink_moe_conv_add_kernel(const float* x, const float* w, const float* __restrict__ scale,
@@ -813,11 +833,7 @@ struct QkvArgs {
 
 // ink_qkv(): blocks [0, n_head) Q's heads, then K's n_kv, V's n_kv, and the relative positions' n_head; 128 threads.
 template <bool KV8>
-__global__ void ink_qkv_kernel(QkvArgs g) {
-    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-    pdl_wait();
-    __shared__ float part[128 / WARP];
-    const InkQkv& a = g.a;
+__device__ __forceinline__ void qkv_block(const InkQkv& a, float k_norm, float v_norm, float* part) {
     const long long p = a.at ? a.at[0] : (long long) a.pos;
     int b = blockIdx.x;
     if (b < a.n_head) {
@@ -835,7 +851,7 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
         if (i < a.dim) {
             const int c = h * a.dim + i;
             out[c] = conv_value(x, state, is_v ? a.vw : a.kw, is_v ? a.vdyn : a.kdyn, channels, a.n_kv, a.taps, 0, c,
-                                is_v ? g.v_norm : g.k_norm);
+                                is_v ? v_norm : k_norm);
             conv_state_at(x, state, channels, a.taps, 1, c);
         }
         float* head = out + size_t(h) * a.dim;
@@ -850,6 +866,39 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
     b -= 2 * a.n_kv;
     clip_head(a.r + size_t(b) * a.n_rel, a.r_scale ? a.r_scale + size_t(b) * a.n_rel : nullptr, a.rel_thr, a.n_rel,
               a.alpha, a.floor, p, part);
+}
+
+template <bool KV8>
+__global__ void ink_qkv_kernel(QkvArgs g) {
+    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
+    pdl_wait();
+    __shared__ float part[128 / WARP];
+    qkv_block<KV8>(g.a, g.k_norm, g.v_norm, part);
+}
+
+// ink_qkv_rows(): token blockIdx.y's blocks, its rows of the products and outputs, its states, caches and position
+template <bool KV8>
+__global__ void ink_qkv_rows_kernel(QkvArgs g, InkQkvRows r) {
+    pdl_trigger();
+    pdl_wait();
+    __shared__ float part[128 / WARP];
+    const int t = blockIdx.y;
+    InkQkv a = g.a;
+    const size_t kv = size_t(a.n_kv) * a.dim, dyn = size_t(a.taps) * a.n_kv;
+    a.q += size_t(t) * a.n_head * a.dim;
+    a.r += size_t(t) * a.n_head * a.n_rel;
+    a.kraw += t * kv;
+    a.vraw += t * kv;
+    if (a.kdyn) a.kdyn += t * dyn;
+    if (a.vdyn) a.vdyn += t * dyn;
+    a.k += t * kv;
+    a.v += t * kv;
+    a.kstate = r.kstate[t];
+    a.vstate = r.vstate[t];
+    a.keys = r.keys[t];
+    a.vals = r.vals[t];
+    a.at += 2 * t;
+    qkv_block<KV8>(a, g.k_norm, g.v_norm, part);
 }
 
 __global__ void ink_mul_sigmoid_kernel(float* x, const float* __restrict__ gate, size_t n) {
@@ -908,9 +957,7 @@ __device__ __forceinline__ void lane_halves(const __half* head, int lane, int n,
 // their products with the queries are summed across the warp.  The bias's products are the first n_rel lanes'.
 // t0 is the launch's first token among the call's, nk_max the scores a head has room for.
 template <bool KV8>
-__global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
-    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-    pdl_wait();
+__device__ __forceinline__ void score_block(const InkAttn& a, const void* keys, int t0, int nk_max) {
     __shared__ float qs[kMaxPer * 128];
     __shared__ float rs[kMaxPer * 32];
     __shared__ float sinks[kMaxPer];
@@ -943,8 +990,8 @@ __global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
 #pragma unroll
     for (int u = 0; u < kScoreKeys; ++u) {
         if (j0 + u < j1) {
-            if (KV8) lane_fp8(a.keys, row, a.n_kv, a.dim, g, lane, lh, k[u]);
-            else lane_halves((const __half*) a.keys + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, k[u]);
+            if (KV8) lane_fp8(keys, row, a.n_kv, a.dim, g, lane, lh, k[u]);
+            else lane_halves((const __half*) keys + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, k[u]);
             const long long dist = p - (lo + j0 + u);
             rb[u] = lane < a.n_rel && dist < a.extent ? a.rel_bias[size_t(dist) * a.n_rel + lane] : 0.0f;
             if (++row == a.ring) row = 0;
@@ -965,6 +1012,21 @@ __global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
             }
         }
     }
+}
+
+template <bool KV8>
+__global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
+    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
+    pdl_wait();
+    score_block<KV8>(a, a.keys, t0, nk_max);
+}
+
+// ink_attend_rows(): the score kernel's blocks of token t0 + blockIdx.x / n_kv over that token's own keys
+template <bool KV8>
+__global__ void ink_score_rows_kernel(InkAttn a, int t0, int nk_max, InkAttnRows c) {
+    pdl_trigger();
+    pdl_wait();
+    score_block<KV8>(a, c.keys[t0 + blockIdx.x / a.n_kv], t0, nk_max);
 }
 
 // A token's head a block: the scores' softmax with its extra term of score 0.  The scores become the weights'
@@ -996,9 +1058,8 @@ __global__ void ink_softmax_kernel(InkAttn a, int t0, int nk_max, float* norm) {
 // sums are added in their order.  value_warps() launches up to 32 warps, so the registers must fit 1,024 threads on
 // every card: sm_86 and sm_89 gave this kernel 66 a thread without the bound, and the launch failed there.
 template <bool KV8>
-__global__ void __launch_bounds__(1024) ink_value_kernel(InkAttn a, int t0, int nk_max, float* parts, int n_parts) {
-    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-    pdl_wait();
+__device__ __forceinline__ void value_block(const InkAttn& a, const void* vals, int t0, int nk_max, float* parts,
+                                            int n_parts) {
     extern __shared__ float sums[];   // a warp's, a head of the group: dim
     const int per = a.n_head / a.n_kv, lh = a.dim / 32;
     const int tt = blockIdx.x / a.n_kv, g = blockIdx.x % a.n_kv, t = t0 + tt;
@@ -1023,8 +1084,8 @@ __global__ void __launch_bounds__(1024) ink_value_kernel(InkAttn a, int t0, int 
 #pragma unroll
     for (int u = 0; u < kValueKeys; ++u) {
         if (j0 + u < j1) {
-            if (KV8) lane_fp8(a.vals, row, a.n_kv, a.dim, g, lane, lh, v[u]);
-            else lane_halves((const __half*) a.vals + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, v[u]);
+            if (KV8) lane_fp8(vals, row, a.n_kv, a.dim, g, lane, lh, v[u]);
+            else lane_halves((const __half*) vals + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, v[u]);
             if (++row == a.ring) row = 0;
         }
     }
@@ -1056,22 +1117,52 @@ __global__ void __launch_bounds__(1024) ink_value_kernel(InkAttn a, int t0, int 
     }
 }
 
-// A token's head a block: its parts added in their order, over its softmax's norm.
-__global__ void ink_join_kernel(InkAttn a, int t0, const float* parts, int n_parts, const float* norm) {
+template <bool KV8>
+__global__ void __launch_bounds__(1024) ink_value_kernel(InkAttn a, int t0, int nk_max, float* parts, int n_parts) {
     pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
     pdl_wait();
+    value_block<KV8>(a, a.vals, t0, nk_max, parts, n_parts);
+}
+
+// ink_attend_rows(): the value kernel's blocks of token t0 + blockIdx.x / n_kv over that token's own values
+template <bool KV8>
+__global__ void __launch_bounds__(1024) ink_value_rows_kernel(InkAttn a, int t0, int nk_max, float* parts, int n_parts,
+                                                              InkAttnRows c) {
+    pdl_trigger();
+    pdl_wait();
+    value_block<KV8>(a, c.vals[t0 + blockIdx.x / a.n_kv], t0, nk_max, parts, n_parts);
+}
+
+// A token's head a block: its first `mine` parts added in their order (of n_parts a head in parts), over its
+// softmax's norm.
+__device__ __forceinline__ void join_block(const InkAttn& a, int t0, const float* parts, int n_parts, int mine,
+                                           const float* norm) {
     const int tt = blockIdx.x / a.n_head, h = blockIdx.x % a.n_head, t = t0 + tt;
     const float inv = 1.0f / norm[blockIdx.x];
     const float* pt = parts + size_t(blockIdx.x) * n_parts * a.dim;
     for (int i = threadIdx.x; i < a.dim; i += blockDim.x) {
         float total = 0.0f;
-        for (int k = 0; k < n_parts; ++k) total += pt[size_t(k) * a.dim + i];
+        for (int k = 0; k < mine; ++k) total += pt[size_t(k) * a.dim + i];
         const size_t at = (size_t(t) * a.n_head + h) * a.dim + i;
         float v = total * inv;
         if (a.gate) v *= 1.0f / (1.0f + expf(-a.gate[at]));   // ink_mul_sigmoid_kernel's
         a.out[at] = v;
         if (a.q8) q8_put((QB*) a.q8, (int) at, v);   // one token's row, for the output product
     }
+}
+
+__global__ void ink_join_kernel(InkAttn a, int t0, const float* parts, int n_parts, const float* norm) {
+    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
+    pdl_wait();
+    join_block(a, t0, parts, n_parts, n_parts, norm);
+}
+
+// ink_attend_rows(): a token's head adds the parts it has alone (InkAttnRows::parts)
+__global__ void ink_join_rows_kernel(InkAttn a, int t0, const float* parts, int n_parts, const float* norm,
+                                     InkAttnRows c) {
+    pdl_trigger();
+    pdl_wait();
+    join_block(a, t0, parts, n_parts, c.parts[t0 + blockIdx.x / a.n_head], norm);
 }
 
 // The tensor cores' m16n8k16 step, ldmatrix and the copies into shared memory, as kernels.cu has them for its
@@ -1825,6 +1916,16 @@ void ink_conv_add(const float* x, float* state, const float* w, float* out, floa
     launched("ink_conv_add");
 }
 
+void ink_conv_add_rows(const float* x, const InkStateRows& state, const float* w, float* out, float* acc, float* keep,
+                       float a, int mode, int channels, int taps, int rows, void* stream) {
+    if (taps < 2 || taps > 8) throw std::invalid_argument("ink_conv_add_rows: 2 to 8 taps");
+    if (rows < 1 || rows > kInkRows) throw std::invalid_argument("ink_conv_add_rows: 1 to kInkRows tokens");
+    const float norm = 1.0f / std::sqrt((float) (taps + 1));   // ink_conv_add()'s
+    launch_pdl(ink_conv_add_rows_kernel, dim3(grid((size_t) channels, 256), rows), dim3(256), 0, cs(stream), x, state,
+               w, out, acc, keep, a, mode, channels, taps, norm);
+    launched("ink_conv_add_rows");
+}
+
 void ink_moe_conv_add(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
                       float* state, const float* cw, float* out, float* acc, float a, int channels, int taps,
                       void* stream) {
@@ -1843,6 +1944,17 @@ void ink_qkv(const InkQkv& a, void* stream) {
     launch_pdl(a.kv8 ? ink_qkv_kernel<true> : ink_qkv_kernel<false>, dim3(2 * a.n_head + 2 * a.n_kv), dim3(128), 0,
                cs(stream), g);
     launched("ink_qkv");
+}
+
+void ink_qkv_rows(const InkQkv& a, const InkQkvRows& r, int rows, void* stream) {
+    if (a.dim > 128 || a.n_rel > 128 || a.taps < 2 || a.taps > 8 || a.n_kv < 1)
+        throw std::invalid_argument("ink_qkv_rows: heads of up to 128 values, 2 to 8 taps");
+    if (rows < 1 || rows > kInkRows || !a.at) throw std::invalid_argument("ink_qkv_rows: 1 to kInkRows tokens, positions on the card");
+    QkvArgs g{a, 1.0f / std::sqrt((float) ((a.kdyn ? 2 : 1) * a.taps + 1)),   // ink_qkv()'s
+              1.0f / std::sqrt((float) ((a.vdyn ? 2 : 1) * a.taps + 1))};
+    launch_pdl(a.kv8 ? ink_qkv_rows_kernel<true> : ink_qkv_rows_kernel<false>, dim3(2 * a.n_head + 2 * a.n_kv, rows),
+               dim3(128), 0, cs(stream), g, r);
+    launched("ink_qkv_rows");
 }
 
 void ink_clip(float* x, const float* scale, float thr, int dim, int heads, int rows, int64_t pos, float alpha,
@@ -1896,7 +2008,14 @@ size_t ink_attend_floats(int n_head, int n_kv, int dim, int64_t keys) {
     return (size_t) n_head * ((size_t) keys + 1 + (size_t) ((keys + block - 1) / block) * dim);
 }
 
-void ink_attend(const InkAttn& a, void* stream) {
+int ink_attend_parts(int n_head, int n_kv, int dim, int window, int64_t last) {
+    const int nk_max = (int) (window > 0 ? std::min<int64_t>(window, last) : last);
+    const int warps = value_warps(n_head, n_kv, dim);
+    return (nk_max + warps * kValueKeys - 1) / (warps * kValueKeys);
+}
+
+// ink_attend(), or with rows ink_attend_rows()'s tokens over their own caches
+static void attend(const InkAttn& a, const InkAttnRows* rows, void* stream) {
     if (a.rows <= 0) return;
     if (a.n_kv < 1 || a.n_head % a.n_kv != 0 || a.n_head / a.n_kv > kMaxPer || (a.dim != 64 && a.dim != 128) ||
         a.n_rel < 1 || a.n_rel > 32)
@@ -1907,25 +2026,37 @@ void ink_attend(const InkAttn& a, void* stream) {
     if (a.at && a.room < 1) throw std::invalid_argument("ink_attend: positions on the card need the rows to size for");
     const int nk_max = (int) (a.window > 0 ? std::min<int64_t>(a.window, last) : last);
     const int group = a.n_head / a.n_kv, warps = value_warps(a.n_head, a.n_kv, a.dim);
-    const int n_parts = (nk_max + warps * kValueKeys - 1) / (warps * kValueKeys);
+    const int n_parts = ink_attend_parts(a.n_head, a.n_kv, a.dim, a.window, last);
     const int score_blocks = (nk_max + kScoreWarps * kScoreKeys - 1) / (kScoreWarps * kScoreKeys);
     const size_t per = ink_attend_floats(a.n_head, a.n_kv, a.dim, nk_max);
     if (a.score_n < per) throw std::logic_error("ink_attend: the scores of one token do not fit the scratch");
     const int chunk = (int) std::min<size_t>(a.score_n / per, (size_t) a.rows);
     float* norm = a.score + (size_t) chunk * a.n_head * nk_max;
     float* parts = norm + (size_t) chunk * a.n_head;
+    const size_t value_shared = (size_t) warps * group * a.dim * sizeof(float);
     for (int t0 = 0; t0 < a.rows; t0 += chunk) {
         const int m = std::min(chunk, a.rows - t0);
-        launch_pdl(a.kv8 ? ink_score_kernel<true> : ink_score_kernel<false>, dim3(m * a.n_kv, score_blocks),
-                   dim3(kScoreWarps * 32), 0, cs(stream), a, t0, nk_max);
+        if (rows)
+            launch_pdl(a.kv8 ? ink_score_rows_kernel<true> : ink_score_rows_kernel<false>,
+                       dim3(m * a.n_kv, score_blocks), dim3(kScoreWarps * 32), 0, cs(stream), a, t0, nk_max, *rows);
+        else
+            launch_pdl(a.kv8 ? ink_score_kernel<true> : ink_score_kernel<false>, dim3(m * a.n_kv, score_blocks),
+                       dim3(kScoreWarps * 32), 0, cs(stream), a, t0, nk_max);
         launched("ink_score");
         launch_pdl(ink_softmax_kernel, dim3(m * a.n_head), dim3(kAttnThreads), 0, cs(stream), a, t0, nk_max, norm);
         launched("ink_softmax");
-        launch_pdl(a.kv8 ? ink_value_kernel<true> : ink_value_kernel<false>, dim3(m * a.n_kv, n_parts),
-                   dim3(warps * 32), (size_t) warps * group * a.dim * sizeof(float), cs(stream), a, t0, nk_max, parts,
-                   n_parts);
+        if (rows)
+            launch_pdl(a.kv8 ? ink_value_rows_kernel<true> : ink_value_rows_kernel<false>, dim3(m * a.n_kv, n_parts),
+                       dim3(warps * 32), value_shared, cs(stream), a, t0, nk_max, parts, n_parts, *rows);
+        else
+            launch_pdl(a.kv8 ? ink_value_kernel<true> : ink_value_kernel<false>, dim3(m * a.n_kv, n_parts),
+                       dim3(warps * 32), value_shared, cs(stream), a, t0, nk_max, parts, n_parts);
         launched("ink_value");
-        launch_pdl(ink_join_kernel, dim3(m * a.n_head), dim3(128), 0, cs(stream), a, t0, parts, n_parts, norm);
+        if (rows)
+            launch_pdl(ink_join_rows_kernel, dim3(m * a.n_head), dim3(128), 0, cs(stream), a, t0, parts, n_parts, norm,
+                       *rows);
+        else
+            launch_pdl(ink_join_kernel, dim3(m * a.n_head), dim3(128), 0, cs(stream), a, t0, parts, n_parts, norm);
         launched("ink_join");
     }
 }
@@ -1948,6 +2079,16 @@ static bool flash75(const InkAttn& a, int per, void* stream) {
     return true;
 }
 #endif
+
+void ink_attend(const InkAttn& a, void* stream) { attend(a, nullptr, stream); }
+
+void ink_attend_rows(const InkAttn& a, const InkAttnRows& c, void* stream) {
+    if (a.rows > kInkRows || !a.at || a.q8) throw std::invalid_argument("ink_attend_rows: 1 to kInkRows tokens, positions on the card, no q8");
+    for (int t = 0; t < a.rows; ++t)
+        if (c.parts[t] < 1 || c.parts[t] > ink_attend_parts(a.n_head, a.n_kv, a.dim, a.window, a.room))
+            throw std::invalid_argument("ink_attend_rows: a token's parts are more than the launch's");
+    attend(a, &c, stream);
+}
 
 bool ink_attend_batch(const InkAttn& a, void* stream) {
 #if defined(__HIPCC__)

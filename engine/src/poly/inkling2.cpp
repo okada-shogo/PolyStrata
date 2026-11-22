@@ -40,9 +40,9 @@ void Inkling2::load_geometry() {
     // token at a time unless --window asks for more: guesses from repeats of the conversation wrote 1.8% slower after
     // a short prompt that had few (RTX 5090, UD-Q4_K_XL, --window 4).  With it a window is its block.
     opt_.draft = false;
-    // --batch: sequences beside the first, a token of each in one step() (batch_heads()).  Not with the drafter, whose
-    // caches and block are one sequence's.
-    need(opt_.batch <= 2, "Inkling 2 takes --batch 0 to 2");
+    // --batch: sequences beside the first, a token of each in one step() (batch_heads()), whose rows the _rows kernels
+    // take kInkRows at a time.  Not with the drafter, whose caches and block are one sequence's.
+    need(opt_.batch + 1 <= kInkRows, "Inkling 2 takes fewer sequences (--batch) than that");
 #if defined(STRATA_GPU_METAL)
     need(opt_.batch == 0, "Inkling 2 runs one sequence on Metal (--batch is not supported there yet)");
 #endif
@@ -948,6 +948,13 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     // position goes a row at a time, each with a token's launches and its own sequence's slot (run_slot())
     const bool per_row = rows_of_ != nullptr;
     const int each = per_row ? n : 1;
+    // and their launches of a row each in one launch for all of them (the _rows kernels: a row's bits are its own
+    // launch's); not on Metal, whose kernels have none (load_geometry() refuses --batch there)
+#if defined(STRATA_GPU_METAL)
+    const bool rows_launch = false;
+#else
+    const bool rows_launch = per_row && n > 1;
+#endif
 
     // the tokens' embeddings, normed (a picture's rows are not: whole(); step()'s rows have none)
     if (il == 0 && (per_row || !image_at(pos_))) {
@@ -1104,6 +1111,21 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
             c.taps = taps_;
             c.ring = B.swa ? ring_ : 0;
             c.kv8 = kv8_;
+#if !defined(STRATA_GPU_METAL)
+            if (rows_launch) {   // all of step()'s rows in one launch, from row 0's, positions from at_
+                InkQkvRows r;
+                for (int j = 0; j < n; ++j) {
+                    const Slot sj = run_slot(il, j);
+                    r.kstate[j] = past_k(sj);
+                    r.vstate[j] = past_v(sj);
+                    r.keys[j] = sj.keys;
+                    r.vals[j] = sj.vals;
+                }
+                c.at = at_;
+                ink_qkv_rows(c, r, n, st_);
+                break;
+            }
+#endif
             ink_qkv(c, st_);
         }
     } else {
@@ -1169,7 +1191,27 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     a.scale = 1.f / std::sqrt((float) head_dim_);
     a.gate = gate_;   // the output gate in the join's launch, or the flash kernel's
     a.kv8 = kv8_;
-    if (per_row) {   // step()'s rows: each over its own sequence's caches, at its position, sized as it is alone
+    if (rows_launch) {   // step()'s rows: each over its own sequence's caches, at its position, as it is alone
+#if !defined(STRATA_GPU_METAL)
+        InkAttnRows c;
+        InkAttn b = a;
+        b.at = at_;
+        b.room = 0;
+        const int64_t keep = pos_;
+        for (int i = 0; i < n; ++i) {
+            const Slot s = run_slot(il, i);
+            c.keys[i] = s.keys;
+            c.vals[i] = s.vals;
+            // the rows its launch alone is sized for: room()'s steps when recorded, else its position and itself
+            pos_ = rows_of_[i].pos;
+            const int64_t last = at ? room(1) : pos_ + 1;
+            c.parts[i] = ink_attend_parts(n_head_, n_kv_, head_dim_, b.window, last);
+            b.room = (int) std::max<int64_t>(b.room, last);
+        }
+        pos_ = keep;
+        ink_attend_rows(b, c, st_);
+#endif
+    } else if (per_row) {   // the same a launch a row
         const int64_t keep = pos_;
         for (int i = 0; i < n; ++i) {
             const Slot s = run_slot(il, i);
@@ -1214,10 +1256,18 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     // the first layer of a block starts a new stream from the attention's output; the one it had joins the mixes
     if (n == 1 || per_row) {   // the convolution and the stream's update in one launch (a launch a row of step()'s)
         const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
-        for (int i = 0; i < each; ++i) {
+        float* const keep = mode == 1 ? bl_[il / blk_] : nullptr;
+#if !defined(STRATA_GPU_METAL)
+        if (rows_launch) {
+            InkStateRows st;
+            for (int i = 0; i < n; ++i) st.p[i] = past_a(run_slot(il, i));
+            ink_conv_add_rows(aoraw_, st, fp(B.a_conv), ao_, r_, keep, 1.f, mode, n_embd_, taps_, n, st_);
+        }
+#endif
+        for (int i = 0; i < each && !rows_launch; ++i) {
             const size_t t = (size_t) i * n_embd_;
-            ink_conv_add(aoraw_ + t, past_a(run_slot(il, i)), fp(B.a_conv), ao_ + t, r_ + t,
-                         mode == 1 ? bl_[il / blk_] + t : nullptr, 1.f, mode, n_embd_, taps_, st_);
+            ink_conv_add(aoraw_ + t, past_a(run_slot(il, i)), fp(B.a_conv), ao_ + t, r_ + t, keep ? keep + t : nullptr,
+                         1.f, mode, n_embd_, taps_, st_);
         }
         dbg("attn", il, ao_, n_embd_);
     } else {
@@ -1275,7 +1325,16 @@ void Inkling2::tail_rows(int il, int n) {
                          fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, n_embd_, taps_, st_);
         return;
     }
-    if (n == 1 || rows_of_) {   // step()'s rows: a launch a row, each with its own sequence's state
+    if (n == 1 || rows_of_) {   // step()'s rows: each with its own sequence's state, in one launch
+#if !defined(STRATA_GPU_METAL)
+        if (rows_of_ && n > 1) {
+            InkStateRows st;
+            for (int i = 0; i < n; ++i) st.p[i] = past_f(run_slot(il, i));
+            ink_conv_add_rows(fo_, st, fp(blocks_[(size_t) il].f_conv), fc_, r_, nullptr, 1.f, 0, n_embd_, taps_, n,
+                              st_);
+            return;
+        }
+#endif
         for (int i = 0; i < (rows_of_ ? n : 1); ++i) {
             const size_t t = (size_t) i * n_embd_;
             ink_conv_add(fo_ + t, past_f(run_slot(il, i)), fp(blocks_[(size_t) il].f_conv), fc_ + t, r_ + t, nullptr,
