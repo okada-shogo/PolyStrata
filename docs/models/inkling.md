@@ -3,7 +3,7 @@
 Back to [README.md](../../README.md)
 
 **Inkling 2 Mini** by Thinking Machines: a file of 9 to 18 GB. It is experimental here. It has run on Linux with an
-RTX 5090, on Windows with an 8 GB laptop card and on a Mac with an M5 Ultra (a beta there), one request at a time. It
+RTX 5090, on Windows with an 8 GB laptop card and on a Mac with an M5 Ultra (a beta there). It
 reads pictures too. Its 24 layers of weights run as 48: the twelve in the middle run three
 times for every token. Forty of the 48 look back 1,024 tokens only, so a long conversation takes little VRAM:
 32,768 bytes a token.
@@ -129,8 +129,9 @@ rows took 3.4 s.
 Not run yet: an AMD card, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
 on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on
 the CPU. The draft file is an
-option (`--draft-model`). The engine takes one request at a time
-for this model, and the installer writes `"parallel": 1`. Its license is Apache 2.0.
+option (`--draft-model`). Several requests at once (`"parallel"`, see [BATCHING.md](../BATCHING.md)) are
+opt-in on an NVIDIA card, not with the draft file; on a Mac the engine takes one request at a time for this model,
+and the installer writes `"parallel": 1` there. Its license is Apache 2.0.
 
 ## Install
 

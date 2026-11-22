@@ -931,8 +931,9 @@ FAMILIES = {
     # context token is the rows of the eight full-attention applications ("row_bytes"); the forty window ones keep
     # rings.  The files are the repository's Mainline_Support ones, the layout llama.cpp runs: the repository names them
     # .gguf_file ("remote_suffix") and its top-level files are another layout (architecture inkling2), which the
-    # engine refuses.  The engine keeps one sequence's state for it, so it answers one
-    # request at a time ("one_request": setup writes "parallel": 1).  "vram_beside_gb" is the peak VRAM measured on an RTX 5090 with no expert on the card, a 10,081-token
+    # engine refuses.  "parallel" (the engine's batch slots) is
+    # opt-in as for the other strata-poly families; on a Mac the engine keeps one sequence's state for it, so it answers
+    # one request at a time there ("one_request": "mac": setup_mac.py writes "parallel": 1).  "vram_beside_gb" is the peak VRAM measured on an RTX 5090 with no expert on the card, a 10,081-token
     # prompt read 1,024 tokens at a time at a 32K context (2,916 MiB), plus the rows of the context's other tokens.
     "inkling": {"title": "Inkling 2 Mini", "by": "Thinking Machines; quantized by Unsloth",
                 "about": "experimental, on the strata-poly engine: one NVIDIA card, Linux or Windows, or a Mac (beta), "
@@ -940,7 +941,7 @@ FAMILIES = {
                 "hf": hf("unsloth/Inkling-2-Mini-GGUF") + "Mainline_Support/", "file": "Inkling-2-Mini-{q}.gguf",
                 "remote_suffix": "_file", "shards": 1,
                 "tag": "inkling-", "name": "inkling-2-mini", "engine": "poly", "vision": True, "experimental": True,
-                "windows": True, "ran_on_gb": 8, "row_bytes": 32768, "one_request": True,
+                "windows": True, "ran_on_gb": 8, "row_bytes": 32768, "one_request": "mac",
                 # the engine's layer split is not built for Inkling 2 yet: it exits with "Inkling 2 runs on one
                 # card (--layer-split is not supported for it yet)", so setup never offers a pair to this family
                 "one_card": True,
@@ -10934,8 +10935,9 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     # requests at once: written only when given, else an earlier "parallel" is carried over (write_setup_config).
-    # A family the engine answers one request at a time ("one_request") is written 1, whatever was asked or kept.
-    if fam.get("one_request"):
+    # A family the engine answers one request at a time ("one_request": True) is written 1, whatever was asked or kept
+    # ("mac": on a Mac only, which setup_mac.py writes).
+    if fam.get("one_request") is True:
         cfg["parallel"] = 1
         if (a.parallel or 1) >= 2:
             warn(f"--parallel {a.parallel}: {title} answers one request at a time on this engine; \"parallel\" is "
