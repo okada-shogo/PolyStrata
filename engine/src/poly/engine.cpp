@@ -959,12 +959,27 @@ static size_t vmm_unit(size_t grain) { return up_to(size_t(2) << 20, grain); }
 
 // The size of every piece of a reservation of `reserved` bytes: `first`, the size of the piece it has, or for its
 // first map the most units that divide the reservation and are no more than the piece asked for and the map's bytes.
-// A map then covers a whole number of pieces, and the last one is no shorter than the others.
+// A map then covers a whole number of pieces, and the last one is no shorter than the others.  A map of any piece size
+// (SIZE_MAX: the staging buffer, a read's rows) takes the divisor that maps the fewest units past the map's bytes, of
+// 16 MiB or more where one maps at most half again as much (a piece is a file descriptor on ROCm), the larger on a tie:
+// the most units would map a reservation of 100 units whole for a first map of 51.
 static size_t vmm_piece(size_t reserved, size_t first, size_t bytes, size_t piece, size_t unit) {
     if (first) return first;
+    const size_t r = reserved / unit;
+    if (piece == SIZE_MAX) {
+        const size_t b = std::max<size_t>(up_to(std::min(bytes, reserved), unit) / unit, 1);
+        const auto least = [&](size_t from) {   // {the divisor of r from `from` on that maps least past b, its excess}
+            size_t best = r, past = up_to(b, r) - b;
+            for (size_t k = r; k-- > from;)
+                if (k > 0 && r % k == 0 && up_to(b, k) - b < past) best = k, past = up_to(b, k) - b;
+            return std::pair<size_t, size_t>(best, past);
+        };
+        const auto wide = least(std::min<size_t>(r, (size_t(16) << 20) / unit));
+        return (2 * wide.second <= b ? wide.first : least(1).first) * unit;
+    }
     const size_t most = std::min(up_to(std::min(piece, reserved), unit), up_to(bytes, unit)) / unit;
     size_t k = std::max<size_t>(most, 1);
-    while (k > 1 && (reserved / unit) % k != 0) --k;
+    while (k > 1 && r % k != 0) --k;
     return k * unit;
 }
 #endif
