@@ -40,7 +40,13 @@ void Inkling2::load_geometry() {
     // token at a time unless --window asks for more: guesses from repeats of the conversation wrote 1.8% slower after
     // a short prompt that had few (RTX 5090, UD-Q4_K_XL, --window 4).  With it a window is its block.
     opt_.draft = false;
-    need(opt_.batch == 0, "Inkling 2 runs one sequence (--batch is not supported for it yet)");
+    // --batch: sequences beside the first, a token of each in one step() (batch_heads()).  Not with the drafter, whose
+    // caches and block are one sequence's.
+    need(opt_.batch <= 2, "Inkling 2 takes --batch 0 to 2");
+#if defined(STRATA_GPU_METAL)
+    need(opt_.batch == 0, "Inkling 2 runs one sequence on Metal (--batch is not supported there yet)");
+#endif
+    need(opt_.batch == 0 || opt_.draft_model.empty(), "Inkling 2 runs one sequence with --draft-model (no --batch)");
     need(opt_.layer_split.empty(), "Inkling 2 runs on one card (--layer-split is not supported for it yet)");
     need(opt_.kv_format == KvFmt::kFp16 || opt_.kv_format == KvFmt::kFp8, "Inkling 2's attention caches are fp16 or fp8");
     load_shape();
@@ -705,6 +711,17 @@ InkStates Inkling2::streams_of(int blocks, size_t at) const {
     return s;
 }
 
+Inkling2::Slot Inkling2::run_slot(int il, int i) const {
+    const Slot& s = slots_[(size_t) slot_of(il, pass_of(il))];
+    if (!rows_of_) return s;
+    const int q = rows_of_[i].seq;
+    Slot r = s;
+    r.keys = (uint16_t*) seq_buf(q, s.keys);
+    r.vals = (uint16_t*) seq_buf(q, s.vals);
+    r.past = seq_state(q, s.past);
+    return r;
+}
+
 // A loop controller: out = cur - tanh(forget) * cur + tanh(gain) * msg, the two gates from cur and msg.  out may
 // be cur.
 void Inkling2::control(const float* cur, const float* msg, const Ctrl& c, float* out, int n) {
@@ -725,34 +742,38 @@ void Inkling2::control(const float* cur, const float* msg, const Ctrl& c, float*
 
 // A later pass's FFN controller for one token (control() on mixf_), its gate in the launch of the experts' input
 // norm and quantization (native_add_rms_norm_q8_1()'s): the same bytes.  False, with nothing launched, where
-// control() and that norm do it.
-bool Inkling2::control_ffn(const float* msg, const Ctrl& c, const Block& B) {
+// control() and that norm do it.  `row`: the token's row of mixf_, msg, xn_ and xq_ (step()'s rows, one at a time).
+bool Inkling2::control_ffn(const float* msg, const Ctrl& c, const Block& B, int row) {
+    float* const mixf = mixf_ + (size_t) row * n_embd_;
+    float* const xn = xn_ + (size_t) row * n_embd_;
+    void* const xq = (uint8_t*) xq_ + (size_t) row * kernels::native_q8_1_bytes(n_embd_);
+    msg += (size_t) row * n_embd_;
     if (c.down.type == kTypeBF16) {   // the down product, then the gate (ink_control3_gate()'s of one), then the norm
         if (c.gain.type != kTypeBF16 || c.forget.type != kTypeBF16 || c.down.scale != 1.0f || c.gain.scale != 1.0f ||
             c.forget.scale != 1.0f || rank_ >= 128)
             return false;
-        const float* cur = mixf_;
+        const float* cur = mixf;
         const void* down = c.down.p;
         float* ch = ch_;
         if (!ink_ctrl_down(&cur, &msg, &down, &ch, 1, n_embd_, rank_, 1, st_, true)) return false;
         const float* chs = ch_;
         const void* g = c.gain.p;
         const void* f = c.forget.p;
-        float* out = mixf_;
+        float* out = mixf;
         ink_control3_gate(&cur, &msg, &chs, &g, &f, &out, n_embd_, rank_, st_, 1, true);
-        kernels::native_add_rms_norm_q8_1(mixf_, nullptr, fp(B.ffn_norm), xn_, xq_, n_embd_, 1, rms_eps_,
+        kernels::native_add_rms_norm_q8_1(mixf, nullptr, fp(B.ffn_norm), xn, xq, n_embd_, 1, rms_eps_,
                                           sum_threads(n_embd_), st_);
         return true;
     }
     if (c.gain.type != kTypeF32 || c.forget.type != kTypeF32 || c.gain.scale != 1.0f || c.forget.scale != 1.0f ||
         sum_threads(n_embd_) != 1024)
         return false;
-    const float* cur = mixf_;
+    const float* cur = mixf;
     const void* down = fp(c.down);
     float* ch = ch_;
     if (c.down.type != kTypeF32 || c.down.scale != 1.0f ||
         !ink_ctrl_down(&cur, &msg, &down, &ch, 1, n_embd_, rank_, 1, st_)) {   // the norms and lin()'s gemv_kernel
-        ink_cat_norm(mixf_, msg, cat_, n_embd_, 1, st_);
+        ink_cat_norm(mixf, msg, cat_, n_embd_, 1, st_);
         lin(c.down, cat_, ch_, 1);
     }
     const float* w[2] = {fp(c.gain), fp(c.forget)};
@@ -760,7 +781,7 @@ bool Inkling2::control_ffn(const float* msg, const Ctrl& c, const Block& B) {
     float* y[2] = {gain_, forget_};
     const int outs[2] = {n_embd_, n_embd_};
     gemv_set(w, x, y, outs, 2, rank_, 1, st_);
-    ink_gate_norm_q8(mixf_, msg, gain_, forget_, mixf_, fp(B.ffn_norm), xn_, xq_, n_embd_, rms_eps_, st_);
+    ink_gate_norm_q8(mixf, msg, gain_, forget_, mixf, fp(B.ffn_norm), xn, xq, n_embd_, rms_eps_, st_);
     return true;
 }
 
@@ -855,11 +876,13 @@ bool Inkling2::project(const Block& B, const float* const* x, int n, bool quanti
 // The three controllers of a later pass's attention inputs for a few tokens, each step one launch for the three
 // (ink_cat_norm_set(), gemv_set(), ink_gate_set()), every output the bits control() gives it.  A window layer's
 // three cur are one buffer, and out[0] is that buffer too: ink_gate_set() reads every cur before it writes.  False,
-// with nothing launched, where control() does it: a prompt batch, or matrices gemv_set() does not take.
+// with nothing launched, where control() does it: a prompt batch, or matrices gemv_set() does not take.  Of step()'s
+// rows (each a token of its own sequence) the BF16 controllers' gates are a token's launch a row.
 bool Inkling2::control3(const float* const* cur, float* const* msg, const Ctrl* c, float* const* out, int n) {
     if (n >= kStageRows) return false;
     const bool bf = c[0].down.type == kTypeBF16;   // --loop-bf16: a token's only, control() the others
-    if (bf && !(n == 1 && rank_ < 128)) return false;
+    const bool per_row = bf && rows_of_ && n > 1;
+    if (bf && !((n == 1 || per_row) && rank_ < 128)) return false;
     for (int j = 0; j < 3; ++j)
         for (const Dev* d : {&c[j].down, &c[j].gain, &c[j].forget})
             if (d->type != (bf ? kTypeBF16 : kTypeF32) || d->scale != 1.0f) return false;
@@ -881,11 +904,17 @@ bool Inkling2::control3(const float* const* cur, float* const* msg, const Ctrl* 
         ink_cat_norm_set(cur, m, cat3_, 3, n_embd_, n, st_);
         gemv_set(w, x, y, outs, 3, 2 * n_embd_, n, st_);
     }
-    if (n == 1 && rank_ < 128) {   // the gain and forget products and the gates in one launch
-        const float* ch[3] = {ch3_[0], ch3_[1], ch3_[2]};
+    if ((n == 1 || per_row) && rank_ < 128) {   // the gain and forget products and the gates in one launch
         const void* gw[3] = {c[0].gain.p, c[1].gain.p, c[2].gain.p};
         const void* fw[3] = {c[0].forget.p, c[1].forget.p, c[2].forget.p};
-        ink_control3_gate(cur, m, ch, gw, fw, out, n_embd_, rank_, st_, 3, bf);
+        for (int i = 0; i < n; ++i) {   // a row at a time
+            const size_t e = (size_t) i * n_embd_, r = (size_t) i * rank_;
+            const float* ci[3] = {cur[0] + e, cur[1] + e, cur[2] + e};
+            const float* mi[3] = {m[0] + e, m[1] + e, m[2] + e};
+            const float* ch[3] = {ch3_[0] + r, ch3_[1] + r, ch3_[2] + r};
+            float* oi[3] = {out[0] + e, out[1] + e, out[2] + e};
+            ink_control3_gate(ci, mi, ch, gw, fw, oi, n_embd_, rank_, st_, 3, bf);
+        }
         return true;
     }
     for (int j = 0; j < 3; ++j) {
@@ -915,8 +944,13 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     Slot& S = slots_[(size_t) slot_of(il, pass_of(il))];
     const size_t ne = (size_t) n * n_embd_;
     const int kv = n_kv_ * head_dim_, hq = n_head_ * head_dim_;
+    // step()'s rows (rows_of_), each a token of its own sequence: what reads or writes a sequence's states, caches or
+    // position goes a row at a time, each with a token's launches and its own sequence's slot (run_slot())
+    const bool per_row = rows_of_ != nullptr;
+    const int each = per_row ? n : 1;
 
-    if (il == 0 && !image_at(pos_)) {   // the tokens' embeddings, normed (a picture's rows are not: whole())
+    // the tokens' embeddings, normed (a picture's rows are not: whole(); step()'s rows have none)
+    if (il == 0 && (per_row || !image_at(pos_))) {
         rms_norm(r_, fp(tok_norm_), mixf_, n_embd_, n, rms_eps_, st_);
         copy_rows(mixf_, r_, n);
     }
@@ -1033,39 +1067,45 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     }
     const float alpha = B.swa ? 0.f : log_alpha_;
     const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the tokens' positions from what at_ holds
-    if (n == 1 && head_dim_ <= 128 && n_rel_ <= 128) {   // one launch for all of it, the same bits
-        InkQkv c;
-        c.q = q_;
-        c.q_scale = fp(B.q_clip);
-        c.r = rr_;
-        c.r_scale = fp(B.rel_clip);
-        c.kraw = kraw_;
-        c.vraw = vraw_;
-        c.kstate = past_k(S);
-        c.vstate = past_v(S);
-        c.kw = fp(B.k_conv);
-        c.vw = fp(B.v_conv);
-        c.kdyn = kd;
-        c.vdyn = vd;
-        c.k = k_;
-        c.v = v_;
-        c.keys = S.keys;
-        c.vals = S.vals;
-        c.at = at;
-        c.pos = pos_;
-        c.qk_thr = qk_clip_;
-        c.rel_thr = rel_clip_;
-        c.alpha = alpha;
-        c.floor = log_floor_;
-        c.eps = rms_eps_;
-        c.n_head = n_head_;
-        c.n_kv = n_kv_;
-        c.dim = head_dim_;
-        c.n_rel = n_rel_;
-        c.taps = taps_;
-        c.ring = B.swa ? ring_ : 0;
-        c.kv8 = kv8_;
-        ink_qkv(c, st_);
+    // one launch for all of it, the same bits (step()'s rows: a launch a row; load_geometry() takes no other heads)
+    if ((n == 1 || per_row) && head_dim_ <= 128 && n_rel_ <= 128) {
+        for (int i = 0; i < each; ++i) {
+            const Slot s = run_slot(il, i);
+            const size_t tq = (size_t) i * hq, tk = (size_t) i * kv, tr = (size_t) i * n_head_ * n_rel_,
+                         td = (size_t) i * taps_ * n_kv_;
+            InkQkv c;
+            c.q = q_ + tq;
+            c.q_scale = fp(B.q_clip);
+            c.r = rr_ + tr;
+            c.r_scale = fp(B.rel_clip);
+            c.kraw = kraw_ + tk;
+            c.vraw = vraw_ + tk;
+            c.kstate = past_k(s);
+            c.vstate = past_v(s);
+            c.kw = fp(B.k_conv);
+            c.vw = fp(B.v_conv);
+            c.kdyn = kd ? kd + td : nullptr;
+            c.vdyn = vd ? vd + td : nullptr;
+            c.k = k_ + tk;
+            c.v = v_ + tk;
+            c.keys = s.keys;
+            c.vals = s.vals;
+            c.at = at ? at + 2 * i : nullptr;
+            c.pos = per_row ? rows_of_[i].pos : pos_;
+            c.qk_thr = qk_clip_;
+            c.rel_thr = rel_clip_;
+            c.alpha = alpha;
+            c.floor = log_floor_;
+            c.eps = rms_eps_;
+            c.n_head = n_head_;
+            c.n_kv = n_kv_;
+            c.dim = head_dim_;
+            c.n_rel = n_rel_;
+            c.taps = taps_;
+            c.ring = B.swa ? ring_ : 0;
+            c.kv8 = kv8_;
+            ink_qkv(c, st_);
+        }
     } else {
         if (n <= kConvFew) {   // a window's K and V convolutions in one launch
             InkConv ck, cv;
@@ -1129,7 +1169,27 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     a.scale = 1.f / std::sqrt((float) head_dim_);
     a.gate = gate_;   // the output gate in the join's launch, or the flash kernel's
     a.kv8 = kv8_;
-    if (n >= kStageRows && ink_attend_batch(a, st_)) {
+    if (per_row) {   // step()'s rows: each over its own sequence's caches, at its position, sized as it is alone
+        const int64_t keep = pos_;
+        for (int i = 0; i < n; ++i) {
+            const Slot s = run_slot(il, i);
+            InkAttn b = a;
+            b.q = q_ + (size_t) i * hq;
+            b.r = rr_ + (size_t) i * n_head_ * n_rel_;
+            b.sink = sink_ + (size_t) i * n_head_;
+            b.keys = s.keys;
+            b.vals = s.vals;
+            b.out = att_ + (size_t) i * hq;
+            b.gate = gate_ + (size_t) i * hq;
+            b.pos = pos_ = rows_of_[i].pos;
+            b.at = at ? at + 2 * i : nullptr;
+            b.room = at ? room(1) : 0;
+            b.rows = 1;
+            if (n == 1) b.q8 = xqo_;   // and the output quantized for wo
+            ink_attend(b, st_);
+        }
+        pos_ = keep;
+    } else if (n >= kStageRows && ink_attend_batch(a, st_)) {
         // a prompt batch on the tensor cores with no score written out: attend_batch()'s path below wrote 1.6e11
         // scores of a 30,954-token read and read them back, 8.9 of its 16.8 s of attention on the RTX 4070 Laptop
     } else if (n >= kStageRows) {
@@ -1152,10 +1212,13 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     }
     lin(B.wo, att_, aoraw_, n, n == 1 && n < kStageRows ? xqo_ : nullptr);
     // the first layer of a block starts a new stream from the attention's output; the one it had joins the mixes
-    if (n == 1) {   // the convolution and the stream's update in one launch
+    if (n == 1 || per_row) {   // the convolution and the stream's update in one launch (a launch a row of step()'s)
         const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
-        ink_conv_add(aoraw_, past_a(S), fp(B.a_conv), ao_, r_, mode == 1 ? bl_[il / blk_] : nullptr, 1.f, mode,
-                     n_embd_, taps_, st_);
+        for (int i = 0; i < each; ++i) {
+            const size_t t = (size_t) i * n_embd_;
+            ink_conv_add(aoraw_ + t, past_a(run_slot(il, i)), fp(B.a_conv), ao_ + t, r_ + t,
+                         mode == 1 ? bl_[il / blk_] + t : nullptr, 1.f, mode, n_embd_, taps_, st_);
+        }
         dbg("attn", il, ao_, n_embd_);
     } else {
         if (n <= kConvFew) {   // the convolution and the stream's update in one launch, as for a token
@@ -1186,7 +1249,10 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                      rms_eps_, st_, xq_, true);
     } else {
         ink_mix(streams_of(il / blk_ + 1, 0), fp(B.ffn_query), 1, mixed, n_embd_, n, st_);
-        if (!(looped && n == 1 && control_ffn(msg[3], B.ctrl[3], B))) {
+        // a token's controller (step()'s rows: a row at a time; each takes it or none does)
+        bool ffn_done = looped && (n == 1 || per_row) && control_ffn(msg[3], B.ctrl[3], B, 0);
+        for (int i = 1; i < n && ffn_done; ++i) control_ffn(msg[3], B.ctrl[3], B, i);
+        if (!ffn_done) {
             if (looped) control(mixf_, msg[3], B.ctrl[3], mixf_, n);
             kernels::native_add_rms_norm_q8_1(mixf_, nullptr, fp(B.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
                                               sum_threads(n_embd_), st_);
@@ -1205,12 +1271,16 @@ void Inkling2::layer_tail(Layer&, int il, int n) {
 void Inkling2::tail_rows(int il, int n) {
     const Slot& S = slots_[(size_t) slot_of(il, pass_of(il))];
     if (n == 1 && std::exchange(moe_left_, false)) {   // moe_card() left the experts' sum here
-        ink_moe_conv_add(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(S), fp(blocks_[(size_t) il].f_conv),
-                         fc_, r_, 1.f, n_embd_, taps_, st_);
+        ink_moe_conv_add(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(run_slot(il, 0)),
+                         fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, n_embd_, taps_, st_);
         return;
     }
-    if (n == 1) {
-        ink_conv_add(fo_, past_f(S), fp(blocks_[(size_t) il].f_conv), fc_, r_, nullptr, 1.f, 0, n_embd_, taps_, st_);
+    if (n == 1 || rows_of_) {   // step()'s rows: a launch a row, each with its own sequence's state
+        for (int i = 0; i < (rows_of_ ? n : 1); ++i) {
+            const size_t t = (size_t) i * n_embd_;
+            ink_conv_add(fo_ + t, past_f(run_slot(il, i)), fp(blocks_[(size_t) il].f_conv), fc_ + t, r_ + t, nullptr,
+                         1.f, 0, n_embd_, taps_, st_);
+        }
         return;
     }
     if (n <= kConvFew) {   // the convolution and the stream's update in one launch, as for a token
@@ -1243,7 +1313,9 @@ int Inkling2::head_key(int il, int n) const {
     return pass_of(il) * 32 + (blocks_[(size_t) il].swa ? 0 : room_key(n));
 }
 
-int Inkling2::tail_key(int il, int) const { return pass_of(il); }
+// A tail's recordings: one a pass of the core and a sequence, whose state is in them (the heads' are the sequence's
+// own: Engine::Seq::heads).
+int Inkling2::tail_key(int il, int) const { return pass_of(il) + n_pass_ * bound(); }
 
 void Inkling2::output_rows(int first, int rows, float* h) {
     const size_t at = (size_t) first * n_embd_;

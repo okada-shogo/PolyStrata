@@ -1206,6 +1206,7 @@ void Engine::metal_invalidate_graphs() {
     graphs_.clear();
     for (Layer& l : layers_) {
         l.heads.clear(); l.shared.clear(); l.tail.clear(); l.card_moe.clear(); l.rows_heads.clear();
+        l.rows_tails.clear();
         l.card = -1;
     }
     passes_.clear();
@@ -6879,21 +6880,24 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         void*& pass = step_passes_[wkey];
         if (!pass)
             pass = record([&] {
-                for (int il = lo_; il < hi_; ++il) {
+                // the layers' runs in next_layer()'s order (a looped core's layers run more than once a token)
+                for (int il = lo_; il < hi_; il = next_layer(il)) {
                     Layer& L = layers_[(size_t) il];
                     rows_of_ = rows.data();
                     n_rows_of_ = R;
                     layer_head(L, il, R);
-                    rows_of_ = nullptr;
+                    if (!tail_by_rows() || !L.moe) rows_of_ = nullptr;
                     if (!L.moe) continue;
                     moe_shared(L, il, R);
                     moe_card(L, il, R);
                     layer_tail(L, il, R);
+                    rows_of_ = nullptr;
                 }
                 logits_rows(0, R);
             });
         ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
-        for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += layers_[(size_t) il].moe ? R * n_used_ : 0;
+        for (int il = lo_; il < hi_; il = next_layer(il))
+            stats_.gpu_experts += layers_[(size_t) il].moe ? R * n_used_ : 0;
         out_done[0] = out_done[1] = true;
     }
     // With experts on the CPU, the rows go through the layers in two halves, a sequence's rows in one, as a window's
@@ -6907,8 +6911,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     }();
     int mid = R / 2;
     while (mid < R && mid > 0 && rseq[(size_t) mid] == rseq[(size_t) mid - 1]) ++mid;
-    const bool halved = halves_on && !card && batch_heads() && !all_cached() && R >= 4 && mid > 0 && mid < R &&
-                        !batched(layers_[(size_t) first_moe_layer()], R);
+    // (not where the tails take the rows: a half's tail is recorded by its place in the buffers, not by sequence)
+    const bool halved = halves_on && !card && batch_heads() && !tail_by_rows() && !all_cached() && R >= 4 && mid > 0 &&
+                        mid < R && !batched(layers_[(size_t) first_moe_layer()], R);
     if (halved) {
         const int first[3] = {0, mid, R};
         int at0 = 0;
@@ -7006,7 +7011,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         }
         back();
     }
-    for (int il = lo_; il < hi_ && !halved && !whole; ++il) {
+    for (int il = lo_; il < hi_ && !halved && !whole; il = next_layer(il)) {
         Layer& L = layers_[(size_t) il];
         if (batch_heads()) {
             const int64_t keep = pos_;
@@ -7056,8 +7061,24 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
                 moe_add(R);
             }
         }
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, R); });
-        else layer_tail(L, il, R);
+        if (tail_by_rows()) {   // the rows' own states: recorded by their sequences
+            std::vector<int> tkey{R, tail_key(il, R)};
+            for (int i = 0; i < R; ++i) tkey.push_back(rseq[(size_t) i]);
+            rows_of_ = rows.data();
+            n_rows_of_ = R;
+            if (replay && L.fixed) {
+                void*& made = L.rows_tails[tkey];
+                if (!made) made = record([&] { layer_tail(L, il, R); });
+                ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
+            } else {
+                layer_tail(L, il, R);
+            }
+            rows_of_ = nullptr;
+        } else if (replay && L.fixed) {
+            replayed(L.tail, rec, [&] { layer_tail(L, il, R); });
+        } else {
+            layer_tail(L, il, R);
+        }
     }
 
     if (next_) {

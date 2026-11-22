@@ -204,6 +204,9 @@ struct Layer {
     std::vector<void*> card_moe;       ///< the routed experts, routed on the card (moe_card())
     /// the head of step()'s rows in one call (Engine::batch_heads()): by the rows, their sequences and head keys
     std::map<std::vector<int>, void*> rows_heads;
+    /// the tail of step()'s rows in one call, where it reads them too (Engine::tail_by_rows()): by the rows, their
+    /// sequences and the tail key
+    std::map<std::vector<int>, void*> rows_tails;
 };
 
 /// A routed expert is run from the VRAM cache or on the CPU when tokens come a few at a time, as an answer's do
@@ -604,6 +607,10 @@ protected:
     /// state and attention rows from its own sequence (rows_of_, seq_state(), seq_buf()), its position from at_.
     /// Otherwise step() runs the head a row at a time, with the row's sequence bound.
     virtual bool batch_heads() const { return false; }
+    /// With batch_heads(): layer_tail() takes step()'s rows too (rows_of_ set), for a recurrent state of each row's
+    /// own sequence after the experts (Inkling 2's convolution of the experts' sum).  step() then records a tail by
+    /// its rows' sequences, as a head, and does not split the rows into halves.
+    virtual bool tail_by_rows() const { return false; }
     /// The architecture's step() rows leave the recurrent state after a row at Row::snap (step() with guesses).
     virtual bool rows_snaps() const { return false; }
     /// While step() runs a head in one call: each row's sequence and position, row after row; else null.  snap: for
