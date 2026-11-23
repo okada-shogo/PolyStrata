@@ -478,6 +478,9 @@ protected:
     // ---- what an architecture supplies ----
     /// The model's shape from its metadata: load_shape() for what every architecture has, then its own.
     virtual void load_geometry() = 0;
+    /// f32_tile_shapes_' picks for gemm_f32_tiles(): from the cache file, else timed and written there
+    /// (STRATA_POLY_F32_AUTOTUNE=0: the cost model).  CUDA and HIP.
+    void tune_f32_tiles();
     /// A layer's weights, to VRAM (upload()) or as places in the mapped file (load_moe()).  load() runs the layers
     /// through twice: begin_pass() is called before each.
     virtual void load_layer(int il) = 0;
@@ -1071,6 +1074,8 @@ protected:
     /// a prompt batch's F32 (and widened BF16) products of one group of 33 to 256 outputs go to gemm_f32_tiles(),
     /// with the same bits as gemm_f32().  On for Inkling 2 Mini, whose controllers and routers it was measured on.
     bool f32_tiles_ = false;
+    /// those products' (inputs, outputs): the way each takes is timed at load (tune_f32_tiles())
+    std::vector<std::pair<int, int>> f32_tile_shapes_;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
     Dev out_norm_, output_;

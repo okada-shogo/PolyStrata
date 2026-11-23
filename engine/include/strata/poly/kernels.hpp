@@ -10,6 +10,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace strata::poly {
 
@@ -34,6 +37,41 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
 /// gemm_f32() of one group (rows_per_x = n_out), 33 to 256 outputs in larger tiles that read their values two steps
 /// ahead: the same bits.  Inkling 2 Mini's prompt batches (Engine::f32_tiles_).  CUDA and HIP only.
 void gemm_f32_tiles(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows);
+/// gemm_f32_tiles()'s ways: 0..3 gemm_ahead_kernel's tiles (64 tokens x 128 outputs, 64 x 64, 32 x 64, 32 x 32),
+/// kF32Way gemm_f32() itself.  Every way gives the same bits.
+constexpr int kF32Ways = 5, kF32Way = 4;
+/// a way picked for n_in inputs, n_out outputs and a bucket of rows (gemm_f32_tiles_bucket())
+struct F32TilePick {
+    int n_in = 0, n_out = 0, rows = 0, way = kF32Way;
+};
+bool gemm_f32_tiles_takes(int n_out);                // 33 to 256 outputs
+bool gemm_f32_tiles_way_ok(int way, int n_out);      // the 64 x 128 tile only past 64 outputs
+int gemm_f32_tiles_bucket(int rows);                 // the rows a pick is timed at: 32, 48, 64, 96 ... 4096 (the top for more)
+/// the cost model's way, for a shape not timed: a tile on the families it was checked on (Turing, Blackwell:
+/// gemm_f32_tiles_model_known()), gemm_f32() (kF32Way) on every other card
+int gemm_f32_tiles_model(int n_in, int n_out, int rows);
+bool gemm_f32_tiles_model_known();
+/// the current device's picks from now on (replaces the ones before); other shapes take the cost model
+void gemm_f32_tiles_use(const F32TilePick* picks, int n);
+int gemm_f32_tiles_pick(int n_in, int n_out, int rows);    // what gemm_f32_tiles() runs
+void gemm_f32_tiles_at(int way, void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows);
+/// times every way on w (n_out x n_in), x (rows x n_in) -> y on blas's stream: a warm-up round, then `samples` rounds
+/// of each way in turn; the median us of each into us[kF32Ways] (-1: not a way for n_out), and returns the fastest.
+/// Throws std::runtime_error.
+int gemm_f32_tiles_time(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows, int samples,
+                        float* us);
+/// what the picks are good for: the current device's name, SMs, clock, driver and runtime, and this build
+std::string gemm_f32_tiles_device_key();
+/// the picks a cache file keeps for `key` (lines "key<TAB>n_in n_out rows way"); false: no file
+bool gemm_f32_tiles_cache_read(const std::string& path, const std::string& key, std::vector<F32TilePick>& picks);
+/// writes `picks` as key's lines (other keys' lines stay), through a temporary file; false: not written
+bool gemm_f32_tiles_cache_write(const std::string& path, const std::string& key, const std::vector<F32TilePick>& picks);
+/// At load: a pick for every (n_in, n_out) of `shapes` and every row bucket up to top_rows', from the cache file
+/// (its lines for gemm_f32_tiles_device_key()) or timed now (gemm_f32_tiles_time()) and written there; where the
+/// cache cannot be written (or there is no VRAM to time in), the cost model's.  Sets them (gemm_f32_tiles_use()) and
+/// returns them; *log says what it did.
+std::vector<F32TilePick> gemm_f32_tiles_autotune(void* blas, const std::vector<std::pair<int, int>>& shapes, int top_rows,
+                                                 const std::string& cache, std::string* log);
 /// n BF16 values as floats, for gemm_f32.
 void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream);
 /// Before a Q8_1 quantization whose blocks keep their sums in halves (llama.cpp's MMQ for Q4_K, Q5_K, Q2_K, Q4_1,
