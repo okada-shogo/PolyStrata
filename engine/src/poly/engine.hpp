@@ -1001,6 +1001,9 @@ protected:
     /// buffer while a run's calls are read (prestage()).  The buffer then takes two layers' VRAM from the expert
     /// cache during a read (widen_stage()).  Inkling 2's on CUDA with STRATA_INK_PRESTAGE=1, else off.
     bool prestage_ = false;
+    /// a prompt batch's F32 (and widened BF16) products of one group of 33 to 256 outputs go to gemm_f32_tiles(),
+    /// with the same bits as gemm_f32().  On for Inkling 2 Mini, whose controllers and routers it was measured on.
+    bool f32_tiles_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
     Dev out_norm_, output_;

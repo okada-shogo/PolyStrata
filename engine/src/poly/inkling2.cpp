@@ -195,6 +195,9 @@ void Inkling2::load_geometry() {
         prestage_ = v && std::string(v) == "1";
     }
 #endif
+    // a prompt batch's F32 products of 33 to 256 outputs (the controllers' down products, the routers) in
+    // gemm_f32_tiles(): the same bits as gemm_f32()
+    f32_tiles_ = true;
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;
     // --attn-requant: the attention's six matrices quantized again to that type at load (kGuessMat), fewer bytes a

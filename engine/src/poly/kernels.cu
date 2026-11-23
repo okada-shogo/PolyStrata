@@ -354,6 +354,119 @@ void gemm_tile(const float* w, const float* x, float* y, int n_in, int n_out, in
         w, x, y, n_in, n_out, rows);
 }
 
+// gemm_tile_kernel's products for Inkling 2 Mini's prompt batches (gemm_f32_tiles()): its controllers' down products
+// (4,608 inputs, 64 outputs) and its routers (2,304 inputs, 128 outputs).  A block TOK tokens and OUT outputs, a
+// thread TT tokens and TO outputs of them, the inputs K at a time; a step's inputs and weights are read into
+// registers two steps before the block works on them, and stored so that a warp's writes fill the 32 banks.  Each
+// output is still one fmaf after the other in the inputs' order: the same bits as gemm_f32(), whatever the tile.
+template <int TOK, int OUT, int TT, int TO, int K>
+__global__ void __launch_bounds__((TOK / TT) * (OUT / TO))
+gemm_ahead_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
+                  int rows) {
+    constexpr int THREADS = (TOK / TT) * (OUT / TO), XS = TOK * K / THREADS, WS = OUT * K / THREADS;
+    static_assert(XS * THREADS == TOK * K && WS * THREADS == OUT * K, "a step's values spread over the threads");
+    static_assert(TOK % 8 == 0 && OUT % 8 == 0 && (TT == 2 || TT == 4 || TT == 8) && (TO == 2 || TO == 4 || TO == 8),
+                  "rows of a multiple of 4 floats, an odd one of them past a multiple of 32 banks");
+    // a step's inputs and weights by input (a row TOK + 4 floats, so a warp's 4 tokens of 8 inputs fill 32 banks),
+    // twice over
+    __shared__ __align__(16) float sx[2][K][TOK + 4], sw[2][K][OUT + 4];
+    const int t0 = blockIdx.x * TOK, o0 = blockIdx.y * OUT;
+    // a thread's tokens and outputs: TT (TO) in a row, or two runs of 4 half a tile apart, so that a quarter of a
+    // warp reads its float4s from 128 bytes in a row
+    const int tr = threadIdx.x / (OUT / TO), orr = threadIdx.x % (OUT / TO);
+    const int tb = TT == 8 ? 4 * tr : TT * tr, ob = TO == 8 ? 4 * orr : TO * orr;
+    constexpr int TH = TT == 8 ? TOK / 2 : 0, OH = TO == 8 ? OUT / 2 : 0;
+    // what a thread reads of a step: one input of a token (an output) and of every RS-th one on, so that a warp
+    // reads 4 tokens' (outputs') runs of 8 inputs
+    static_assert(THREADS % (4 * K) == 0, "a thread's input the same at every place of its step");
+    constexpr int RS = THREADS / K;
+    const int kq = threadIdx.x / 4 % K, rq = threadIdx.x % 4 + 4 * (threadIdx.x / (4 * K));
+    const float* const xb = x + size_t(t0) * n_in;
+    const float* const wb = w + size_t(o0) * n_in;
+    const int xn = rows - t0, wn = n_out - o0;
+    // a step's values in registers: two steps' worth, so that what a thread reads has a whole step to arrive
+    struct Regs {
+        float x[XS], w[WS];
+    } ra, rb;
+    const auto fetch = [&](Regs& r, int k0) {
+        const int k = k0 + kq;
+        const bool in = k < n_in;
+#pragma unroll
+        for (int j = 0; j < XS; ++j) {
+            const int t = rq + j * RS;
+            r.x[j] = in && t < xn ? xb[size_t(t) * n_in + k] : 0.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < WS; ++j) {
+            const int o = rq + j * RS;
+            r.w[j] = in && o < wn ? wb[size_t(o) * n_in + k] : 0.0f;
+        }
+    };
+    const auto store = [&](const Regs& r, int b) {
+#pragma unroll
+        for (int j = 0; j < XS; ++j) sx[b][kq][rq + j * RS] = r.x[j];
+#pragma unroll
+        for (int j = 0; j < WS; ++j) sw[b][kq][rq + j * RS] = r.w[j];
+    };
+    // n floats from 16 (n = 2: 8) bytes on: 4 of them and 4 more `half` floats on for n = 8
+    const auto read = [](const float* p, int half, float* v, int n) {
+        if (n == 2) {
+            const float2 a = *reinterpret_cast<const float2*>(p);
+            v[0] = a.x, v[1] = a.y;
+            return;
+        }
+        const float4 a = *reinterpret_cast<const float4*>(p);
+        v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w;
+        if (n == 8) {
+            const float4 b = *reinterpret_cast<const float4*>(p + half);
+            v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+        }
+    };
+    float acc[TT][TO];
+#pragma unroll
+    for (int i = 0; i < TT; ++i)
+#pragma unroll
+        for (int j = 0; j < TO; ++j) acc[i][j] = 0.0f;
+    // step s works on shared half s % 2, stores step s + 1's values into the other one (read during step s - 1)
+    // and reads step s + 2's into the registers that held them
+    const auto step = [&](Regs& next, Regs& later, int k0, int b) {
+        fetch(next, k0 + 2 * K);
+#pragma unroll 8
+        for (int c = 0; c < K; ++c) {
+            float av[TT], bv[TO];
+            read(&sx[b][c][tb], TH, av, TT);
+            read(&sw[b][c][ob], OH, bv, TO);
+#pragma unroll
+            for (int i = 0; i < TT; ++i)
+#pragma unroll
+                for (int j = 0; j < TO; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+        }
+        store(later, b ^ 1);
+        __syncthreads();
+    };
+    fetch(ra, 0);
+    fetch(rb, K);
+    store(ra, 0);
+    __syncthreads();
+    for (int k0 = 0; k0 < n_in; k0 += 2 * K) {
+        step(ra, rb, k0, 0);
+        if (k0 + K < n_in) step(rb, ra, k0 + K, 1);
+    }
+#pragma unroll
+    for (int i = 0; i < TT; ++i)
+#pragma unroll
+        for (int j = 0; j < TO; ++j) {
+            const int t = t0 + tb + (TT == 8 ? i / 4 * TH + i % 4 : i), o = o0 + ob + (TO == 8 ? j / 4 * OH + j % 4 : j);
+            if (t < rows && o < n_out) y[size_t(t) * n_out + o] = acc[i][j];
+        }
+}
+
+template <int TOK, int OUT, int TT, int TO, int K>
+void gemm_ahead(const float* w, const float* x, float* y, int n_in, int n_out, int rows, cudaStream_t stream) {
+    gemm_ahead_kernel<TOK, OUT, TT, TO, K><<<dim3((rows + TOK - 1) / TOK, (n_out + OUT - 1) / OUT),
+                                             (TOK / TT) * (OUT / TO), 0, stream>>>(w, x, y, n_in, n_out, rows);
+}
+
 // Where a row's Q8_1 blocks would keep a sum past the halves' range: a power of two to divide the row by, 1 for
 // most.  The test is on runs of 16 (Q2_K's blocks keep sums of 16, the others of 32) against a quarter of 65504,
 // so a block of 32 stays under half of it, and on the largest value, whose block delta is a half too.
@@ -3547,6 +3660,26 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
                                       (long long) rows_per_x * n_in, x, groups * n_in, n_in, &zero, y, n_out,
                                       rows_per_x, groups),
             "a batch's projections");
+}
+
+// gemm_f32() with one group of 33 to 256 outputs in gemm_ahead_kernel: the largest of four tiles that still gives
+// half the card's SMs a block (more work a block reads its inputs fewer times; a tile half as large is faster where
+// it gives twice the SMs one).  On an RTX 2070 Super (40 SMs) each pick was the fastest of the 19 (64 outputs) and
+// 27 (128 outputs) tiles measured at 333, 1,024 and 4,096 rows.  Other shapes go to gemm_f32().
+void gemm_f32_tiles(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows) {
+    if (n_out <= SMALL_OUT || n_out > 8 * SMALL_OUT) return gemm_f32(blas, w, x, y, n_in, n_out, n_out, rows);
+    cudaStream_t stream = nullptr;
+    blas_ck(cublasGetStream((cublasHandle_t) blas, &stream), "cublasGetStream");
+    int dev = 0, sms = 1;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+        sms = 1;
+    const auto blocks = [&](int tok, int out) {
+        return 2LL * ((rows + tok - 1) / tok) * ((n_out + out - 1) / out) >= sms;
+    };
+    if (n_out > 64 && blocks(64, 128)) gemm_ahead<64, 128, 8, 8, 16>(w, x, y, n_in, n_out, rows, stream);
+    else if (blocks(64, 64)) gemm_ahead<64, 64, 8, 4, 16>(w, x, y, n_in, n_out, rows, stream);
+    else if (blocks(32, 64)) gemm_ahead<32, 64, 4, 4, 32>(w, x, y, n_in, n_out, rows, stream);
+    else gemm_ahead<32, 32, 2, 4, 32>(w, x, y, n_in, n_out, rows, stream);
 }
 
 void guard_half_sums(float* x, int64_t ld, int width, int rows, float* factor, void* stream) {
