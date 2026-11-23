@@ -95,12 +95,12 @@ void Inkling2::load_geometry() {
     // every expert's scale goes on its joined gate and up product, whatever the experts' type
     joined_scales_ = true;
 #if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
-    // A prompt's read copies the next layer run's experts that are not cached while a run's calls go, and a call's
-    // row tables do not wait behind those copies (prestage(), kernel_tables_).  The experts, the cache and the
-    // launches are the same, so the results are too.  Measured on CUDA only; STRATA_INK_PRESTAGE=0 turns it off.
+    // In a prompt's read of several calls, a call's row tables go to the card by a kernel, not behind the experts'
+    // copies (kernel_tables_).  The same tables reach the same buffers, so the results are the same.  Measured on
+    // CUDA only; STRATA_INK_KERNEL_TABLES=0 turns it off.
     {
-        const char* v = std::getenv("STRATA_INK_PRESTAGE");
-        prestage_ = kernel_tables_ = !(v && std::string(v) == "0");
+        const char* v = std::getenv("STRATA_INK_KERNEL_TABLES");
+        kernel_tables_ = !(v && std::string(v) == "0");
     }
 #endif
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);

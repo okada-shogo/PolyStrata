@@ -22,7 +22,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -706,11 +705,7 @@ protected:
     template <class F>
     void* record(F&& work);
     void moe_rows(Layer& L, int il, int n);
-    void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false, uint8_t* to = nullptr);
-    void prestage(const Layer& L, int m, int n);
-    void settle_prestage();
-    void drop_prestage();
-    int uncached(const Layer& L) const;
+    void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
     void stage_rest(const Layer& L, const int32_t* experts, const std::vector<int>& which, int m, void* stream,
                     bool alone);
     // The pinned mirror (build_mirror()): the routed experts the card does not hold, in pinned host memory in a
@@ -969,12 +964,10 @@ protected:
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.
     bool half_sum_guard_ = false;
-    /// read_groups() copies the next layer run's experts that are not cached while a run's calls go (prestage());
-    /// Inkling 2's unless STRATA_INK_PRESTAGE=0, else off: each run's copy starts with the run.
-    bool prestage_ = false;
-    /// moe_rows() hands the card a call's row tables by a kernel that reads them from pinned memory (copy2()), not
-    /// by a copy: the copies to the card go one after the other, and a call's tables (about 100 KB) would wait
-    /// behind the next run's experts (prestage()).  Set with prestage_.
+    /// In a read of several calls, moe_rows() hands the card a call's row tables by a kernel that reads them from
+    /// pinned memory (copy2()), not by a copy: the copies to the card go one after the other, and a call's tables
+    /// (about 100 KB) waited behind the layer's experts on their way to the staging buffer.  Inkling 2's on CUDA
+    /// unless STRATA_INK_KERNEL_TABLES=0, else off.
     bool kernel_tables_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
@@ -1159,18 +1152,6 @@ protected:
     void* ev_hr_ = nullptr;                       ///< marks the card's last read of h_r_ by draft_input()
     int staged_il_ = -1;                          ///< the layer whose experts the buffer holds for its next call, or -1
     std::vector<int32_t> staged_;                 ///< those experts, in the buffer's order: one round of the layer's
-    size_t stage_at_ = 0;                         ///< where in stage_ that round starts
-    struct Prestaged {
-        int il = -1;                              ///< the layer whose experts the copy is of, or -1
-        size_t at = 0;                            ///< where in stage_
-        std::vector<int32_t> experts;             ///< the layer's L.ahead when it was planned
-        int ev = 0;                               ///< which of ev_pre_ marks its end
-    } pre_;                                       ///< prestage()'s copy
-    std::thread pre_th_;                          ///< fills the pinned buffers for it
-    std::exception_ptr pre_err_;
-    /// mark the ends of those copies in turn: the next run's copy starts before this one's calls wait for theirs
-    void* ev_pre_[2] = {};
-    int next_home_ = -1;                          ///< read_groups(): the layer the next run is of, or -1
     double ahead_ms_ = 0, route_ms_ = 0;          ///< what that layer's copy ahead took, and the card to its routing
     bool shared_ahead_ = false;                   ///< read() runs several calls: each copies ahead, whatever its size
     size_t stage_bytes_ = 0, chunk_bytes_ = 0;
