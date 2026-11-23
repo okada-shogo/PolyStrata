@@ -3700,8 +3700,16 @@ void Engine::alloc() {
     // a prompt's batch is lent with them, and a call of a few tokens has a layout of its own.  At a prompt batch of
     // 2,048 Qwen3.6's scratch is 450 MB, of which the few tokens' layout keeps some 70 (the attention's scores).
     const int most_step = (opt_.batch + 1) * (opt_.batch_mtp ? 2 : 1);
+    // Whether the prompt's buffers are lent (prompt_lends_, below).  Not on ROCm on Linux, which gives VRAM back only
+    // with its addresses (see below): there nothing is lent, so the scratch keeps one layout, and a call of a few
+    // tokens never finds the prompt's layout left in place (which kept graph replay off for every later step).
+#ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
+    const bool lends = false;
+#else
+    const bool lends = vmm_ && !split_ && std::max(opt_.window, most_step) < kStageRows;
+#endif
     two_scratch_ = scratch_layouts() && mmq_ && vmm_ && !split_ && rows_ >= kStageRows &&
-                   std::max(opt_.window, most_step) < kStageRows;
+                   std::max(opt_.window, most_step) < kStageRows && lends;
     if (two_scratch_) {
         buf_rows_ = kStageRows - 1;
         scratch_at_ = 0;
@@ -3770,11 +3778,7 @@ void Engine::alloc() {
         // not: with the buffers lent, strata-poly crashed (SIGSEGV inside hipLaunchKernel, the dequantize launch of a
         // prompt's dense product into the lent work memory) in 15 of 16 runs of Inkling 2 Mini IQ4_NL on an RX 9070 XT
         // with 2,443 of its 3,072 experts in VRAM, ROCm 7.2.4.
-#ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
-        prompt_lends_ = false;
-#else
-        prompt_lends_ = vmm_ && !split_ && std::max(opt_.window, most_step) < kStageRows;
-#endif
+        prompt_lends_ = lends;
         const size_t sizes[] = {rr * 2 * n_ff_exp_ * sizeof(float), rr * n_ff_exp_ * sizeof(float),
                                 rr * n_embd_ * sizeof(float), rr * sizeof(float),
                                 Mmq::q8_bytes((int64_t) rr, n_embd_), Mmq::q8_bytes((int64_t) rr, n_ff_exp_),
