@@ -979,12 +979,12 @@ constexpr int kScoreSteps = 8;                   // a warp's steps of kScoreKeys
 constexpr int kScoreBlockKeys = kScoreWarps * kScoreKeys * kScoreSteps;
 static_assert(kScoreShares == 4, "a lane adds the butterfly's first two rounds itself");
 
-// ink_score_kernel()'s steps for a token of kInt8From keys or more with InkAttn::int8_dot (STRATA_KV_INT8), Q8_0
-// keys: each lane's LH values of a query head (already times the scale), at the shares it takes, become Q8_0 codes,
-// a 32-value block's delta its largest |value| / 127 and a code the value times 1 / delta rounded to the nearest
-// (about as llama.cpp's flash-attention kernels quantize their queries for a quantized K).  A share is then the bias's
-// product plus one __dp4a of its codes with the key's times the two deltas; the shares and lanes are added as in the
-// default steps.  Other arithmetic, so other bits.
+// ink_score_kernel()'s steps for a full layer's token of kInt8From keys or more with InkAttn::int8_dot
+// (STRATA_KV_INT8), Q8_0 keys: each lane's LH values of a query head (already times the scale), at the shares it
+// takes, become Q8_0 codes, a 32-value block's delta its largest |value| / 127 and a code the value times 1 / delta
+// rounded to the nearest (about as llama.cpp's flash-attention kernels quantize their queries for a quantized K).  A
+// share is then the bias's product plus one __dp4a of its codes with the key's times the two deltas; the shares and
+// lanes are added as in the default steps.  Other arithmetic, so other bits.
 template <int LH>
 __device__ __forceinline__ void score_int8(const InkAttn& a, const float* qs, const float (&rr)[kMaxPer][kScoreShares],
                                            float* s, const float* sinks, int per, int g, long long p, long long lo,
@@ -1002,7 +1002,11 @@ __device__ __forceinline__ void score_int8(const InkAttn& a, const float* qs, co
 #pragma unroll
             for (int c = 0; c < LH; ++c) {
                 x[k][c] = hp < per ? qs[hp * a.dim + vl * LH + c] : 0.0f;
-                amax[k] = fmaxf(amax[k], fabsf(x[k][c]));
+                // a NaN or infinite value makes its block's delta infinite and the block's codes 0, so the scores it
+                // is in are NaN (0 x Inf): not finite, as the default steps' would not be either (fmaxf skips a NaN,
+                // and a NaN's code is 0, which would hide it)
+                const float ax = fabsf(x[k][c]);
+                amax[k] = fmaxf(amax[k], isfinite(ax) ? ax : INFINITY);
             }
         }
 #pragma unroll
@@ -1087,7 +1091,7 @@ __global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, 
     // the warp's first key and its cache row; a ring's row is advanced, not divided for, from step to step
     int j = jb + warp * kScoreKeys + mine;
     long long row = a.ring > 0 ? (lo + j) % a.ring : lo + j;
-    if (KV == kKvQ8Dot && nk >= kInt8From) {   // (the whole block)
+    if (KV == kKvQ8Dot && a.window == 0 && nk >= kInt8From) {   // full layers only (the whole block)
         score_int8<LH>(a, qs, rr, s, sinks, per, g, p, lo, nk, nk_max, j, row, sub, mine);
         return;
     }

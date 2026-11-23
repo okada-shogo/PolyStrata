@@ -205,9 +205,10 @@ struct InkAttn {
     /// the caches are Q8_0: a row the n_kv heads' dim int8 codes, then a half scale for each block of 32 values in
     /// the codes' order (a block's largest magnitude over 127), ink_kvq8_row() bytes
     bool kvq8 = false;
-    /// STRATA_KV_INT8, with kvq8: a token that reads 32,768 keys or more takes its scores by __dp4a, its queries
-    /// quantized to Q8_0 codes too (a 32-value block's delta its largest |value| / 127).  Other arithmetic, so
-    /// other bits; the other tokens, the values and ink_attend_batch() ignore it.
+    /// STRATA_KV_INT8, with kvq8: a full layer's (window 0) token that reads 32,768 keys or more takes its scores by
+    /// __dp4a, its queries quantized to Q8_0 codes too (a 32-value block's delta its largest |value| / 127).  Other
+    /// arithmetic, so other bits; window layers, the other tokens, the values and ink_attend_batch() ignore it.  The
+    /// engine sets it for decode only (Inkling2::layer_head()).
     bool int8_dot = false;
 };
 void ink_attend(const InkAttn& a, void* stream);
