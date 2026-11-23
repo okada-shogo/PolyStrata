@@ -171,9 +171,10 @@ class Main(unittest.TestCase):
 
     def test_two_cards_set_up_one_and_size_it_for_that_card(self):
         # PR 208: the engine has no layer split for Inkling 2 yet; two 8 GB cards chosen together get the config one
-        # 8 GB card gets (the small-card flags), not a pair the engine refuses
-        code, out, cfg = self.main(("--gpus", "0,1"), family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024,
-                                   n_gpus=2)
+        # 8 GB card gets (the small-card flags, here asked for: they are off unless the person says on), not a pair
+        # the engine refuses
+        code, out, cfg = self.main(("--gpus", "0,1", "--inkling-small-card", "on"), family="inkling", model="UD-Q3_K_XL",
+                                   ram=32.0, vram=8188 / 1024, n_gpus=2)
         self.assertEqual(code, 0, out)
         self.assertEqual(cfg["gpu"], 0)
         self.assertNotIn("layer_split", cfg)
