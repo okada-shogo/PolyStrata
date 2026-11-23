@@ -96,6 +96,13 @@ by a kernel, so they no longer wait behind the experts copied over the bus. The 
 added. On an RTX 2070 Super 8 GB a 2,048-token prompt reads 6.5% faster with IQ4_NL (477 against 448 tokens/s) and
 2.7% faster with UD-Q2_K_XL; 32,768 tokens read as fast as before. `STRATA_INK_KERNEL_TABLES=0` turns it off.
 
+`STRATA_INK_PRESTAGE=1` (opt-in, NVIDIA, with the pinned copy of the experts that Linux makes): in a prompt of more
+than one batch, the next layer's missing experts are copied while the card works on the current layer. The staging
+buffer then holds two layers, and the expert cache gives up that VRAM (about 1 GB on IQ4_NL) for the read only and
+takes it back after. The answers are the same. On an RTX 2070 Super 8 GB a 2,048-token IQ4_NL prompt reads 12.6%
+faster (541 against 480 tokens/s); UD-Q2_K_XL at 2,048 tokens is 1.3% slower and IQ4_NL at 32,768 tokens 1.9%
+slower, as the smaller cache costs more than the copies save.
+
 On a laptop with an RTX 4070 Laptop (8 GB), a Core i7-14700HX and 32 GB of RAM, on Windows, UD-Q3_K_XL has 1,216 of
 its 3,072 experts on the card and the rest are computed on the CPU. On a card that does not hold every expert, setup
 gives Inkling 2 Mini three settings that read fewer bytes for each token: `--attn-requant q5_0` (the attention's

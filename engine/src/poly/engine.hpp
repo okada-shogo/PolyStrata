@@ -724,9 +724,12 @@ protected:
     template <class F>
     void* record(F&& work);
     void moe_rows(Layer& L, int il, int n);
-    void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
+    void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false, uint8_t* to = nullptr);
+    void prestage(int n);
+    void drop_prestage();
+    int uncached(const Layer& L) const;
     void stage_rest(const Layer& L, const int32_t* experts, const std::vector<int>& which, int m, void* stream,
-                    bool alone);
+                    bool alone, uint8_t* to);
     // The pinned mirror (build_mirror()): the routed experts the card does not hold, in pinned host memory in a
     // card slot's layout.
     void build_mirror();
@@ -994,6 +997,10 @@ protected:
     /// (about 100 KB) waited behind the layer's experts on their way to the staging buffer.  Inkling 2's on CUDA
     /// unless STRATA_INK_KERNEL_TABLES=0, else off.
     bool kernel_tables_ = false;
+    /// read_groups() copies the next layer run's experts that are not cached into a second part of the staging
+    /// buffer while a run's calls are read (prestage()).  The buffer then takes two layers' VRAM from the expert
+    /// cache during a read (widen_stage()).  Inkling 2's on CUDA with STRATA_INK_PRESTAGE=1, else off.
+    bool prestage_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
     Dev out_norm_, output_;
@@ -1177,6 +1184,17 @@ protected:
     void* ev_hr_ = nullptr;                       ///< marks the card's last read of h_r_ by draft_input()
     int staged_il_ = -1;                          ///< the layer whose experts the buffer holds for its next call, or -1
     std::vector<int32_t> staged_;                 ///< those experts, in the buffer's order: one round of the layer's
+    size_t stage_at_ = 0;                         ///< where in stage_ they are: 0, or stage_two_ (prestage())
+    size_t stage_two_ = 0;                        ///< where the buffer's second part starts while a read maps it, or 0
+    struct Prestaged {
+        int il = -1;                              ///< the layer whose experts prestage() copies, or -1
+        size_t at = 0;                            ///< where in stage_
+        std::vector<int32_t> experts;             ///< that layer's L.ahead when the copy started
+        int ev = 0;                               ///< which of ev_pre_ marks its end
+    } pre_;
+    void* ev_pre_[2] = {};                        ///< mark the ends of prestage()'s copies, in turn
+    int next_home_ = -1;                          ///< read_groups(): the layer of the next run, for prestage(), or -1
+    int pre_runs_ = 0, pre_hits_ = 0;             ///< a read's layer runs, and the ones prestage() copied for
     double ahead_ms_ = 0, route_ms_ = 0;          ///< what that layer's copy ahead took, and the card to its routing
     bool shared_ahead_ = false;                   ///< read() runs several calls: each copies ahead, whatever its size
     size_t stage_bytes_ = 0, chunk_bytes_ = 0;
