@@ -17,12 +17,17 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace strata::poly {
 namespace {
@@ -3662,24 +3667,304 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
             "a batch's projections");
 }
 
-// gemm_f32() with one group of 33 to 256 outputs in gemm_ahead_kernel: the largest of four tiles that still gives
-// half the card's SMs a block (more work a block reads its inputs fewer times; a tile half as large is faster where
-// it gives twice the SMs one).  On an RTX 2070 Super (40 SMs) each pick was the fastest of the 19 (64 outputs) and
-// 27 (128 outputs) tiles measured at 333, 1,024 and 4,096 rows.  Other shapes go to gemm_f32().
+// gemm_f32() with one group of 33 to 256 outputs in one of five ways: gemm_ahead_kernel in a tile of 64 tokens x 128
+// outputs (past 64 outputs only), 64 x 64, 32 x 64 or 32 x 32, or gemm_f32() itself.  Every way sums each output with
+// one fmaf after the other in the inputs' order, so the bits are gemm_f32()'s whatever the pick.  Which is fastest
+// depends on the card more than on any count it reports: on Turing one 128-thread block keeps an SM busy, so the
+// largest tile that gives about every SM a block wins; on RDNA a block alone waits on its loads and smaller tiles,
+// several to a CU, win, and gemm_f32() beats every tile on a few shapes.  So the engine times the ways at load
+// (gemm_f32_tiles_time(), Engine::tune_f32_tiles()) and keeps the picks (gemm_f32_tiles_use()); a shape it did not
+// time takes the cost model (gemm_f32_tiles_model()).
+namespace {
+constexpr int kAheadTok[4] = {64, 64, 32, 32}, kAheadOut[4] = {128, 64, 64, 32};
+constexpr int kBuckets[] = {32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
+constexpr int kDevs = 64;
+
+struct TunedPicks {
+    std::vector<F32TilePick> picks;
+};
+TunedPicks g_tuned[kDevs];
+
+int current_device() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kDevs) dev = 0;
+    return dev;
+}
+
+int device_sms(int dev) {
+    static int sms[kDevs] = {};
+    if (!sms[dev] && (cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms[dev] < 1))
+        sms[dev] = 1;
+    return sms[dev];
+}
+
+void tune_ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+}
+
+long long ahead_blocks(int tile, int n_out, int rows) {
+    return (long long) ((rows + kAheadTok[tile] - 1) / kAheadTok[tile]) * ((n_out + kAheadOut[tile] - 1) / kAheadOut[tile]);
+}
+}  // namespace
+
+bool gemm_f32_tiles_takes(int n_out) { return n_out > SMALL_OUT && n_out <= 8 * SMALL_OUT; }
+
+bool gemm_f32_tiles_way_ok(int way, int n_out) { return way >= 0 && way < kF32Ways && (way != 0 || n_out > 64); }
+
+int gemm_f32_tiles_bucket(int rows) {
+    for (int b : kBuckets)
+        if (rows <= b) return b;
+    return kBuckets[sizeof kBuckets / sizeof kBuckets[0] - 1];
+}
+
+// The cost model, for a shape the engine did not time: a tile's time is about n_in times the larger of what one
+// block takes alone and what the busiest SM's blocks take one after the other once it is full (us per 1,024 inputs,
+// from an RTX 2070).  It picked the fastest way on every shape on an RTX 2070 (Turing) and an RTX 5080 Laptop GPU
+// (Blackwell); on an RTX 3060 (Ampere) and RDNA it picked tiles slower than gemm_f32(), so there, and on any other
+// card, the fallback is gemm_f32() itself: never slower than without the tiles.
+bool gemm_f32_tiles_model_known() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static int known = -1;
+    if (known < 0) {
+        const int dev = current_device();
+        int major = 0, minor = 0;
+        known = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+                ((major == 7 && minor == 5) || major == 10 || major == 11 || major == 12);
+    }
+    return known == 1;
+#endif
+}
+
+int gemm_f32_tiles_model(int n_in, int n_out, int rows) {
+    if (!gemm_f32_tiles_model_known()) return kF32Way;
+    constexpr float L[4] = {131, 75, 46, 29}, S[4] = {124, 75, 46, 34};
+    const int sms = device_sms(current_device());
+    int pick = 3;
+    float best = 0.0f;
+    for (int t = n_out > 64 ? 0 : 1; t < 4; ++t) {
+        const long long per_sm = (ahead_blocks(t, n_out, rows) + sms - 1) / sms;
+        const float est = float(n_in) / 1024.0f * std::max(L[t], float(per_sm) * S[t]);
+        if (t == (n_out > 64 ? 0 : 1) || est < best) best = est, pick = t;
+    }
+    return pick;
+}
+
+void gemm_f32_tiles_use(const F32TilePick* p, int n) {
+    g_tuned[current_device()].picks.assign(p, p + n);
+}
+
+int gemm_f32_tiles_pick(int n_in, int n_out, int rows) {
+    const int b = gemm_f32_tiles_bucket(rows);
+    for (const F32TilePick& t : g_tuned[current_device()].picks)
+        if (t.n_in == n_in && t.n_out == n_out && t.rows == b && gemm_f32_tiles_way_ok(t.way, n_out)) return t.way;
+    return gemm_f32_tiles_model(n_in, n_out, rows);
+}
+
+void gemm_f32_tiles_at(int way, void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows) {
+    if (way == kF32Way || !gemm_f32_tiles_way_ok(way, n_out)) return gemm_f32(blas, w, x, y, n_in, n_out, n_out, rows);
+    cudaStream_t st = nullptr;
+    blas_ck(cublasGetStream((cublasHandle_t) blas, &st), "cublasGetStream");
+    switch (way) {
+    case 0: return gemm_ahead<64, 128, 8, 8, 16>(w, x, y, n_in, n_out, rows, st);
+    case 1: return gemm_ahead<64, 64, 8, 4, 16>(w, x, y, n_in, n_out, rows, st);
+    case 2: return gemm_ahead<32, 64, 4, 4, 32>(w, x, y, n_in, n_out, rows, st);
+    default: return gemm_ahead<32, 32, 2, 4, 32>(w, x, y, n_in, n_out, rows, st);
+    }
+}
+
 void gemm_f32_tiles(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows) {
-    if (n_out <= SMALL_OUT || n_out > 8 * SMALL_OUT) return gemm_f32(blas, w, x, y, n_in, n_out, n_out, rows);
-    cudaStream_t stream = nullptr;
-    blas_ck(cublasGetStream((cublasHandle_t) blas, &stream), "cublasGetStream");
-    int dev = 0, sms = 1;
-    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
-        sms = 1;
-    const auto blocks = [&](int tok, int out) {
-        return 2LL * ((rows + tok - 1) / tok) * ((n_out + out - 1) / out) >= sms;
-    };
-    if (n_out > 64 && blocks(64, 128)) gemm_ahead<64, 128, 8, 8, 16>(w, x, y, n_in, n_out, rows, stream);
-    else if (blocks(64, 64)) gemm_ahead<64, 64, 8, 4, 16>(w, x, y, n_in, n_out, rows, stream);
-    else if (blocks(32, 64)) gemm_ahead<32, 64, 4, 4, 32>(w, x, y, n_in, n_out, rows, stream);
-    else gemm_ahead<32, 32, 2, 4, 32>(w, x, y, n_in, n_out, rows, stream);
+    if (!gemm_f32_tiles_takes(n_out)) return gemm_f32(blas, w, x, y, n_in, n_out, n_out, rows);
+    gemm_f32_tiles_at(gemm_f32_tiles_pick(n_in, n_out, rows), blas, w, x, y, n_in, n_out, rows);
+}
+
+int gemm_f32_tiles_time(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows, int samples,
+                        float* us) {
+    cudaStream_t st = nullptr;
+    blas_ck(cublasGetStream((cublasHandle_t) blas, &st), "cublasGetStream");
+    cudaEvent_t e[2] = {};
+    for (cudaEvent_t& ev : e) tune_ck(cudaEventCreate(&ev), "cudaEventCreate");
+    std::vector<float> t[kF32Ways];
+    int reps[kF32Ways];
+    // a warm-up round that also sets each way's calls a sample (about 0.5 ms of them back to back, as a prompt
+    // batch runs them: one call after an idle card is slower, and not by the same for every way), then `samples`
+    // rounds of every way in turn, so that a card's clocks rising over the rounds weigh on every way alike
+    for (int r = -1; r < samples; ++r)
+        for (int way = 0; way < kF32Ways; ++way) {
+            if (!gemm_f32_tiles_way_ok(way, n_out)) continue;
+            const int n = r < 0 ? 1 : reps[way];
+            tune_ck(cudaEventRecord(e[0], st), "cudaEventRecord");
+            for (int i = 0; i < n; ++i) gemm_f32_tiles_at(way, blas, w, x, y, n_in, n_out, rows);
+            tune_ck(cudaEventRecord(e[1], st), "cudaEventRecord");
+            tune_ck(cudaEventSynchronize(e[1]), "cudaEventSynchronize");
+            float ms = 0.0f;
+            tune_ck(cudaEventElapsedTime(&ms, e[0], e[1]), "cudaEventElapsedTime");
+            if (r < 0) reps[way] = std::max(2, std::min(32, int(0.5f / std::max(ms, 1e-3f) + 0.5f)));
+            else t[way].push_back(1000.0f * ms / float(n));
+        }
+    for (cudaEvent_t ev : e) (void) cudaEventDestroy(ev);
+    int pick = kF32Way;
+    for (int way = 0; way < kF32Ways; ++way) {
+        us[way] = -1.0f;
+        if (t[way].empty()) continue;
+        std::sort(t[way].begin(), t[way].end());
+        us[way] = t[way][t[way].size() / 2];
+    }
+    // the fastest median; gemm_f32() only where it beats every tile
+    for (int way = 0; way < kF32Ways; ++way)
+        if (us[way] >= 0.0f && (us[pick] < 0.0f || us[way] < us[pick])) pick = way;
+    return pick;
+}
+
+std::string gemm_f32_tiles_device_key() {
+    const int dev = current_device();
+    int drv = 0, rt = 0, sms = device_sms(dev), clock = 0;
+    (void) cudaDriverGetVersion(&drv);
+    (void) cudaRuntimeGetVersion(&rt);
+    (void) cudaDeviceGetAttribute(&clock, cudaDevAttrClockRate, dev);
+    cudaDeviceProp prop = {};
+    std::string name = cudaGetDeviceProperties(&prop, dev) == cudaSuccess ? prop.name : "unknown";
+#if defined(STRATA_USE_HIP)
+    name += std::string(" ") + prop.gcnArchName;
+#endif
+    for (char& c : name)
+        if (c == '\t' || c == '\n' || c == '|') c = ' ';
+    // the build: the engine's version and when this file was compiled (a rebuilt kernel times again)
+    return name + "|sms " + std::to_string(sms) + "|clock " + std::to_string(clock) + "|driver " + std::to_string(drv) +
+           "|runtime " + std::to_string(rt) + "|engine " + STRATA_VERSION + "|built " + __DATE__ + " " + __TIME__ +
+           "|ways 1";
+}
+
+bool gemm_f32_tiles_cache_read(const std::string& path, const std::string& key, std::vector<F32TilePick>& picks) {
+    picks.clear();
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos || line.compare(0, tab, key) != 0 || tab != key.size()) continue;
+        F32TilePick p;
+        if (std::sscanf(line.c_str() + tab + 1, "%d %d %d %d", &p.n_in, &p.n_out, &p.rows, &p.way) == 4 &&
+            gemm_f32_tiles_way_ok(p.way, p.n_out))
+            picks.push_back(p);
+    }
+    return true;
+}
+
+bool gemm_f32_tiles_cache_write(const std::string& path, const std::string& key, const std::vector<F32TilePick>& picks) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::path(path).has_parent_path()) fs::create_directories(fs::path(path).parent_path(), ec);
+    // the other setups' lines stay; this one's are written anew
+    std::vector<std::string> keep;
+    {
+        std::ifstream f(path);
+        std::string line;
+        while (f && std::getline(f, line))
+            if (!line.empty() && line.compare(0, key.size() + 1, key + "\t") != 0) keep.push_back(line);
+    }
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) return false;
+        for (const std::string& l : keep) f << l << '\n';
+        for (const F32TilePick& p : picks) f << key << '\t' << p.n_in << ' ' << p.n_out << ' ' << p.rows << ' ' << p.way << '\n';
+        if (!f.flush()) return false;
+    }
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
+std::vector<F32TilePick> gemm_f32_tiles_autotune(void* blas, const std::vector<std::pair<int, int>>& shapes, int top_rows,
+                                                 const std::string& cache, std::string* log) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string key = gemm_f32_tiles_device_key();
+    const int top = gemm_f32_tiles_bucket(std::max(top_rows, 32));
+    std::vector<F32TilePick> want;
+    for (const auto& [n_in, n_out] : shapes) {
+        if (!gemm_f32_tiles_takes(n_out) || n_in < 1) continue;
+        for (int b = gemm_f32_tiles_bucket(32);; b = gemm_f32_tiles_bucket(b + 1)) {
+            want.push_back(F32TilePick{n_in, n_out, b, kF32Way});
+            if (b >= top) break;
+        }
+    }
+    std::vector<F32TilePick> cached;
+    if (!cache.empty()) gemm_f32_tiles_cache_read(cache, key, cached);
+    int from_cache = 0, timed = 0;
+    std::vector<F32TilePick*> todo;
+    for (F32TilePick& w : want) {
+        bool hit = false;
+        for (const F32TilePick& c : cached)
+            if (c.n_in == w.n_in && c.n_out == w.n_out && c.rows == w.rows) w.way = c.way, hit = true;
+        if (hit) ++from_cache;
+        else todo.push_back(&w);
+    }
+    std::string how = "cache " + (cache.empty() ? std::string("none") : cache);
+    if (!todo.empty()) {
+        // a cache that cannot be written would make each run time again and maybe pick otherwise: the cost model
+        // instead, the same every run
+        bool writable = !cache.empty();
+        if (writable) {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            if (fs::path(cache).has_parent_path()) fs::create_directories(fs::path(cache).parent_path(), ec);
+            std::ofstream probe(cache + ".tmp", std::ios::trunc);
+            writable = bool(probe);
+            probe.close();
+            fs::remove(cache + ".tmp", ec);
+        }
+        if (!writable) {
+            for (F32TilePick* w : todo) w->way = gemm_f32_tiles_model(w->n_in, w->n_out, w->rows);
+            how += " (not writable: the cost model for " + std::to_string(todo.size()) + " shapes)";
+        } else {
+            size_t xn = 0, wn = 0, yn = 0;
+            for (const F32TilePick* w : todo) {
+                xn = std::max(xn, size_t(w->n_in) * w->rows);
+                wn = std::max(wn, size_t(w->n_in) * w->n_out);
+                yn = std::max(yn, size_t(w->n_out) * w->rows);
+            }
+            float *dx = nullptr, *dw = nullptr, *dy = nullptr;
+            const bool ok = cudaMalloc(&dx, xn * sizeof(float)) == cudaSuccess &&
+                            cudaMalloc(&dw, wn * sizeof(float)) == cudaSuccess &&
+                            cudaMalloc(&dy, yn * sizeof(float)) == cudaSuccess;
+            if (ok) {
+                // any finite values: each float 0x3c3c3c3c (0.0115)
+                (void) cudaMemset(dx, 0x3c, xn * sizeof(float));
+                (void) cudaMemset(dw, 0x3c, wn * sizeof(float));
+                float us[kF32Ways];
+                for (F32TilePick* w : todo) {
+                    w->way = gemm_f32_tiles_time(blas, dw, dx, dy, w->n_in, w->n_out, w->rows, 5, us);
+                    ++timed;
+                }
+                if (!gemm_f32_tiles_cache_write(cache, key, want)) how += " (write failed)";
+            } else {
+                (void) cudaGetLastError();
+                for (F32TilePick* w : todo) w->way = gemm_f32_tiles_model(w->n_in, w->n_out, w->rows);
+                how += " (no VRAM to time: the cost model)";
+            }
+            (void) cudaFree(dx), (void) cudaFree(dw), (void) cudaFree(dy);
+        }
+    }
+    gemm_f32_tiles_use(want.data(), (int) want.size());
+    if (log) {
+        static const char* const names[kF32Ways] = {"64x128", "64x64", "32x64", "32x32", "gemm_f32"};
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        *log = std::to_string(want.size()) + " picks, " + std::to_string(timed) + " timed, " + std::to_string(from_cache) +
+               " from the " + how + ", " + std::to_string((int) ms) + " ms:";
+        int last_in = -1, last_out = -1;
+        for (const F32TilePick& w : want) {
+            if (w.n_in != last_in || w.n_out != last_out)
+                *log += " " + std::to_string(w.n_in) + "->" + std::to_string(w.n_out), last_in = w.n_in, last_out = w.n_out;
+            *log += " " + std::to_string(w.rows) + ":" + names[w.way];
+        }
+    }
+    return want;
 }
 
 void guard_half_sums(float* x, int64_t ld, int width, int rows, float* factor, void* stream) {
