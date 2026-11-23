@@ -1117,6 +1117,9 @@ protected:
     int32_t* d_ids_ = nullptr;                    ///< a batch's experts and weights when it routes on the card
     float* d_wts_ = nullptr;
     int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card
+    float* h_wts_ = nullptr;                      ///< pinned: their weights, for step()'s rows (bells(), --batch)
+    /// While moe() takes step()'s rows: their picks from the card (h_ids_, h_wts_), as a token alone routes there
+    const int32_t* step_ids_ = nullptr;
     void** d_slots_ = nullptr;                    ///< every layer's L.slot on the card, n_expert_ a layer (moe_card())
     std::vector<void*> h_slots_;                  ///< what d_slots_ holds
     // card_far_: with most experts cached, a few tokens route on the card even so (card_moe()), and a call's experts

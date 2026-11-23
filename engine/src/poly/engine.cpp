@@ -3719,6 +3719,8 @@ void Engine::alloc() {
         d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
         h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
+        // the weights of step()'s rows, back from the card where a token alone routes there (the doorbell)
+        if (bells() && opt_.batch > 0) h_wts_ = (float*) hmalloc(rr * sizeof(float), "pinned memory");
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
 #if !defined(STRATA_GPU_METAL)
         d_far_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
@@ -4940,6 +4942,12 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         const auto route_row = [&](int t) {
             int* ids = ids_of[t];
             float* w = w_of[t];
+            if (step_ids_) {   // step()'s rows: the card's picks and weights (step_ids_)
+                const size_t from = (size_t) (at + t) * n_used_;
+                std::copy(step_ids_ + from, step_ids_ + from + n_used_, ids);
+                std::copy(h_wts_ + from, h_wts_ + from + n_used_, w);
+                return;
+            }
             const float* scores = h_rl_ + (size_t) (at + t) * n_expert_;
             route(il, opt_.cache_bias > 0.f ? biased(L, scores) : scores, tok_ ? tok_[at + t] : -1, ids, w,
                   route_tmp_.data() + (size_t) (spread ? t : 0) * 2 * n_expert_);
@@ -6831,6 +6839,8 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         ~BellOff() { on = false; }
     } bell_off{bell_};
     const bool card = R < kStageRows && card_moe(R);
+    // a token alone is routed on the card (the doorbell, bell_on()), so the rows the host takes are too (below)
+    const bool picks_like_alone = h_wts_ && bell_on(1) && R > 1 && !guesses && opt_.cache_bias <= 0.f;
     // an architecture that takes the rows in one head: their sequences and positions while it does
     std::vector<Row> rows;
     if (batch_heads())
@@ -7060,6 +7070,12 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         if (batched(L, R)) {
             moe_rows(L, il, R);
         } else {
+            // Rows the host takes, where a token alone is routed on the card (the doorbell's route_card()): they take
+            // the card's picks too (moe(), step_ids_).  The host's route() computes the gates' sigmoid with its own
+            // exp, which can differ from the card's in the last bit, and a row would not get the weights, or now
+            // and then the experts, it gets alone.
+            const bool card_picks = !card && picks_like_alone && route_card(il, R, d_ids_, d_wts_);
+            if (card_picks) copy2(d_ids_, h_ids_, R * n_used_, d_wts_, h_wts_, R * n_used_, st_);
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
             if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
             else moe_shared(L, il, R);
@@ -7069,8 +7085,13 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             if (on_card) {
                 stats_.gpu_experts += R * n_used_;
                 if (bell_) bell_serve();   // as run() layer by layer: what this thread does next may wait for the card
-            } else if (moe(L, il, R)) {
-                moe_add(R);
+            } else {
+                struct Picks {
+                    const int32_t*& ids;
+                    ~Picks() { ids = nullptr; }
+                } picks_off{step_ids_};
+                step_ids_ = card_picks ? h_ids_ : nullptr;
+                if (moe(L, il, R)) moe_add(R);
             }
         }
         if (tail_by_rows()) {   // the rows' own states: recorded by their sequences
