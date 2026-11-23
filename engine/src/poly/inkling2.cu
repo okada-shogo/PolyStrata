@@ -3666,6 +3666,16 @@ void ink_gate(const float* cur, const float* msg, const float* gain, const float
     ink_gate_set(&cur, &msg, &gain, &forget, &out, 1, n, stream);
 }
 
+// CUDA loads a file's kernels at the first launch of one of them (lazy loading, the default since CUDA 12.2): 50 to
+// 70 ms for this file's on an RTX 2070 Super, inside the first prompt.  Asking for a kernel's attributes loads them
+// here instead.  A card the file has no code for answers with an error, which is not kept.
+void ink_kernels_load() {
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)   // (HIP builds keep the first launch's load)
+    cudaFuncAttributes a{};
+    if (cudaFuncGetAttributes(&a, (const void*) ink_conv_kernel) != cudaSuccess) (void) cudaGetLastError();
+#endif
+}
+
 void ink_conv(const float* x, float* state, const float* w, const float* dyn, float* out, int channels, int heads,
               int taps, int rows, void* stream, float* snap, size_t snap_stride, unsigned snap_bits) {
     if (taps < 2 || taps > 8) throw std::invalid_argument("ink_conv: 2 to 8 taps");

@@ -170,6 +170,9 @@ private:
 #else
     int default_swaps() const override { return 128; }
 #endif
+#if !defined(STRATA_GPU_METAL)
+    void load_kernels() override;
+#endif
 #if defined(STRATA_USE_HIP)
     // the shared expert is one memset (moe_shared()), and a graph launch a layer for it cost an RX 9070 XT's host
     // more than the memset: with experts on the CPU and no doorbell a token's layers are launched one by one

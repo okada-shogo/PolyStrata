@@ -49,6 +49,8 @@ void scale_rows(float* y, int64_t ld, int width, int rows, const int32_t* place,
 /// rows) may be null.  A row of y starts y_stride values after the one before it (0: n), so two calls can fill
 /// the two halves of rows twice as long.
 void rms_norm(const float* x, const float* w, float* y, int n, int rows, float eps, void* stream, int y_stride = 0);
+/// Loads this file's kernels (CUDA loads them at the first launch otherwise), so that the first launch does not wait.
+void kernels_load();
 /// rms_norm() of 1 to 3 inputs of `rows` rows each, every one with its weight (null: none) and output, in one
 /// launch with the same bits.
 void rms_norm_many(const float* const* x, const float* const* w, float* const* y, int count, int n, int rows, float eps,

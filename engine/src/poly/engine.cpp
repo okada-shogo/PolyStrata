@@ -3927,6 +3927,7 @@ void Engine::load(const Options& o) {
     start_swaps();
     reset();
     build_mirror();
+    load_kernels();
     std::vector<std::pair<int, int>> outside;
     if (opt_.lock_experts && mirror_of_.empty()) {   // the mirror's pages are pinned already
         locked_.assign(layers_.size() * (size_t) n_expert_, 0);
