@@ -954,19 +954,18 @@ __device__ __forceinline__ void lane_halves(const __half* head, int lane, int n,
 // query's values LH * j .. LH * j + LH - 1 with the key's, and it is added up as a butterfly over 32 lanes adds:
 // j with j + 16, then 8 apart, 4, 2, 1.  A lane takes the four shares of one key that sum first (j, j + 8, j + 16,
 // j + 24, for j its lane in the key's 8), so a warp makes four keys' scores at once with three shuffles a head, and
-// takes kScoreSteps such steps (the block's warps in turn).  Every product and sum is the one a lane of a 32-lane
+// takes `steps` such steps (the block's warps in turn).  Every product and sum is the one a lane of a 32-lane
 // warp a key made before, in its order (pinned with __fmul_rn / __fmaf_rn as NVVM contracted that code), so the
 // scores are the same bits.  A step whose keys are all past the bias's extent (most of a long context) reads no
 // bias weights: theirs are 0, so is their product.  t0 is the launch's first token among the call's, nk_max the
 // scores a head has room for.
 constexpr int kScoreLanes = 32 / kScoreKeys;     // a key's lanes
 constexpr int kScoreShares = 32 / kScoreLanes;   // a lane's shares of a score
-constexpr int kScoreSteps = 8;                   // a warp's steps of kScoreKeys keys
-constexpr int kScoreBlockKeys = kScoreWarps * kScoreKeys * kScoreSteps;
+constexpr int kScoreSteps = 8;                   // the most steps of kScoreKeys keys a warp takes
 static_assert(kScoreShares == 4, "a lane adds the butterfly's first two rounds itself");
 
 template <int KV, int LH>
-__global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, int t0, int nk_max) {
+__global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, int t0, int nk_max, int steps) {
     pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
     pdl_wait();
     __shared__ __align__(16) float qs[kMaxPer * 128];
@@ -979,7 +978,7 @@ __global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, 
     const long long p = a.at ? a.at[2 * t] : a.pos + t;
     const long long lo = a.window > 0 ? (p - a.window + 1 > 0 ? p - a.window + 1 : 0) : 0;
     const int nk = (int) (p - lo + 1);
-    const int jb = blockIdx.y * kScoreBlockKeys;
+    const int jb = blockIdx.y * kScoreWarps * kScoreKeys * steps;
     if (jb >= nk) return;   // (the whole block)
     const size_t head0 = size_t(t) * a.n_head + size_t(g) * per;   // the group's heads lie together
     for (int i = tid; i < per * a.dim; i += blockDim.x) qs[i] = a.q[head0 * a.dim + i] * a.scale;
@@ -999,7 +998,7 @@ __global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, 
     // the warp's first key and its cache row; a ring's row is advanced, not divided for, from step to step
     int j = jb + warp * kScoreKeys + mine;
     long long row = a.ring > 0 ? (lo + j) % a.ring : lo + j;
-    for (int st = 0; st < kScoreSteps; ++st) {
+    for (int st = 0; st < steps; ++st) {
         const int jw = j - mine;   // the step's first key
         if (jw >= nk) break;       // (a whole warp)
         const bool here = j < nk;
@@ -2008,6 +2007,30 @@ template <int LH> static auto score_kernel_lh(const InkAttn& a) {
 }
 static auto score_kernel(const InkAttn& a) { return a.dim == 128 ? score_kernel_lh<4>(a) : score_kernel_lh<2>(a); }
 
+// ink_score_kernel()'s steps for `rows` blocks of up to nk_max keys: kScoreSteps (a block 256 keys) when that still
+// gives each multiprocessor kScoreFill blocks, else the most that do, down to 1 (a block 32 keys, the launch of a
+// warp a step).  A short context gets the blocks to keep the card's multiprocessors busy (302 keys made 16 blocks
+// of 256 for 68 multiprocessors), a long one a block's queries loaded for more keys.  A key's score is the same bits
+// in every shape.  STRATA_INK_SCORE_STEPS=1, 2, 4 or 8 sets it (for poly_inkling2_attend_test).
+constexpr int kScoreFill = 2;
+static int score_steps(int rows, int nk_max) {
+    static const int forced = [] {
+        const char* v = std::getenv("STRATA_INK_SCORE_STEPS");
+        const int n = v ? std::atoi(v) : 0;
+        return n == 1 || n == 2 || n == 4 || n == 8 ? n : 0;
+    }();
+    if (forced) return forced;
+    int dev = 0, sms = 1;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+        return kScoreSteps;
+    int steps = kScoreSteps;
+    for (; steps > 1; steps /= 2) {
+        const long long keys = (long long) kScoreWarps * kScoreKeys * steps;
+        if ((long long) rows * ((nk_max + keys - 1) / keys) >= (long long) kScoreFill * sms) break;
+    }
+    return steps;
+}
+
 size_t ink_attend_floats(int n_head, int n_kv, int dim, int64_t keys) {
     // a head's scores, its softmax's norm, and its values' sums a block of the value kernel
     const int64_t block = (int64_t) value_warps(n_head, n_kv, dim) * kValueKeys;
@@ -2026,7 +2049,6 @@ void ink_attend(const InkAttn& a, void* stream) {
     const int nk_max = (int) (a.window > 0 ? std::min<int64_t>(a.window, last) : last);
     const int group = a.n_head / a.n_kv, warps = value_warps(a.n_head, a.n_kv, a.dim);
     const int n_parts = (nk_max + warps * kValueKeys - 1) / (warps * kValueKeys);
-    const int score_blocks = (nk_max + kScoreBlockKeys - 1) / kScoreBlockKeys;
     const size_t per = ink_attend_floats(a.n_head, a.n_kv, a.dim, nk_max);
     if (a.score_n < per) throw std::logic_error("ink_attend: the scores of one token do not fit the scratch");
     const int chunk = (int) std::min<size_t>(a.score_n / per, (size_t) a.rows);
@@ -2034,8 +2056,9 @@ void ink_attend(const InkAttn& a, void* stream) {
     float* parts = norm + (size_t) chunk * a.n_head;
     for (int t0 = 0; t0 < a.rows; t0 += chunk) {
         const int m = std::min(chunk, a.rows - t0);
-        launch_pdl(score_kernel(a), dim3(m * a.n_kv, score_blocks),
-                   dim3(kScoreWarps * 32), 0, cs(stream), a, t0, nk_max);
+        const int steps = score_steps(m * a.n_kv, nk_max), keys = kScoreWarps * kScoreKeys * steps;
+        launch_pdl(score_kernel(a), dim3(m * a.n_kv, (nk_max + keys - 1) / keys), dim3(kScoreWarps * 32), 0,
+                   cs(stream), a, t0, nk_max, steps);
         launched("ink_score");
         launch_pdl(ink_softmax_kernel, dim3(m * a.n_head), dim3(kAttnThreads), 0, cs(stream), a, t0, nk_max, norm);
         launched("ink_softmax");

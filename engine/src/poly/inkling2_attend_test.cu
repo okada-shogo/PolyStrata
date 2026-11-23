@@ -4,7 +4,7 @@
 //                 rows, positions on the host and on the card, gate and q8 output on and off): one FNV-1a hash of each
 //                 call's output bytes a line.  Two builds' files differ where their outputs differ; equal files mean the same bits
 //                 (but for a hash collision).  Exit 1 if a call's output is not finite.
-//   bench         one token of a full layer, rooms 32K to 1M: microseconds a call and the caches' bytes a second.
+//   bench         one token of a full layer, rooms 302 to 1M: microseconds a call and the caches' bytes a second.
 // Needs a card; run by hand.
 #include "inkling2_kernels.hpp"
 
@@ -214,7 +214,7 @@ int run_hash(const char* path) {
 }
 
 int run_bench() {
-    const int64_t rooms[] = {32768, 131072, 262144, 524288, 1048576};
+    const int64_t rooms[] = {302, 1024, 2048, 4096, 8192, 16384, 32768, 131072, 262144, 524288, 1048576};
     size_t free_b = 0, total_b = 0;
     ck(cudaMemGetInfo(&free_b, &total_b), "meminfo");
     std::vector<Fmt> fmts = {kF16, kQ8};
@@ -238,7 +238,7 @@ int run_bench() {
             a.gate = b.gate;
             a.q8 = b.q8;
             for (int i = 0; i < 3; ++i) ink_attend(a, nullptr);
-            const int reps = room >= 524288 ? 20 : 50;
+            const int reps = room >= 524288 ? 20 : room >= 32768 ? 50 : 500;
             ck(cudaEventRecord(e0), "event");
             for (int i = 0; i < reps; ++i) ink_attend(a, nullptr);
             ck(cudaEventRecord(e1), "event");
