@@ -6979,7 +6979,13 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     } bell_off{bell_};
     const bool card = R < kStageRows && card_moe(R);
     // a token alone is routed on the card (the doorbell, bell_on()), so the rows the host takes are too (below)
-    const bool picks_like_alone = h_wts_ && bell_on(1) && R > 1 && !guesses && opt_.cache_bias <= 0.f;
+    // (card_moe(1)'s test without its side effects: the doorbell, the card's slot table, no --expert-gpu; a layer that
+    // card_moe() found it cannot route, L.card == 0, is routed on the host alone too: below)
+    bool picks_like_alone = h_wts_ && bell_on(1) && d_slots_ && n_used_ <= card_rows() && !opt_.dump && R > 1 &&
+                            !guesses && opt_.cache_bias <= 0.f;
+#if !defined(STRATA_GPU_METAL)
+    picks_like_alone = picks_like_alone && !ecard_;
+#endif
     // an architecture that takes the rows in one head: their sequences and positions while it does
     std::vector<Row> rows;
     if (batch_heads())
@@ -7219,7 +7225,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             // the card's picks too (moe(), step_ids_).  The host's route() computes the gates' sigmoid with its own
             // exp, which can differ from the card's in the last bit, and a row would not get the weights, or now
             // and then the experts, it gets alone.
-            const bool card_picks = !card && picks_like_alone && route_card(il, R, d_ids_, d_wts_);
+            const bool card_picks = !card && picks_like_alone && L.card != 0 && route_card(il, R, d_ids_, d_wts_);
             if (card_picks) copy2(d_ids_, h_ids_, R * n_used_, d_wts_, h_wts_, R * n_used_, st_);
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
             if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
