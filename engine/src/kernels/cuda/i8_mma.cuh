@@ -1301,7 +1301,7 @@ __device__ __forceinline__ void i8m_tile(const uint8_t* __restrict__ W, size_t m
 }
 
 // (stages of 128: two blocks a multiprocessor, so no more than half its registers a block.)  A shape other than the
-// one above (CF != 0) is Turing's only (i8m_cf75()): the passes for Ampere and newer compile it empty.
+// one above (CF != 0) is Turing's (i8m_cf75()) and sm_86's (i8m_amp_shape()): the other passes compile it empty.
 #if defined(__HIPCC__)
 #define I8M_BOUNDS(T, NJ, WR, CF) __launch_bounds__(i8m_threads(T, NJ, WR))   // (HIP: CF 0 only)
 #else
@@ -1315,7 +1315,7 @@ __global__ void I8M_BOUNDS(T, NJ, WR, CF) i8m_kernel(const uint8_t* __restrict__
                                                     const int32_t* __restrict__ ids, const int32_t* __restrict__ from,
                                                     const long long* __restrict__ at, float* __restrict__ Y, long long ldy) {
 #if defined(__CUDA_ARCH__)
-    if constexpr (CF == 0 || __CUDA_ARCH__ < 800)
+    if constexpr (CF == 0 || __CUDA_ARCH__ < 800 || __CUDA_ARCH__ == 860)
         i8m_tile<T, NJ, WR, RAW, CF>(W, mat_bytes, row_bytes, n_out, K, X, XD, XS, bounds, ch_per_e, ids, from, at, Y, ldy);
 #elif I8M_HIP
     if constexpr (CF == 0)
@@ -1457,6 +1457,39 @@ __host__ __device__ constexpr int i8m_cf75(int t, int nj, int wr) {
                                              : 0;
 }
 
+// The sm_86 pass (Ampere and Ada with 100 KB of shared memory a multiprocessor; not sm_80's 164 KB, where the shape
+// above already fits two blocks): the same shapes as Turing's, for the products where they beat the launcher's own
+// pick, its raw stage copy included (i8m_amp_shape()).  Bit t of i8m_amp_types: type t so; STRATA_I8M_AMPERE=<types,
+// comma-separated> sets them (0: none).
+inline std::atomic<uint64_t>& i8m_amp_types() {
+    static std::atomic<uint64_t> m{[] {
+        const char* v = std::getenv("STRATA_I8M_AMPERE");
+        uint64_t b = (uint64_t{1} << 20) | (uint64_t{1} << 16) | (uint64_t{1} << 40) | (uint64_t{1} << 8);
+        if (v) {
+            b = 0;
+            for (const char* q = v; *q;) {
+                char* e = nullptr;
+                const long t = std::strtol(q, &e, 10);
+                if (e == q) break;
+                if (t > 0 && t < 64) b |= uint64_t{1} << t;
+                q = *e == ',' ? e + 1 : e;
+            }
+        }
+        return b;
+    }()};
+    return m;
+}
+
+// The products of those types that take it (RTX 3090, poly_i8m_shapes_test --ab 7, medians against the launcher's own
+// pick; Inkling 2 Mini's shapes): IQ4_NL where the raw stage copy is not taken (its experts' downs, 1,152 values a row:
+// 969 -> 785 us; its gate|up with the raw copy was no faster), IQ2_XXS (1,752 -> 1,432), NVFP4's downs (rows that end
+// inside a stage of 256: 1,051 -> 928; its gate|up was slower), Q8_0 in the widest tile up to 1,024 outputs (the
+// attention's [2304 -> 1024] of 1,024 rows: 79.7 -> 74.2, in place of the raw copy; [2304 -> 3072] and the experts were
+// not faster).
+inline bool i8m_amp_shape(int t, int nj, int n_out, int K, bool raw) {
+    return t == 20 ? !raw : t == 16 ? true : t == 40 ? K % 256 != 0 : t == 8 ? nj == 8 && n_out <= 1024 : false;
+}
+
 // the tile as wide in activation rows as the launch's rows need, of what the card has the shared memory for
 template <int T>
 bool i8m_launch_type(const I8mCard& card, int dev, cudaStream_t s, const uint8_t* W, size_t mat_bytes, size_t row_bytes, int n_out, int K,
@@ -1475,7 +1508,7 @@ bool i8m_launch_type(const I8mCard& card, int dev, cudaStream_t s, const uint8_t
 #else
     constexpr bool kRaw = i8m_raw_type(T);
 #endif
-    const bool raw = kRaw && raw_on && card.arch >= 800 && i8m_raw_type(T) && K % 256 == 0 && (uintptr_t) W % 16 == 0 &&
+    bool raw = kRaw && raw_on && card.arch >= 800 && i8m_raw_type(T) && K % 256 == 0 && (uintptr_t) W % 16 == 0 &&
                      (i8m_raw_bytes(T) % 16 != 0 || (row_bytes % 16 == 0 && mat_bytes % 16 == 0)) &&
                      i8m_tile_bytes<T>(nj, wr, true) <= card.shared &&
                      per_sm(i8m_tile_bytes<T>(nj, wr, true)) >= per_sm(i8m_tile_bytes<T>(nj, wr, false));
@@ -1494,7 +1527,10 @@ bool i8m_launch_type(const I8mCard& card, int dev, cudaStream_t s, const uint8_t
     }
     const dim3 grid((unsigned) ((n_out + wr - 1) / wr), (unsigned) gy);
     static const bool turing_on = [] { const char* v = std::getenv("STRATA_I8M_TURING"); return v == nullptr || v[0] != '0'; }();
-    const bool turing = turing_on && card.arch < 800 && !raw;
+    const bool amp = card.arch == 860 && card.shared_sm <= 102400 && wr == 64 && i8m_cf75(T, nj, wr) != 0 &&
+                     ((i8m_amp_types().load(std::memory_order_relaxed) >> T) & 1u) && i8m_amp_shape(T, nj, n_out, K, raw);
+    if (amp) raw = false;
+    const bool turing = !raw && ((turing_on && card.arch < 800) || amp);
 #define STRATA_I8M_GO(NJ_, WR_) \
     if constexpr (i8m_cf75(T, NJ_, WR_) != 0) \
         if (nj == NJ_ && wr == WR_ && turing) \
