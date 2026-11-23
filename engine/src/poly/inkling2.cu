@@ -2040,7 +2040,8 @@ bool ink_attend_batch(const InkAttn& a, void* stream) {
         cudaFuncAttributes f{};
         return cudaFuncGetAttributes(&f, ink_flash_kernel<1>) == cudaSuccess ? f.ptxVersion : 0;
     }();
-    if (ptx < 80) return ptx >= 75 && !a.kv8 && flash75(a, per, stream);
+    // Turing: ink_flash75_kernel reads fp16 caches only (FP8 and Q8_0 rows go to attend_batch())
+    if (ptx < 80) return ptx >= 75 && !a.kv8 && !a.kvq8 && flash75(a, per, stream);
     const auto launch = [&](auto kernel, int g) {
         const size_t smem = kFlashKv + (size_t) kFlashTokens * g * kFlashRel * sizeof(float);
         const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
