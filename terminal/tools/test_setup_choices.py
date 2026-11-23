@@ -581,6 +581,14 @@ class VramReserve(unittest.TestCase):
         self.assertEqual(a.count("--vram-reserve-mib"), 1)
         self.assertEqual(a[a.index("--vram-reserve-mib") + 1], "1500")
 
+    def test_windows_amd_default(self):
+        # strata-poly on an AMD card under Windows: the desktop's reserve unless one was given (poly_setup)
+        with mock.patch.object(setup, "WIN", True):
+            self.assertEqual(setup.win_hip_reserve(True), ["--vram-reserve-mib", str(setup.DESKTOP_RESERVE_MIB)])
+            self.assertEqual(setup.win_hip_reserve(False), [])
+        with mock.patch.object(setup, "WIN", False):
+            self.assertEqual(setup.win_hip_reserve(True), [])
+
     def test_a_negative_value_is_refused(self):
         with contextlib.redirect_stderr(io.StringIO()) as err:
             code, out, cfg, _ = self.install("--vram-reserve-mib", "-1")

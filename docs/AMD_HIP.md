@@ -148,6 +148,13 @@ no NVIDIA card PolyStrata can use, the AMD card is chosen by itself; with both, 
 - **VRAM budget:** `hipMemGetInfo` on Windows does not subtract what the desktop and other programs hold. The engine lowers
   the free figure by what Windows' video memory budget for the process withholds (logged once). `STRATA_WDDM_BUDGET=0` turns
   that off.
+- **VRAM for the desktop (strata-poly):** Windows' budget still lets the engine take nearly the whole card (15,419 of an
+  RX 9070 XT's 16,304 MiB) while the desktop's programs hold 2-3 GB of it, and the engine filled the budget. Setup
+  therefore writes `--vram-reserve-mib 3072` into a strata-poly config on an AMD card under Windows, unless
+  `--vram-reserve-mib N` was given. Inkling 2 Mini IQ4_NL on that card, a warm request first, mean of 3 runs: prompts
+  read at 151 / 290 / 323 tokens/s (302 / 2,048 / 8,192 tokens) without it and 360 / 670 / 1,026 with it; decode after
+  302 tokens 34.2 and 33.0 tokens/s, after 8,192 tokens 33.5 and 29.2 (the card holds 9.3 GiB of experts instead of
+  11.8). `--vram-reserve-mib N` at setup sets another amount.
 - **Pinned expert arena (#3431):** the HIP runtime gives each page-locked range of the arena a second address for the GPU, and
   it takes any pointer of the process inside that range for the arena. Through engine 0.1.54 about one start in ten on an RX
   7900 XTX had the engine thread's stack there (the same symptom was reported on an R9700): every long prompt was then read

@@ -10485,6 +10485,15 @@ def poly_kv_whole(cfg: dict, cfg_path: Path | None = None) -> None:
         write_config(cfg_path, cfg)
 
 
+def win_hip_reserve(hip: bool) -> list:
+    """strata-poly on an AMD card under Windows: --vram-reserve-mib DESKTOP_RESERVE_MIB when the person gave none.
+    Windows lets the engine budget nearly the whole card (15,419 of an RX 9070 XT's 16,304 MiB) while the desktop's
+    programs hold 2-3 GB of it, and the engine filled the budget: Inkling 2 Mini IQ4_NL read an 8K prompt at 323
+    tokens/s, 1,026 with 3,072 MiB kept free, and wrote 33.5 tokens/s after it, 29.2 with fewer experts on the card
+    (docs/AMD_HIP.md)."""
+    return ["--vram-reserve-mib", str(DESKTOP_RESERVE_MIB)] if WIN and hip else []
+
+
 def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, adopted) -> int:
     """Steps 2 to 7 for a model of strata-poly (docs/GLM.md, docs/BACKENDS.md): its questions, the Python
     packages, the engine (ready-made or compiled here), the model file, its tokenizer and expert profile, the run
@@ -10796,6 +10805,10 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
+    elif win_hip_reserve(hip):
+        args += win_hip_reserve(hip)
+        ok(f"AMD card on Windows: {DESKTOP_RESERVE_MIB} MiB of VRAM kept free for the desktop's programs "
+           "(--vram-reserve-mib N sets another amount)")
     if fam.get("tail_skip"):
         args += ["--tail-skip", str(fam["tail_skip"])]
     if fam.get("small_card_args") and not multi and poly_held_gb(d, vram) < d["arena_gb"]:
