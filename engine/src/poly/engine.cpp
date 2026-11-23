@@ -6249,7 +6249,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     const int n_ex = (es.gate || es.up) && rg > 0 ? rg : 0;
     // A read of several calls copies each layer's experts outside the cache ahead (up_), and a copy of the tables
     // would wait behind them: there a kernel reads them from pinned memory.  A call alone keeps the copy.
-    if (kernel_tables_ && shared_ahead_) {
+    if (kernel_tables_ && opt_.stage_ahead > 0 && shared_ahead_) {
         copy2(h_tab_, tab_, (int) n_tab, h_ex_, d_ex_, n_ex, st_);
     } else {
         ck(cudaMemcpyAsync(tab_, h_tab_, n_tab * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)), "expert rows");

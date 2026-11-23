@@ -80,8 +80,8 @@ each matrix than the other experts' int8 products do, so it is opt-in until more
 
 On a card that does not hold every expert, a prompt of more than one batch hands each call's row tables to the card
 by a kernel, so they no longer wait behind the experts copied over the bus. The answers are the same and no VRAM is
-added. On an RTX 2070 Super 8 GB a 2,048-token prompt reads 6.7% faster with IQ4_NL (479 against 449 tokens/s) and
-2.3% faster with UD-Q2_K_XL; 32,768 tokens read as fast as before. `STRATA_INK_KERNEL_TABLES=0` turns it off.
+added. On an RTX 2070 Super 8 GB a 2,048-token prompt reads 6.5% faster with IQ4_NL (477 against 448 tokens/s) and
+2.7% faster with UD-Q2_K_XL; 32,768 tokens read as fast as before. `STRATA_INK_KERNEL_TABLES=0` turns it off.
 
 On a laptop with an RTX 4070 Laptop (8 GB), a Core i7-14700HX and 32 GB of RAM, on Windows, UD-Q3_K_XL has 1,216 of
 its 3,072 experts on the card and the rest are computed on the CPU. On a card that does not hold every expert, setup
