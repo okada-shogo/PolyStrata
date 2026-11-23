@@ -265,9 +265,10 @@ go through hipBLASLt, which rounds them differently: after one 2,048-token promp
 9070 XT's answers differed from CUDA's more than the RX 7900 XT's, and with `ROCBLAS_USE_HIPBLASLT=0` as much as the
 RX 7900 XT's; after 302 and 8,192 tokens they match CUDA's. Use an NVIDIA card or a Mac for now.
 
-Not run yet: an AMD card on native Linux or Windows, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the
-8 GB card and UD-Q4_K_XL on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or
-the card; on a Mac, on the CPU. The draft file is an option (`--draft-model`). The engine takes one request at a time
+Not run yet: an AMD card on native Linux or Windows, `--expert-gpu` on two cards (built but not run), `--layer-split`
+on two unequal cards (below; it has run on two RTX 2070 Super), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL on a Mac.
+Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on the CPU. The
+draft file is an option (`--draft-model`). The engine takes one request at a time
 for this model, and the installer writes `"parallel": 1`. Its license is Apache 2.0.
 
 ## Install
@@ -293,6 +294,25 @@ Unsloth's layout of the same weights: the engine reads them too. Setup takes the
 `setup --custom-gguf <file>` also takes a quantization the installer does not offer (for example IQ4_NL) as a
 size of its own: its experts' size and the RAM estimate are read from the file's header, and the VRAM before any
 expert is the closest offered size's. `--custom-gguf` is not used on a Mac yet.
+
+## Two or more cards
+
+`--layer-split` puts the first layers on one card and the rest on the next, as for the other strata-poly models.
+Each card keeps its layers' weights, attention caches and expert cache. The loop's twelve layers (6 to 17, which
+run three times a token) stay on one card, so the second card starts at layer 1 to 6 or 18 to 22; a number inside
+the loop is refused. `"auto"` shares the layers by each card's free VRAM and takes 6 or 18, whichever is nearer.
+On two cards whose memory bandwidth differs by more than 5%, `"auto"` also estimates a token's time for every
+place to start the second card and both card orders, counting the loop's layers three times, and takes the fastest
+when it is at least 3% faster: the loop then goes to the faster card, whatever order the cards are listed in. The
+log line `layer split auto: the loop ... on the faster card` says when it did. Equal cards get the plain layout.
+`STRATA_POLY_CARD_GBS=a,b` gives the cards' bandwidths in GB/s where the driver's figure is wrong (on AMD cards it
+is not read, so they get the plain layout unless it is set). This has not been run on two unequal cards yet. The
+idea of keeping the loop on the faster card comes from cobra91 and kuraneko1 (Strata PR #6506).
+On two RTX 2070 Super 8 GB (IQ4_NL, a 302-token prompt, 256 tokens written, mean of 3 runs) one card wrote 37.0
+tok/s, `--layer-split 18` 51.0 and `6` 48.5. Every split (3, 6, 18, 20, `6,18`, `"auto"`) gave one card's tokens and
+top-20 probabilities with every expert on the CPU.
+Once a token, a card hands the next one the token's residual streams and the loop's inputs, 64.5 KB. The DSpark
+drafter (`--draft-model`) runs on one card only.
 
 ## How does it work?
 
