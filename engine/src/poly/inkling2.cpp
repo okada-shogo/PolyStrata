@@ -175,7 +175,8 @@ void Inkling2::load_geometry() {
     need((core_end_ - core_start_) / blk_ - 1 <= 1, "a loop core of more than two blocks is not supported");
     // every expert's scale goes on its joined gate and up product, whatever the experts' type
     joined_scales_ = true;
-    // the cached experts' IQ3_S / IQ3_XXS products through the kernels that keep all lanes busy (CUDA; the same bits)
+    // the cached experts' IQ3_S / IQ3_XXS and IQ1_S / IQ2_* products through the kernels that keep all lanes busy (CUDA;
+    // the same bits)
     lane_slots_ = true;
 #if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
     // In a prompt's read of several calls, a call's row tables go to the card by a kernel, not behind the experts'
