@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -4907,10 +4908,14 @@ ExpertScales Engine::expert_scales(const Layer& L, const int32_t* ids) const {
 #if !defined(STRATA_GPU_METAL)
 void Engine::tune_f32_tiles() {
     if (f32_tile_shapes_.empty()) return;
-    const char* on = std::getenv("STRATA_POLY_F32_AUTOTUNE");
-    if (on && *on && std::atoi(on) == 0) {
-        std::fprintf(stderr, "strata-poly: F32 tiles: STRATA_POLY_F32_AUTOTUNE=0, the cost model's picks\n");
-        return;
+    // off: 0, off, no or false (any case); unset or anything else: on
+    if (const char* on = std::getenv("STRATA_POLY_F32_AUTOTUNE"); on && *on) {
+        std::string v(on);
+        for (char& c : v) c = (char) std::tolower((unsigned char) c);
+        if (v == "0" || v == "off" || v == "no" || v == "false") {
+            std::fprintf(stderr, "strata-poly: F32 tiles: STRATA_POLY_F32_AUTOTUNE=%s, the cost model's picks\n", on);
+            return;
+        }
     }
     // the cache: STRATA_POLY_F32_TUNE_CACHE, else cache/f32-tiles.txt in the PolyStrata-data folder the model is in,
     // else the user's cache folder

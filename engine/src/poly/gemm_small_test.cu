@@ -3,7 +3,8 @@
 // rule, the cost model) against the same products on the host: each output's sum of fmaf in the inputs' order, so the
 // bits must be the same.  Then gemm_f32_tiles_autotune() on Inkling 2 Mini's shapes (its router, 2,304 inputs to 128
 // outputs, and its controllers' down products, 4,608 to 64): every pick a way, a cache round trip that gives the same
-// picks, and the cost model where the cache cannot be written.  --bench times every way on those shapes at 333, 1,024
+// picks, a second engine's write that keeps the first's lines and picks, no temporary file left, and the cost model
+// where the cache cannot be written.  --bench times every way on those shapes at 333, 1,024
 // and 4,096 rows with the timed picks, prints each shape's picks with their grids and the SM (CU) count, and a hash of
 // each way's outputs, which must be the same for all.
 //
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <utility>
@@ -178,9 +180,32 @@ int check_autotune(cublasHandle_t h, const std::string& cache, int top) {
                                                           log.find(" 0 timed") != std::string::npos;
     std::printf("%s autotune picks valid (%zu)\n%s autotune cache round trip\n", ok_valid ? "ok  " : "FAIL", a.size(),
                 ok_trip ? "ok  " : "FAIL");
-    // a cache in a folder that cannot be made: the cost model's picks
-    const std::vector<F32TilePick> c =
-        gemm_f32_tiles_autotune(h, shapes, top, std::string("/proc/strata-no-such-dir/f32-tiles.txt"), &log);
+    // a second engine with another shape and a smaller prompt batch: it times only its own, and its write keeps the
+    // first's lines; the card's picks keep the first's too
+    const std::vector<F32TilePick> m = gemm_f32_tiles_autotune(h, {{2000, 100}}, 32, cache, &log);
+    std::printf("autotune   %s\n", log.c_str());
+    std::vector<F32TilePick> merged;
+    gemm_f32_tiles_cache_read(cache, gemm_f32_tiles_device_key(), merged);
+    bool ok_merge = m.size() == 1 && log.find(" 1 timed") != std::string::npos && merged.size() == a.size() + 1;
+    for (const F32TilePick& p : a) {
+        bool in = false;
+        for (const F32TilePick& q : merged) in = in || (q.n_in == p.n_in && q.n_out == p.n_out && q.rows == p.rows && q.way == p.way);
+        ok_merge = ok_merge && in && gemm_f32_tiles_pick(p.n_in, p.n_out, p.rows) == p.way;
+    }
+    ok_merge = ok_merge && !m.empty() && gemm_f32_tiles_pick(2000, 100, 32) == m[0].way;
+    // every write and probe went through a temporary file of its own and left none
+    namespace fs = std::filesystem;
+    const std::string leaf = fs::path(cache).filename().string();
+    int left = 0;
+    std::error_code ec;
+    for (const fs::directory_entry& e : fs::directory_iterator(fs::path(cache).parent_path(), ec)) {
+        const std::string n = e.path().filename().string();
+        left += n.size() > leaf.size() + 1 && n.compare(0, leaf.size() + 2, "." + leaf + ".") == 0;
+    }
+    std::printf("%s autotune merged write (%zu lines)\n%s autotune no temporary file left (%d)\n", ok_merge ? "ok  " : "FAIL",
+                merged.size(), left == 0 ? "ok  " : "FAIL", left);
+    // a cache under a regular file (no folder can be made there, on any system): the cost model's picks
+    const std::vector<F32TilePick> c = gemm_f32_tiles_autotune(h, shapes, top, cache + "/sub/f32-tiles.txt", &log);
     bool model = true;
     for (const F32TilePick& p : c) model = model && p.way == gemm_f32_tiles_model(p.n_in, p.n_out, p.rows);
     std::printf("autotune   %s\n%s autotune unwritable cache: cost model\n", log.c_str(), model ? "ok  " : "FAIL");
@@ -208,7 +233,7 @@ int check_autotune(cublasHandle_t h, const std::string& cache, int top) {
     }
     // the timed picks again, for --bench
     gemm_f32_tiles_use(a.data(), (int) a.size());
-    return !ok_valid + !ok_trip + !model + !fam;
+    return !ok_valid + !ok_trip + !ok_merge + (left != 0) + !model + !fam;
 }
 
 }  // namespace
@@ -230,13 +255,16 @@ int main(int argc, char** argv) {
     bad += check(h, 2000, 64, 45, rng);    // inputs that end inside a step
     bad += check(h, 2000, 256, 45, rng);   // and of gemm_tile_kernel's
     bad += check(h, 2000, 33, 45, rng);    // the fewest outputs that take gemm_ahead_kernel
+    bad += check(h, 2008, 100, 45, rng);   // inputs that end inside a 16-input step (the 64-token tiles')
+    bad += check(h, 7, 64, 45, rng);       // fewer inputs than one step
     for (int rows : {16, 333, 1024}) {     // Inkling 2 Mini's router and controllers
         bad += check(h, 2304, 128, rows, rng);
         bad += check(h, 4608, 64, rows, rng);
     }
     {
-        const char* tmp = std::getenv("TMPDIR");
-        const std::string cache = std::string(tmp && *tmp ? tmp : "/tmp") + "/poly_gemm_small_test-f32-tiles.txt";
+        std::error_code ec;
+        const std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+        const std::string cache = ((ec ? std::filesystem::path(".") : dir) / "poly_gemm_small_test-f32-tiles.txt").string();
         bad += check_autotune(h, cache, 4096);
         std::remove(cache.c_str());
     }

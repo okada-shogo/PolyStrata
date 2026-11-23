@@ -34575,13 +34575,13 @@
    "reads": [
     {
      "file": "engine/src/poly/engine.cpp",
-     "line": 4323,
+     "line": 4506,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
    ],
-   "parse": "int",
-   "default_state": null,
+   "parse": "flag",
+   "default_state": "on",
    "code_default": null,
    "engine_sets": [],
    "engine_defaults": [],
@@ -34596,7 +34596,7 @@
    "last_date": null,
    "status": "rollback",
    "owner": "poly",
-   "note": "[reviewed] 0: Inkling 2's prompt F32 products of 33 to 256 outputs take the cost model's tile instead of the ways timed at load and cached (gemm_f32_tiles_autotune()); the same bits either way",
+   "note": "[reviewed] 0, off, no or false (any case): Inkling 2's prompt F32 products of 33 to 256 outputs take the cost model's tile instead of the ways timed at load and cached (gemm_f32_tiles_autotune()); the same bits either way; unset or any other value: on",
    "retire_after": "",
    "retired_in": ""
   },
@@ -34608,12 +34608,12 @@
    "reads": [
     {
      "file": "engine/src/poly/engine.cpp",
-     "line": 4331,
+     "line": 4517,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
    ],
-   "parse": "flag",
+   "parse": "string",
    "default_state": null,
    "code_default": null,
    "engine_sets": [],

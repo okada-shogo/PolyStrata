@@ -1,4 +1,5 @@
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/temp_file.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -91,27 +92,7 @@ using Aligned = std::unique_ptr<uint8_t, AlignedFree>;
 Aligned aligned_block() { return Aligned(static_cast<uint8_t*>(std::aligned_alloc(kAlign, kBlock))); }
 #endif
 
-uint64_t random64() {
-    std::random_device rd;
-    uint64_t r = (uint64_t(rd()) << 32) ^ rd();
-    r ^= (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count() * P1;
-#ifdef _WIN32
-    r ^= (uint64_t) _getpid() * P2;
-#else
-    r ^= (uint64_t) ::getpid() * P2;
-#endif
-    return r;
-}
-
-// The temporary name beside the destination: hidden (a leading dot, which the server never accepts as a session
-// name), unique, and short enough for any filesystem whatever the destination's length.
-std::string temp_name(const std::string& leaf) {
-    size_t keep = std::min<size_t>(leaf.size(), 64);
-    while (keep > 0 && keep < leaf.size() && (uint8_t(leaf[keep]) & 0xC0) == 0x80) --keep;   // whole UTF-8 chars
-    char hex[17];
-    std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) random64());
-    return "." + leaf.substr(0, keep) + "." + hex + ".tmp";
-}
+using temp_file::temp_name;   // the hidden unique temporary name beside the destination
 
 // a test's injected failure at `step`: its errno value (0 = none)
 int injected(const std::function<int(const char*)>* fault, const char* step) {
@@ -134,15 +115,7 @@ bool split_path(const std::string& path, std::string& dir, std::string& leaf, st
 
 #ifdef _WIN32
 // paths reach the engine as UTF-8 (the server writes its commands as UTF-8); invalid UTF-8 is refused, not replaced
-bool wide(const std::string& s, std::wstring& w) {
-    w.clear();
-    if (s.empty()) return true;
-    if (s.size() > (size_t) INT_MAX) return false;
-    const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), nullptr, 0);
-    if (n <= 0) return false;
-    w.assign((size_t) n, L'\0');
-    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), w.data(), n) == n;
-}
+using temp_file::wide;
 
 SessionError win_kind(DWORD code) {
     switch (code) {
