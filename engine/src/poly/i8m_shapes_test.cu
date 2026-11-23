@@ -7,7 +7,7 @@
 //
 // "the launcher's pick" is i8m_launch_type() itself (on Ampere and newer the raw stage copy where it takes it; on
 // Turing i8m_cf75()), so every other shape is also checked against what a card runs by default.
-// usage: poly_i8m_shapes_test [--time]   (--time: also each shape's time on this card, the best of 3 runs of 10;
+// usage: poly_i8m_shapes_test [--time | --ab N]   (--time: also each shape's time on this card, the best of 3 runs of 10;
 // exit 0: every shape gives the same bits; 77: no card or no int8 MMA)
 #if !defined(__HIPCC__)
 #include "strata/kernels/iq_kernels.hpp"
@@ -227,6 +227,7 @@ constexpr Shape kShapes[] = {
     {"as before", 0, 8},
     {"Turing's (i8m_cf75)", -1, 8},
     {"the launcher's pick", -2, 8},
+    {"main's pick (no Ampere selection)", -3, 8},
     {"cvt", I8M_CF_CVT, 8},
     {"cvt2", I8M_CF_CVT2, 8},
     {"256 threads cvt2", I8M_CF_T256 | I8M_CF_CVT2, 8},
@@ -269,7 +270,10 @@ bool run(const Problem& p, const Shape& s, int only = -1) {
     for (size_t i = 0; i < p.launches.size(); ++i) {
         if (only >= 0 && (size_t) only != i) continue;
         const Launch& l = p.launches[i];
-        if (s.cf == -2) {   // the launcher's own pick for this card (on Ampere and newer: the raw stage copy where it takes it)
+        if (s.cf == -2 || s.cf == -3) {   // the launcher's own pick for this card (on Ampere and newer: the raw stage copy where
+                                          // it takes it); -3: without the Ampere selection (i8m_amp_types() 0), as main
+            const uint64_t amp = i8m_amp_types().load();
+            if (s.cf == -3) i8m_amp_types().store(0);
             const float* XD = (const float*) (p.xq + (size_t) p.rows * p.K);
             int dev = 0;
             cudaGetDevice(&dev);
@@ -283,6 +287,7 @@ bool run(const Problem& p, const Shape& s, int only = -1) {
 #undef S8_LAUNCHER
                 default: break;
             }
+            i8m_amp_types().store(amp);
             if (!done) return false;
             continue;
         }
@@ -301,6 +306,9 @@ bool run(const Problem& p, const Shape& s, int only = -1) {
 
 int main(int argc, char** argv) {
     const bool timing = argc > 1 && std::strcmp(argv[1], "--time") == 0;
+    // --ab N: main's pick, the launcher's pick and the new shape forced on, N rounds each, interleaved (the order turns
+    // every round), each round the best of 3 runs of 10; then the median of the rounds
+    const int ab = argc > 2 && std::strcmp(argv[1], "--ab") == 0 ? std::atoi(argv[2]) : 0;
     int cards = 0;
     if (cudaGetDeviceCount(&cards) != cudaSuccess || cards == 0) {
         std::puts("poly_i8m_shapes_test: no card, skipped");
@@ -371,8 +379,49 @@ int main(int argc, char** argv) {
             std::printf("  (the launcher's pick: %s)\n", i8m_card().arch < 800 ? "i8m_cf75() on Turing" : raw ? "the raw stage copy, if the tile fits" : "no raw stage copy");
         }
         float base_ms = 0;
+        if (ab > 0) {
+            const Shape sh[3] = {{"main's pick", -3, 8}, {"the launcher's pick", -2, 8}, {"new shape forced", -1, 8}};
+            std::vector<float> t[3];
+            for (int k = 0; k < 3; ++k) {   // bits first, against main's pick
+                cudaMemset(p.Y, 0xFF, got.size() * sizeof(float));
+                if (!run(p, sh[k]) || !ok(cudaDeviceSynchronize(), sh[k].name)) { all = false; continue; }
+                cudaMemcpy(got.data(), p.Y, got.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                if (k == 0) ref = got;
+                else if (std::memcmp(ref.data(), got.data(), ref.size() * sizeof(uint32_t)) != 0) {
+                    all = false;
+                    std::printf("  %s: DIFFERENT bits\n", sh[k].name);
+                }
+            }
+            for (int r = 0; r < ab; ++r)
+                for (int i = 0; i < 3; ++i) {
+                    const int k = (r % 2 == 0 ? i + r : 2 - i + r) % 3;
+                    float best = 1e30f;
+                    for (int rep = 0; rep < 3; ++rep) {
+                        cudaEventRecord(e0);
+                        for (int it = 0; it < 10; ++it) run(p, sh[k]);
+                        cudaEventRecord(e1);
+                        cudaEventSynchronize(e1);
+                        float ms = 0;
+                        cudaEventElapsedTime(&ms, e0, e1);
+                        best = std::min(best, ms / 10);
+                    }
+                    t[k].push_back(best * 1e3f);
+                }
+            float med[3];
+            for (int k = 0; k < 3; ++k) {
+                std::vector<float> v = t[k];
+                std::sort(v.begin(), v.end());
+                med[k] = v.empty() ? 0.0f : v[v.size() / 2];
+                std::printf("  %-20s median %8.1f us  %+6.1f%% vs main's pick  rounds:", sh[k].name, med[k],
+                            med[0] > 0 ? (med[0] / med[k] - 1) * 100 : 0.0);
+                for (float x : t[k]) std::printf(" %.1f", x);
+                std::printf("\n");
+            }
+            release(p);
+            continue;
+        }
         for (const Shape& s : kShapes) {
-            if ((s.cf > 0 || s.cf == -1) && i8m_card().arch >= 800) {   // (compiled empty there: Turing's only)
+            if ((s.cf > 0 || s.cf == -1) && i8m_card().arch >= 800 && i8m_card().arch != 860) {   // (compiled empty there)
                 if (!timing) std::printf("  %-20s not compiled for this card\n", s.name);
                 continue;
             }
