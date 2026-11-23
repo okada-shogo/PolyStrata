@@ -16506,6 +16506,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_INK_PRESTAGE",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/inkling2.cpp",
+     "line": 102,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/models/inkling.md:86"
+   ],
+   "first_commit": null,
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": null,
+   "last_date": "2026-11-23",
+   "status": "rollback",
+   "owner": "poly",
+   "note": "Inkling 2 on CUDA: a prompt read hands a call's row tables to the card by a kernel (copy2) instead of a copy that waits behind the expert uploads, and copies the next layer run's uncached experts into the free part of the staging buffer while the current run computes, where both fit and there is no pinned mirror (on an 8 GB card they never fit). Same bits, no extra VRAM. Default on; =0 turns both off. HIP and Metal never take it (engine/src/poly/inkling2.cpp, engine.cpp prestage())",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_INK_RUN_KEYS",
    "backends": [
     "metal"

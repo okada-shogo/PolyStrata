@@ -78,6 +78,14 @@ unless `STRATA_PREFILL_IQ1S=int8` is set. On an RTX 3090 that setting reads a 2,
 against 2,005 tokens/s) and an 8,192-token one 6.7% faster, but on a 302-token prompt it moved the answers more for
 each matrix than the other experts' int8 products do, so it is opt-in until more prompts are measured.
 
+On a card that does not hold every expert, a prompt's read hands each call's row tables to the card by a kernel, so
+they no longer wait behind the experts copied over the bus, and it copies the next layer's missing experts while the
+card works on the current layer where both layers' fit in the staging buffer (not with the pinned copy of the experts
+that Linux makes, and not on an 8 GB card, where they never fit). The answers are the same and no VRAM is added. On an
+RTX 2070 Super 8 GB, from the tables alone, a 2,048-token prompt reads 6.7% faster with IQ4_NL (479 against 449
+tokens/s) and 2.3% faster with UD-Q2_K_XL; 32,768 tokens read as fast as before. `STRATA_INK_PRESTAGE=0` turns both
+off.
+
 On a laptop with an RTX 4070 Laptop (8 GB), a Core i7-14700HX and 32 GB of RAM, on Windows, UD-Q3_K_XL has 1,216 of
 its 3,072 experts on the card and the rest are computed on the CPU. On a card that does not hold every expert, setup
 gives Inkling 2 Mini three settings that read fewer bytes for each token: `--attn-requant q5_0` (the attention's

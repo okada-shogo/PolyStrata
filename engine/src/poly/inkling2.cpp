@@ -94,6 +94,15 @@ void Inkling2::load_geometry() {
     need((core_end_ - core_start_) / blk_ - 1 <= 1, "a loop core of more than two blocks is not supported");
     // every expert's scale goes on its joined gate and up product, whatever the experts' type
     joined_scales_ = true;
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+    // A prompt's read copies the next layer run's experts that are not cached while a run's calls go, and a call's
+    // row tables do not wait behind those copies (prestage(), kernel_tables_).  The experts, the cache and the
+    // launches are the same, so the results are too.  Measured on CUDA only; STRATA_INK_PRESTAGE=0 turns it off.
+    {
+        const char* v = std::getenv("STRATA_INK_PRESTAGE");
+        prestage_ = kernel_tables_ = !(v && std::string(v) == "0");
+    }
+#endif
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;
     // --attn-requant: the attention's six matrices quantized again to that type at load (kGuessMat), fewer bytes a
