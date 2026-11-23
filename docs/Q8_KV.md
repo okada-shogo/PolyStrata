@@ -19,7 +19,8 @@ On `kolibri1`, `STRATA_KV_INT8=1` makes both the decode and the prompt read the 
 reader below (`attend_int8`) instead of the float q8 readers. It is experimental: the queries are quantized
 too, so the answers change slightly, and it is opt-in.
 On `inkling2`, with `--kv q8_0`, `STRATA_KV_INT8=1` takes a written token's attention scores by `__dp4a` once it reads
-32,768 keys or more (full layers only); window layers, shorter contexts and the prompt keep the float readers
+32,768 keys or more (full layers only). Written tokens are calls of one row and windows of guessed tokens; window
+layers, shorter contexts and every prompt row, also a short chunk of a prompt, keep the float readers
 ([Inkling 2 Mini](models/inkling.md)). Opt-in as well.
 
 ## What the format is

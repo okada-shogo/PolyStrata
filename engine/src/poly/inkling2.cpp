@@ -142,9 +142,9 @@ void Inkling2::load_geometry() {
 #if defined(STRATA_GPU_METAL)
     need(!kvq8_, "--kv q8_0 has no Metal kernels for Inkling 2 yet");
 #endif
-    // STRATA_KV_INT8=1 (the name of Kolibri's opt-in and of our first engine's), with --kv q8_0: a decoded token that
-    // reads 32,768 keys or more takes its scores by __dp4a, its queries quantized to Q8_0 codes too
-    // (InkAttn::int8_dot).  Only a full layer's tokens read that many.  Opt-in: other arithmetic, so other bits.
+    // STRATA_KV_INT8=1 (the name of Kolibri's opt-in and of our first engine's), with --kv q8_0: a decoded token (a
+    // call of one row, or a window's guesses; never a prompt's rows) of a full layer that reads 32,768 keys or more
+    // takes its scores by __dp4a, its queries quantized to Q8_0 codes too (InkAttn::int8_dot).  Opt-in: other bits.
     if (const char* e = std::getenv("STRATA_KV_INT8"); e && std::atoi(e) != 0) {
         int8_dot_ = kvq8_;
         std::fprintf(stderr, "strata-poly: STRATA_KV_INT8: %s\n",
@@ -1158,7 +1158,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     a.gate = gate_;   // the output gate in the join's launch, or the flash kernel's
     a.kv8 = kv8_;
     a.kvq8 = kvq8_;
-    a.int8_dot = int8_dot_;
+    // STRATA_KV_INT8 for decode only: a token alone or a window's (guessed tokens checked), not a prompt's rows,
+    // which a chunk of fewer than kStageRows also brings here (a short turn, the end of a long prompt)
+    a.int8_dot = int8_dot_ && (n == 1 || windowed_);
     if (n >= kStageRows && ink_attend_batch(a, st_)) {
         // a prompt batch on the tensor cores with no score written out: attend_batch()'s path below wrote 1.6e11
         // scores of a 30,954-token read and read them back, 8.9 of its 16.8 s of attention on the RTX 4070 Laptop
