@@ -7225,7 +7225,12 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             // the card's picks too (moe(), step_ids_).  The host's route() computes the gates' sigmoid with its own
             // exp, which can differ from the card's in the last bit, and a row would not get the weights, or now
             // and then the experts, it gets alone.
-            const bool card_picks = !card && picks_like_alone && L.card != 0 && route_card(il, R, d_ids_, d_wts_);
+            // (a layer card_moe() has not tried yet, L.card == -1, counts as the card's only where its types have the
+            // card's pick kernels, as moe_card() would find: else a token alone would be routed on the host)
+            const bool layer_card = L.card == 1 || (L.card == -1 && kernels::native_mmvq_ids_supported((int) L.gu_type) &&
+                                                    kernels::native_mmvq_ids_supported((int) L.u_type) &&
+                                                    kernels::native_mmvq_ids_supported((int) L.d_type));
+            const bool card_picks = !card && picks_like_alone && layer_card && route_card(il, R, d_ids_, d_wts_);
             if (card_picks) copy2(d_ids_, h_ids_, R * n_used_, d_wts_, h_wts_, R * n_used_, st_);
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
             if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
