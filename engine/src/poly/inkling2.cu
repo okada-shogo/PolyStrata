@@ -567,12 +567,20 @@ __device__ __forceinline__ void cat_squares(const float* cur, const float* msg, 
 
 __device__ __forceinline__ float cat_scale(float sum, int n_embd) { return 1.0f / sqrtf(sum / (float) n_embd + 1e-6f); }
 
+// Entry j of a launch's array of 3 pointers, picked by comparisons: indexed by a register (p[blockIdx.y]), the
+// kernel's parameters were copied to local memory by every block and the loads through the pointers read back from
+// there were generic ones, not read-only global loads.
+template <class T>
+__device__ __forceinline__ T ink_pick(const T (&p)[3], int j) {
+    return j == 0 ? p[0] : j == 1 ? p[1] : p[2];
+}
+
 // A token's pair a block, blockIdx.y the pair.
 __global__ void ink_cat_norm_kernel(CatNormSet s, int n_embd) {
     __shared__ float part[kCatThreads / WARP];
-    const float* __restrict__ cur = s.cur[blockIdx.y];
-    const float* __restrict__ msg = s.msg[blockIdx.y];
-    float* __restrict__ out = s.out[blockIdx.y];
+    const float* __restrict__ cur = ink_pick(s.cur, blockIdx.y);
+    const float* __restrict__ msg = ink_pick(s.msg, blockIdx.y);
+    float* __restrict__ out = ink_pick(s.out, blockIdx.y);
     const size_t row = size_t(blockIdx.x) * n_embd;
     const int tid = threadIdx.x;
     float a, b;
@@ -3351,10 +3359,10 @@ __global__ void ink_norm_many_q8_kernel(NormMany m, int n, float eps) {
     pdl_wait();
     __shared__ float part[32];
     const size_t roff = size_t(blockIdx.x) * n;
-    const float* xr = m.x[blockIdx.y] + roff;
-    const float* __restrict__ w = m.w[blockIdx.y];
-    float* yr = m.y[blockIdx.y] + roff;
-    QB* qr = m.q[blockIdx.y] + size_t(blockIdx.x) * (n / 32);
+    const float* xr = ink_pick(m.x, blockIdx.y) + roff;
+    const float* __restrict__ w = ink_pick(m.w, blockIdx.y);
+    float* yr = ink_pick(m.y, blockIdx.y) + roff;
+    QB* qr = ink_pick(m.q, blockIdx.y) + size_t(blockIdx.x) * (n / 32);
     if (n <= kNormHeld * int(blockDim.x)) {   // the values read once and kept for the norm
         float v[kNormHeld];
         float ss = 0.0f;
