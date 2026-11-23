@@ -11,7 +11,7 @@ A number or a word is set like any environment variable, for example `STRATA_KVA
 (`terminal/strata-<model>.json`), which the server passes to the engine. The Strata project's Terminal writes it there with
 `strata launch --set NAME=value`.
 
-## Switches you can turn on (349)
+## Switches you can turn on (350)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -128,6 +128,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_I8_WG` | number | Intel Arc | [INTEL_INT8_EXPERTS.md](INTEL_INT8_EXPERTS.md) |
 | `STRATA_INK_FAST_CTRL` | on / off | NVIDIA and AMD | - |
 | `STRATA_INK_LOOPCD_HIDDEN` | number | NVIDIA and AMD, Mac | [inkling.md](models/inkling.md) |
+| `STRATA_INK_PRESTAGE` | on / off | NVIDIA | [inkling.md](models/inkling.md) |
 | `STRATA_IO_PF_AHEAD` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_IO_PF_GATE` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [release-notes-0.2.0.md](release-notes-0.2.0.md) |
 | `STRATA_IO_PF_GATE_LO` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
