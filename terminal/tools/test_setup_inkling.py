@@ -101,6 +101,14 @@ class Main(unittest.TestCase):
         self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 4)
         self.assertNotIn("answers one request at a time", out)
         self.assertIn("parallel requests: 4 at once", out)
+        self.assertNotIn("with --tail-skip", out)                          # a card that holds every expert: no skip
+
+    def test_requests_at_once_with_the_tail_skip_are_warned_of(self):
+        # an 8 GB card's small_card_args skip tail experts over a step's rows, which are several chats' tokens
+        code, out, _ = self.main(("--parallel", "2"), family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 2)
+        self.assertIn("--parallel 2 with --tail-skip", out)
 
 
 
