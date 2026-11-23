@@ -97,10 +97,12 @@ rows took 3.4 s.
 **AMD (HIP), experimental, not ready:** the engine builds for RDNA3 and RDNA4 (gfx1100, gfx1200, gfx1201). It has run
 on an RX 7900 XT (gfx1100) and an RX 9070 XT (gfx1201), ROCm 7.2.4, in containers that reach the card through
 librocdxg: the HIP tests pass (16 of 16) and so does the Inkling 2 kernel test. Two failures of the first runs are
-fixed: the first prompt never finished on any AMD card, and with some experts in RAM the RX 9070 XT crashed. With every
-expert on the CPU the answers match an RTX 2070 Super's: on the RX 7900 XT the same most likely token at 61 to 64 of
-64 steps after a 302-token prompt, and at 15 to 16 of 16 after 2,048 tokens. Still open: after 2,048 tokens the RX
-9070 XT's answers differ from CUDA's more than the RX 7900 XT's do. Use an NVIDIA card or a Mac for now.
+fixed: the first prompt never finished on any AMD card, and with some experts in RAM the RX 9070 XT crashed. With
+every expert on the CPU the answers match an RTX 2070 Super's: on the RX 7900 XT the same most likely token at 61 to
+64 of 64 steps after a 302-token prompt, and at 15 to 16 of 16 after 2,048 tokens. On RDNA4 the prompt's FP16 products
+go through hipBLASLt, which rounds them differently: after one 2,048-token prompt that is unusually sensitive, the RX
+9070 XT's answers differed from CUDA's more than the RX 7900 XT's, and with `ROCBLAS_USE_HIPBLASLT=0` as much as the
+RX 7900 XT's; after 302 and 8,192 tokens they match CUDA's. Use an NVIDIA card or a Mac for now.
 
 Not run yet: an AMD card on native Linux or Windows, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the
 8 GB card and UD-Q4_K_XL on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or
