@@ -1244,8 +1244,14 @@ protected:
     std::vector<uint8_t> on_cpu_;  ///< per expert of the layer: the CPU's
     std::vector<int32_t> spare_;   ///< the layer's routed experts outside VRAM, the fewest tokens' first
     std::vector<CpuExpert> host_;  ///< their uses, by token
-    double share_[5] = {0.25, 0.25, 0.25, 0.25, 0.25};   ///< the CPU's share of spare_, by the call's tokens:
-                                                         ///< under 64, from 64, 128, 256 and 512
+    // The CPU's share of spare_, by the layer's matrix types and the call's tokens (under 64, from 64, 128, 256 and
+    // 512): each kind of layer finds its own (share_of()).
+    struct Share {
+        int gt, ut, dt;
+        double s[5];
+    };
+    std::vector<Share> share_;
+    double* share_of(const Layer& L);
     std::unique_ptr<Workers> stagers_;   ///< fill the staging buffers meanwhile
 
     // The cache follows what is written (follow()).  It is filled for the average answer; while one is written,

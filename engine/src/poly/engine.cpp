@@ -6413,7 +6413,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         std::stable_sort(spare_.begin(), spare_.end(),
                          [&](int32_t a, int32_t b) { return count_[(size_t) a] < count_[(size_t) b]; });
         n_spare = (int) spare_.size();
-        const double s = opt_.cpu_share > 0 ? std::min(opt_.cpu_share, 1.f) : share_[size];
+        const double s = opt_.cpu_share > 0 ? std::min(opt_.cpu_share, 1.f) : share_of(L)[size];
         n_cpu = (int) std::lround(s * n_spare);
         for (int j = 0; j < n_cpu; ++j) on_cpu_[(size_t) spare_[(size_t) j]] = 1;
     }
@@ -6764,7 +6764,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         // the share that would have had both done at once, if each one's time grows with its share
         if (opt_.cpu_share < 0 && n_cpu < n_spare && !freeze_experts_) {
             const double s = (double) n_cpu / n_spare, c = cpu / s, g = gpu / (1 - s);
-            share_[size] = std::clamp(0.5 * share_[size] + 0.5 * g / (c + g), 0.05, 0.95);
+            double& sh = share_of(L)[size];
+            sh = std::clamp(0.5 * sh + 0.5 * g / (c + g), 0.05, 0.95);
         }
     }
     moe_sum(dx_, d_w, fo_, n_embd_, n_used_, n, st_);
@@ -6773,6 +6774,17 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         staged_.assign(group_.begin() + round_[(size_t) holds], group_.begin() + round_[(size_t) holds + 1]);
         staged_il_ = il;
     }
+}
+
+// The CPU's share of a layer's experts outside VRAM, by the call's size, for layers of its matrix types.  The CPU's
+// time for an expert and the card's differ by type: UD-Q2_K_XL's IQ1_S layers keep the card busy where its IQ2
+// layers leave it waiting, and one share for all of them, set by each call in turn, fitted the layer before.
+double* Engine::share_of(const Layer& L) {
+    const int gt = (int) L.gu_type, ut = (int) L.u_type, dt = (int) L.d_type;
+    for (Share& x : share_)
+        if (x.gt == gt && x.ut == ut && x.dt == dt) return x.s;
+    share_.push_back({gt, ut, dt, {0.25, 0.25, 0.25, 0.25, 0.25}});
+    return share_.back().s;
 }
 
 // The rows a recorded attention launch is sized for, for n tokens from pos(): the power of two from 1024 that
