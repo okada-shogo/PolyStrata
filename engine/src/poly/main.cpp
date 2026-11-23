@@ -1519,7 +1519,8 @@ int check_batch(Engine& engine, const std::vector<int32_t>& ids, int k, long lon
             prompt[(size_t) j].assign(ids.begin() + j, ids.end());
             continue;
         }
-        const size_t n = std::min(ids.size(), std::max<size_t>(16, ids.size() >> (3 * (k - 1 - j))));
+        const int shift = std::min(3 * (k - 1 - j), 63);   // (k of 23 or more would shift by 64 or more)
+        const size_t n = std::min(ids.size(), std::max<size_t>(16, ids.size() >> shift));
         prompt[(size_t) j].assign(ids.begin(), ids.begin() + (std::ptrdiff_t) n);
         wants[(size_t) j] = max_new - j * max_new / k;
         joins[(size_t) j] = j * max_new / (2 * k);

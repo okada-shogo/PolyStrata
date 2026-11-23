@@ -42,7 +42,10 @@ void Inkling2::load_geometry() {
     opt_.draft = false;
     // --batch: sequences beside the first, a token of each in one step() (batch_heads()), whose rows the _rows kernels
     // take kInkRows at a time.  Not with the drafter, whose caches and block are one sequence's.
-    need(opt_.batch + 1 <= kInkRows, "Inkling 2 takes fewer sequences (--batch) than that");
+    // At most 16 rows a step: under kStageRows, so a step's products are the few-token kernels that give each row the
+    // bits it gets alone (32 rows would take the prompt batch's), and as many as were checked (--check-batch).
+    need(opt_.batch <= 15, "Inkling 2 takes up to 15 sequences beside the first (--batch 1 to 15)");
+    static_assert(16 <= kInkRows && 16 < kStageRows, "a step's rows fit the _rows kernels and the few-token paths");
 #if defined(STRATA_GPU_METAL)
     need(opt_.batch == 0, "Inkling 2 runs one sequence on Metal (--batch is not supported there yet)");
 #endif
