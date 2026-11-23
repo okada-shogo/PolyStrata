@@ -47,6 +47,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <thread>
+#include <set>
 #include <unordered_map>
 
 #ifdef __linux__
@@ -6476,6 +6477,118 @@ void* Engine::record(F&& work) {
     return exec;
 }
 
+// step()'s recording `in[key]` launched, made first if it is not there; false when `work` ran unrecorded instead.  A
+// recording that fails for memory has already run `work` on the host once (its launches captured, nothing run on the
+// card), so `work` runs again unrecorded: a step's host side is the same each time it is recorded or run.
+bool Engine::step_replay(std::map<std::vector<int>, void*>& in, const std::vector<int>& key,
+                         const std::function<void()>& work) {
+    const auto it = in.find(key);
+    void* g = it != in.end() ? it->second : nullptr;
+    if (!g && step_no_ >= step_rec_retry_) {
+        g = record_step(work);
+        if (g) in[key] = g;
+    }
+    if (!g) {
+        work();
+        return false;
+    }
+    ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "layer graph");
+    step_used_[g] = step_no_;
+    return true;
+}
+
+// record() for step_replay(), which takes the VRAM each recording holds into account.  A recording the card has no
+// memory for drops every step recording but this step's and tries again; failing still, it is not made (null), and
+// no step records again for 256 steps.
+void* Engine::record_step(const std::function<void()>& work) {
+    if (step_budget_ == 0) {
+        // the budget: a 64th of the card, 64 to 256 MiB (an 8 GB card's 128), or STRATA_POLY_STEP_GRAPH_MIB
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        size_t mib = std::clamp<size_t>(total_b >> 26, 64, 256);
+        if (const char* v = std::getenv("STRATA_POLY_STEP_GRAPH_MIB"); v && std::atoi(v) > 0) mib = (size_t) std::atoi(v);
+        step_budget_ = mib << 20;
+    }
+    cudaGraph_t g = nullptr;
+    ck(cudaStreamBeginCapture(cs(st_), cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
+    recording_ = recorded_ = true;
+    try {
+        work();
+    } catch (...) {
+        recording_ = false;
+        if (cudaStreamEndCapture(cs(st_), &g) == cudaSuccess && g) cudaGraphDestroy(g);
+        cudaGetLastError();
+        throw;
+    }
+    recording_ = false;
+    ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
+    size_t f0 = 0, f1 = 0, total = 0;
+    ck(cudaMemGetInfo(&f0, &total), "cudaMemGetInfo");
+    cudaGraphExec_t exec = nullptr;
+    cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    if (made == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        trim_step_graphs(0);
+        ck(cudaMemGetInfo(&f0, &total), "cudaMemGetInfo");
+        exec = nullptr;
+        made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    }
+    cudaGraphDestroy(g);
+    if (made == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        step_rec_retry_ = step_no_ + 256;
+        std::fprintf(stderr, "strata-poly: no VRAM for a step's recording: the steps run unrecorded for a while\n");
+        return nullptr;
+    }
+    ck(made, "cudaGraphInstantiate");
+    ck(cudaMemGetInfo(&f1, &total), "cudaMemGetInfo");
+    step_bytes_ += f0 > f1 ? f0 - f1 : 0;
+    graphs_.push_back(exec);
+    step_used_[exec] = step_no_;
+    if (step_bytes_ > step_budget_) trim_step_graphs(step_budget_ / 4 * 3);
+    // what they take, for the budget: a line each time the count doubles
+    if (step_used_.size() >= 2 * std::max<size_t>(step_logged_, 128)) {
+        step_logged_ = step_used_.size();
+        std::fprintf(stderr, "strata-poly: step recordings: %zu held, %.1f MiB (%.0f KiB each), %zu dropped, budget %zu MiB\n",
+                     step_used_.size(), step_bytes_ / 1048576.0, step_bytes_ / 1024.0 / (double) step_used_.size(),
+                     step_dropped_, step_budget_ >> 20);
+    }
+    return exec;
+}
+
+// The step recordings launched longest ago go, but none of this step's, until the VRAM they hold, at their average
+// size, is at most `target`.  Those are done on the card: step() waits for the step before it first.
+void Engine::trim_step_graphs(size_t target) {
+    if (step_used_.empty() || step_bytes_ <= target) return;
+    std::vector<std::pair<uint64_t, void*>> old;
+    for (const auto& [g, used] : step_used_)
+        if (used != step_no_) old.push_back({used, g});
+    std::sort(old.begin(), old.end());
+    const size_t each = std::max<size_t>(1, step_bytes_ / step_used_.size());
+    std::set<void*> gone;
+    for (const auto& [used, g] : old) {
+        if (step_bytes_ <= target) break;
+        gone.insert(g);
+        step_bytes_ -= std::min(step_bytes_, each);
+    }
+    if (gone.empty()) return;
+    const auto drop = [&](std::map<std::vector<int>, void*>& in) {
+        for (auto it = in.begin(); it != in.end();) it = gone.count(it->second) ? in.erase(it) : std::next(it);
+    };
+    for (Layer& L : layers_) {
+        drop(L.rows_heads);
+        drop(L.rows_tails);
+    }
+    drop(step_passes_);
+    graphs_.erase(std::remove_if(graphs_.begin(), graphs_.end(), [&](void* g) { return gone.count(g) > 0; }),
+                  graphs_.end());
+    for (void* g : gone) {
+        ck(cudaGraphExecDestroy((cudaGraphExec_t) g), "a step's recording");
+        step_used_.erase(g);
+    }
+    step_dropped_ += gone.size();
+}
+
 // n tokens from pos() through every layer.  The sequence is not longer for it: the caller says by how much.
 void Engine::run(const int32_t* tokens, int n) {
     if (n < 1 || n > rows_) throw std::logic_error("eval takes 1 to max_rows() tokens");
@@ -6768,6 +6881,7 @@ int Engine::step_rows_alone() const { return std::min(rows_, kStageRows - 1); }
 void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* guesses) {
     // step_picks() asks this step only: taken first, so a step that throws (KvFull below) leaves no ask for the next
     const bool picks = std::exchange(step_picks_, false) && d_picks_;
+    ++step_no_;   // (step_replay()'s clock)
     if (n < 1 || n > std::min(rows_, sequences())) throw std::logic_error("step takes 1 to sequences() tokens");
     if (guesses && !steps_guesses()) throw std::logic_error("step: guesses need --batch-mtp, a draft block and one card");
     if (!step_seqs_.empty()) throw std::logic_error("step: the rows of the step before are not kept yet (keep_step())");
@@ -6897,9 +7011,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             for (int il = lo_; il < hi_; ++il) wkey.push_back(head_key(il, 1));
         }
         pos_ = keep;
-        void*& pass = step_passes_[wkey];
-        if (!pass)
-            pass = record([&] {
+        const auto whole_work = [&] {
                 // the layers' runs in next_layer()'s order (a looped core's layers run more than once a token)
                 for (int il = lo_; il < hi_; il = next_layer(il)) {
                     Layer& L = layers_[(size_t) il];
@@ -6914,8 +7026,14 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
                     rows_of_ = nullptr;
                 }
                 logits_rows(0, R);
-            });
-        ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
+            };
+        if (tail_by_rows()) {
+            step_replay(step_passes_, wkey, whole_work);
+        } else {
+            void*& pass = step_passes_[wkey];
+            if (!pass) pass = record(whole_work);
+            ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
+        }
         for (int il = lo_; il < hi_; il = next_layer(il))
             stats_.gpu_experts += layers_[(size_t) il].moe ? R * n_used_ : 0;
         out_done[0] = out_done[1] = true;
@@ -7046,7 +7164,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             pos_ = keep;
             rows_of_ = rows.data();
             n_rows_of_ = R;
-            if (replay && L.fixed) {
+            if (replay && L.fixed && tail_by_rows()) {
+                step_replay(L.rows_heads, key, [&] { layer_head(L, il, R); });
+            } else if (replay && L.fixed) {
                 void*& made = L.rows_heads[key];
                 if (!made) made = record([&] { layer_head(L, il, R); });
                 ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
@@ -7100,9 +7220,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             rows_of_ = rows.data();
             n_rows_of_ = R;
             if (replay && L.fixed) {
-                void*& made = L.rows_tails[tkey];
-                if (!made) made = record([&] { layer_tail(L, il, R); });
-                ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
+                step_replay(L.rows_tails, tkey, [&] { layer_tail(L, il, R); });
             } else {
                 layer_tail(L, il, R);
             }
