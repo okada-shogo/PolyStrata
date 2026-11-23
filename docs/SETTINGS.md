@@ -365,7 +365,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WDDM_MARGIN_MIB` | number | AMD | [AMD_HIP.md](AMD_HIP.md) |
 
-## Switches that go back to earlier behaviour (119)
+## Switches that go back to earlier behaviour (120)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -405,6 +405,7 @@ version made it the default.
 | `STRATA_IL_PAD` | number | NVIDIA and AMD | v0.2.16 | - |
 | `STRATA_INK_FLASH` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_INK_KERNEL_TABLES` | on / off | NVIDIA | - | [inkling.md](models/inkling.md) |
+| `STRATA_INK_MMA75` | on / off | NVIDIA and AMD | - | [inkling.md](models/inkling.md) |
 | `STRATA_INK_PROJECT_MIXED` | on / off | NVIDIA | - | - |
 | `STRATA_IQ3_LANES` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_IQ_MT_MIN` | on / off | NVIDIA and AMD, CPU | v0.2.16 | [BATCHING.md](BATCHING.md), [DETAILS.md](DETAILS.md), [OLDER_GPUS.md](OLDER_GPUS.md) |

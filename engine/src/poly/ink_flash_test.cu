@@ -1,7 +1,13 @@
-// src/poly/ink_flash_test.cu - ink_attend_batch() (ink_flash_kernel, from Ampere on) against a float64 reference of the same attention, beside the two paths it stands in
+// src/poly/ink_flash_test.cu - ink_attend_batch() (the flash kernels: ink_flash_kernel from Ampere on,
+// ink_flash75_kernel or ink_mma75_kernel on Turing) against a float64 reference of the same attention, beside the two
+// paths it stands in
 // for: ink_attend() (a token's scores in floats) and attend_batch() with an AttnBias (cuBLAS products, the path
 // Inkling2 takes when ink_attend_batch() does not).  Inkling 2 Mini's heads: 128 values, 16 relative values; groups
 // of 1 to 4 query heads, full and window layers, ring caches, a gate, calls that start past position 0.
+//
+// Then the same rows in one call and split over several: every output the same bits (a token's result does not depend
+// on the call it is in).  On Turing it tests ink_mma75_kernel, and ink_flash75_kernel with
+// STRATA_INK_MMA75=0: run it both ways there.
 //
 // usage: poly_ink_flash_test            (exit 0: every case within the bounds below; 77: no flash kernel here)
 //                                       each case also prints a hash of the flash kernel's output bits, which two
@@ -18,6 +24,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <random>
 #include <string>
@@ -214,6 +221,75 @@ size_t work_floats(int rows, int n_head) {   // inkling2.cpp's awork_
     return heads + heads / 2 + 1 + 3 * (size_t) rows * n_head;
 }
 
+// A token's result must not depend on the call it is in: the case's rows in one call, then the same rows (same caches,
+// same inputs) in calls of the given sizes, one after another; every output float the same bits.
+int run_split_tests(cudaStream_t st) {
+    struct Split {
+        Case c;
+        std::vector<int> sizes;
+    };
+    const Split splits[] = {
+        // name                    per n_kv pos    rows  window ring  extent gate   call sizes
+        {{"split window ring g3",   3, 8,   1900,  333,  1024,  1357, 1024,  true},  {1, 100, 232}},
+        {{"split window 1K g3",     3, 8,   3072,  1024, 1024,  2048, 1024,  true},  {512, 512}},
+        {{"split window 1K g3 odd", 3, 8,   3072,  1024, 1024,  2048, 1024,  true},  {333, 21, 1, 669}},
+        {{"split full later g3",    3, 8,   1500,  200,  0,     0,    1024,  false}, {21, 64, 115}},
+        {{"split full pos0 g3",     3, 8,   0,     700,  0,     0,    1024,  true},  {300, 17, 383}},
+        {{"split window g1",        1, 8,   999,   64,   128,   192,  128,   true},  {5, 59}},
+        {{"split full g2",          2, 4,   40,    130,  0,     0,    64,    false}, {17, 113}},
+        {{"split full g4",          4, 2,   0,     77,   0,     0,    1024,  false}, {5, 72}},
+        {{"split window g2",        2, 4,   300,   150,  128,   278,  128,   true},  {7, 30, 113}},
+        {{"split window g4",        4, 2,   500,   90,   100,   190,  100,   false}, {3, 87}},
+        {{"split window 20 g3",     3, 8,   64,    70,   20,    90,   20,    true},  {11, 59}},
+    };
+    int fails = 0;
+    for (unsigned si = 0; si < sizeof(splits) / sizeof(splits[0]); ++si) {
+        const Split& sp = splits[si];
+        Call x(sp.c, 4321u + si);
+        const size_t per_row = (size_t) x.n_head * kDim, n_out = (size_t) sp.c.rows * per_row;
+        float* out = zeros(n_out);
+        InkAttn a = x.attn(out, nullptr, 0);
+        if (!ink_attend_batch(a, st)) {
+            std::printf("%-24s flash off\n", sp.c.name);
+            cudaFree(out);
+            continue;
+        }
+        ck(cudaStreamSynchronize(st), "ink_attend_batch");
+        const std::vector<float> whole = download(out, n_out);
+        ck(cudaMemset(out, 0, n_out * sizeof(float)), "cudaMemset");
+        // the calls last first, so a call that wrote past its rows would leave that behind
+        std::vector<int> first;
+        int at = 0;
+        for (const int m : sp.sizes) first.push_back(at), at += m;
+        bool took = true;
+        for (size_t k = sp.sizes.size(); k-- > 0;) {
+            const int m = sp.sizes[k];
+            at = first[k];
+            InkAttn b = a;
+            b.q = x.dq + (size_t) at * per_row;
+            b.r = x.dr + (size_t) at * x.n_head * kRel;
+            b.sink = x.dsink + (size_t) at * x.n_head;
+            if (x.dgate) b.gate = x.dgate + (size_t) at * per_row;
+            b.out = out + (size_t) at * per_row;
+            b.pos = sp.c.pos + at;
+            b.rows = m;
+            took = ink_attend_batch(b, st) && took;
+        }
+        at = first.back() + sp.sizes.back();
+        ck(cudaStreamSynchronize(st), "ink_attend_batch (split)");
+        const std::vector<float> parts = download(out, n_out);
+        size_t differ = 0;
+        for (size_t i = 0; i < n_out; ++i) differ += std::memcmp(&whole[i], &parts[i], 4) != 0;
+        const bool ok = took && at == sp.c.rows && differ == 0;
+        std::printf("%-24s one call fnv %016llx | %zu calls fnv %016llx | %zu floats differ  %s\n", sp.c.name,
+                    (unsigned long long) fnv(whole), sp.sizes.size(), (unsigned long long) fnv(parts), differ,
+                    ok ? "ok" : "FAIL");
+        fails += !ok;
+        cudaFree(out);
+    }
+    return fails;
+}
+
 int run_tests() {
     const Case cases[] = {
         // name                  per n_kv pos    rows  window ring  extent gate
@@ -228,6 +304,9 @@ int run_tests() {
         {"window ring odd g3",    3, 4,   2049,  45,   100,   145,  100,   false},
         {"window ring g1",        1, 8,   999,   64,   128,   192,  128,   true},
         {"few rows g3",           3, 8,   33,    32,   0,     0,    1024,  false},
+        {"window ring g2",        2, 4,   700,   150,  128,   278,  128,   true},
+        {"window ring g4",        4, 2,   333,   90,   100,   190,  100,   false},
+        {"window 20 g3",          3, 8,   64,    70,   20,    90,   20,    true},
     };
     cudaStream_t st;
     ck(cudaStreamCreate(&st), "stream");
@@ -272,6 +351,7 @@ int run_tests() {
         fails += !ok;
         for (void* p : {(void*) out, (void*) score, (void*) work, (void*) zero}) cudaFree(p);
     }
+    fails += run_split_tests(st);
     blas_destroy(blas);
     cudaStreamDestroy(st);
     std::printf("%d failed\n", fails);

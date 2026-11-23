@@ -2305,6 +2305,205 @@ __global__ void __launch_bounds__(kFastThreads, 2) ink_fast_kernel(InkAttn a) {
 #endif
 }
 
+// The same attention on Turing in the shape of attn_mma_kernel from our earlier Inkling engine (#200's 7f3f4574f,
+// 16f3585bd): a launch block is 4 warps of 16 query rows, row r of the block token r / G and query head r % G of the
+// key head (16 * 4 / G tokens, a row unused for G = 3), keys go 32 at a time through one buffer.  It differs from
+// ink_flash75_kernel in what costs it time: the relative-position bias is a product on the tensor cores too, the
+// warp's R (in log2 units) times the table's rows of the distances the tile spans, each split into a half and the
+// half of what that leaves (hi*hi + lo*hi + hi*lo, summed in floats: about a float product's rounding), a warp's 16
+// rows by mma75_bias(G) distances in shared memory as floats, each score reading its one float; the softmax runs in
+// log2 units (exp2f); and a tile that every row of a warp attends whole skips the masks.  A score is the query rounded
+// to halves times the key summed in floats, times the scale, plus the bias, less the sink; a weight is rounded to a
+// half for the values' product and summed as that half; the softmax has one more term of score 0, then the gate.  The
+// tiles are counted from position 0 and a row's sums read nothing of the block's other rows, so a token's result does
+// not depend on the call it is in (ink_flash_test's split calls).
+constexpr int kMma75Warps = 4, kMma75Keys = 32;
+
+__host__ __device__ constexpr int mma75_tokens(int g) { return 16 * kMma75Warps / g; }
+// a warp's distances a tile: its rows' tokens (at most 15 / G + 2) and the keys, in blocks of 8
+__host__ __device__ constexpr int mma75_bias(int g) { return (15 / g + 2 + kMma75Keys - 1 + 7) / 8 * 8; }
+
+template <int G>
+__global__ void __launch_bounds__(kMma75Warps * 32) ink_mma75_kernel(InkAttn a) {
+#if INK_MMA && !INK_FLASH
+    constexpr int DIM = 128, KEYS = kMma75Keys, ROW = kFlashRow, NR = kFlashRel, W = kMma75Warps, THREADS = W * 32;
+    constexpr int TOKENS = mma75_tokens(G), BIAS = mma75_bias(G);
+    constexpr float LOG2E = 1.44269504f;
+    static_assert(NR == 16, "the bias product is one k = 16 step");
+    __shared__ __align__(16) __half ks[KEYS][ROW], vs[KEYS][ROW];
+    __shared__ __align__(16) float bias[W][16][BIAS];
+    const int lane = threadIdx.x % 32, w = threadIdx.x / 32, gid = lane / 4, tig = lane % 4;
+    const int g = blockIdx.y, t0 = (gridDim.x - 1 - blockIdx.x) * TOKENS;   // the longest blocks first
+    const int nt = min(TOKENS, a.rows - t0), wt0 = 16 * w / G, wt1 = min((16 * w + 15) / G, TOKENS - 1);
+    const long long p0 = a.pos + t0;
+    int tok[2];
+    bool ok[2];
+    size_t th[2];   // the thread's rows gid and gid + 8 of the warp's: token, and its head's place in q, r, out
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int r = 16 * w + gid + 8 * i;
+        tok[i] = r / G;
+        ok[i] = tok[i] < nt;
+        th[i] = ok[i] ? size_t(t0 + tok[i]) * a.n_head + g * G + r % G : 0;
+    }
+    uint32_t qa[8][4], ra[4], rl[4];   // a block of 16 values a step; R in log2 units, and what its halves leave
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                float2 x = make_float2(0.0f, 0.0f);
+                if (ok[i]) x = *reinterpret_cast<const float2*>(a.q + th[i] * DIM + 16 * k + 8 * u + 2 * tig);
+                qa[k][i + 2 * u] = ink_h2(x.x, x.y);
+            }
+            float2 x = make_float2(0.0f, 0.0f);
+            if (ok[i]) x = *reinterpret_cast<const float2*>(a.r + th[i] * NR + 8 * u + 2 * tig);
+            const float2 y = make_float2(x.x * LOG2E, x.y * LOG2E);
+            const __half2 h = __floats2half2_rn(y.x, y.y);
+            ra[i + 2 * u] = *reinterpret_cast<const uint32_t*>(&h);
+            rl[i + 2 * u] = ink_h2(y.x - __low2float(h), y.y - __high2float(h));
+        }
+    float sink[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) sink[i] = ok[i] ? a.sink[th[i]] * LOG2E : 0.0f;
+    const float sl = a.scale * LOG2E;
+    float o[16][4], m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int n = 0; n < 16; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    // the block's tokens attend positions [lo, hi): from the first one's window to the last one
+    const long long hi = p0 + nt, lo = a.window > 0 ? max(0LL, p0 - a.window + 1) : 0;
+    const bool wfull = wt1 < nt;   // every row of the warp is a token of the call
+    const __half* kc = reinterpret_cast<const __half*>(a.keys);
+    const __half* vc = reinterpret_cast<const __half*>(a.vals);
+    for (long long k0 = lo / KEYS * KEYS; k0 < hi; k0 += KEYS) {
+        __syncthreads();   // the last tile's keys, values and table rows are read
+        for (int i = threadIdx.x; i < KEYS * DIM / 8; i += THREADS) {
+            const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
+            const long long key = k0 + r;
+            uint4 kx = make_uint4(0, 0, 0, 0), vx = kx;   // zeros outside [lo, hi), which no weight reads
+            if (key >= lo && key < hi) {
+                const size_t at = (size_t(a.ring > 0 ? key % a.ring : key) * a.n_kv + g) * DIM + c;
+                kx = *reinterpret_cast<const uint4*>(kc + at);
+                vx = *reinterpret_cast<const uint4*>(vc + at);
+            }
+            *reinterpret_cast<uint4*>(&ks[r][c]) = kx;
+            *reinterpret_cast<uint4*>(&vs[r][c]) = vx;
+        }
+        // the block's distances own - key are d0 .. ; a tile with one below the extent has a bias
+        const long long d0 = p0 - (k0 + KEYS - 1);
+        const bool near = d0 < a.extent;
+        __syncthreads();
+        float s[KEYS / 8][4];
+#pragma unroll
+        for (int n = 0; n < KEYS / 8; ++n) {
+            s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
+                ink_ldsm4(b, &ks[8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
+                ink_mma(s[n], qa[k], b);
+                ink_mma(s[n], qa[k + 1], b + 2);
+            }
+        }
+        if (near) {   // the warp's rows times its distances: column e is distance d0 + wt0 + e
+#pragma unroll
+            for (int n = 0; n < BIAS / 8; ++n) {
+                // the B fragment: the table's row of distance d0 + wt0 + 8 n + gid, values 2 tig.. and 8 + 2 tig..,
+                // zeros before 0 and from the extent on; as halves, and the halves of what they leave
+                const long long d = d0 + wt0 + 8 * n + gid;
+                float2 x0 = make_float2(0.0f, 0.0f), x1 = x0;
+                if (d >= 0 && d < a.extent) {
+                    x0 = __ldg(reinterpret_cast<const float2*>(a.rel_bias + size_t(d) * NR + 2 * tig));
+                    x1 = __ldg(reinterpret_cast<const float2*>(a.rel_bias + size_t(d) * NR + 8 + 2 * tig));
+                }
+                const __half2 h0 = __floats2half2_rn(x0.x, x0.y), h1 = __floats2half2_rn(x1.x, x1.y);
+                const uint32_t b[2] = {*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1)};
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const uint32_t bl[2] = {ink_h2(x0.x - __low2float(h0), x0.y - __high2float(h0)),
+                                        ink_h2(x1.x - __low2float(h1), x1.y - __high2float(h1))};
+                ink_mma(c, ra, b);    // hi * hi
+                ink_mma(c, rl, b);    // + lo * hi
+                ink_mma(c, ra, bl);   // + hi * lo: about what the products in floats give
+                *reinterpret_cast<float2*>(&bias[w][gid][8 * n + 2 * tig]) = make_float2(c[0], c[1]);
+                *reinterpret_cast<float2*>(&bias[w][gid + 8][8 * n + 2 * tig]) = make_float2(c[2], c[3]);
+            }
+            __syncwarp();
+        }
+        // whether every row of the warp attends every key of the tile: then no score needs its mask
+        const bool whole = wfull && k0 + KEYS - 1 <= p0 + wt0 && (a.window <= 0 || k0 > p0 + wt1 - a.window);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            // the row's token attends positions (own - window, own]: columns c of the tile with lo_c < c <= hi_c
+            const long long own = p0 + tok[i];
+            const int hi_c = ok[i] ? (int) min(own - k0, (long long) KEYS) : -1;
+            const int lo_c = a.window > 0 ? (int) max(own - a.window - k0, -1LL) : -1;
+            const int e0 = tok[i] - wt0 + KEYS - 1;
+            float mx = -INFINITY;
+#pragma unroll
+            for (int n = 0; n < KEYS / 8; ++n)
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    const int c = 8 * n + 2 * tig + j % 2;
+                    const float b = near ? bias[w][gid + 8 * i][e0 - c] : 0.0f;
+                    float v = fmaf(s[n][j], sl, b) - sink[i];
+                    if (!whole && (c > hi_c || c <= lo_c)) v = -INFINITY;
+                    s[n][j] = v;
+                    mx = fmaxf(mx, v);
+                }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.0f : now;
+            const float f = exp2f(m[i] - base);
+            m[i] = now;
+            l[i] *= f;
+#pragma unroll
+            for (int n = 0; n < 16; ++n) {
+                o[n][2 * i] *= f;
+                o[n][2 * i + 1] *= f;
+            }
+#pragma unroll
+            for (int n = 0; n < KEYS / 8; ++n)
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    s[n][j] = __half2float(__float2half(exp2f(s[n][j] - base)));   // the weight the values get
+                    l[i] += s[n][j];
+                }
+        }
+#pragma unroll
+        for (int k = 0; k < KEYS / 16; ++k) {   // keys 16 k..: the weights as an A fragment
+            const uint32_t pa[4] = {ink_h2(s[2 * k][0], s[2 * k][1]), ink_h2(s[2 * k][2], s[2 * k][3]),
+                                    ink_h2(s[2 * k + 1][0], s[2 * k + 1][1]), ink_h2(s[2 * k + 1][2], s[2 * k + 1][3])};
+#pragma unroll
+            for (int n = 0; n < 16; n += 2) {
+                uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
+                ink_ldsm4(b, &vs[16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
+                ink_mma(o[n], pa, b);
+                ink_mma(o[n + 1], pa, b + 2);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        if (!ok[i]) continue;
+        const float inv = 1.0f / (l[i] + exp2f(0.0f - m[i]));   // the term of score 0, against the row's top
+        const size_t at = th[i] * DIM + 2 * tig;
+#pragma unroll
+        for (int n = 0; n < 16; ++n)
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                float v = o[n][2 * i + e] * inv;
+                if (a.gate) v *= 1.0f / (1.0f + expf(-a.gate[at + 8 * n + e]));   // ink_mul_sigmoid_kernel's
+                a.out[at + 8 * n + e] = v;
+            }
+    }
+#else
+    (void) a;   // ink_attend_batch() launches it only where the PTX has the steps
+#endif
+}
+
 __device__ __forceinline__ float2 situ_scales(const ExpertScales& s, int row) {
     if (!s.gate && !s.up) return make_float2(1.0f, 1.0f);
     const int e = s.ids ? s.ids[row] : s.e[row];
@@ -2850,8 +3049,27 @@ void ink_attend(const InkAttn& a, void* stream) {
 }
 
 #if !defined(__HIPCC__)
-// ink_attend_batch() on Turing: ink_flash75_kernel, fp16 caches
+// ink_attend_batch() on Turing, fp16 caches: ink_mma75_kernel, or ink_flash75_kernel with STRATA_INK_MMA75=0.  On
+// upstream's accuracy check (3 prompts of 302 to 8,192 tokens, 64 tokens, 3 files) ink_mma75_kernel's most likely
+// token is ink_flash75_kernel's greedy answer at 98.3% of the steps and attend_batch()'s at 98.4%.
 static bool flash75(const InkAttn& a, int per, void* stream) {
+    static const bool mma = [] {
+        const char* v = std::getenv("STRATA_INK_MMA75");
+        return !(v && v[0] == '0');
+    }();
+    if (mma) {
+        const auto launch = [&](auto kernel, int g) {
+            kernel<<<dim3(grid((size_t) a.rows, mma75_tokens(g)), a.n_kv), kMma75Warps * 32, 0, cs(stream)>>>(a);
+        };
+        switch (per) {
+            case 1: launch(ink_mma75_kernel<1>, 1); break;
+            case 2: launch(ink_mma75_kernel<2>, 2); break;
+            case 3: launch(ink_mma75_kernel<3>, 3); break;
+            default: launch(ink_mma75_kernel<4>, 4); break;
+        }
+        launched("ink_mma75");
+        return true;
+    }
     const auto launch = [&](auto kernel, size_t smem, int g) {
         const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         if (e != cudaSuccess) throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));

@@ -16649,6 +16649,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_INK_MMA75",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/inkling2.cu",
+     "line": 3057,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/models/inkling.md:84"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "rollback",
+   "owner": "",
+   "note": "0: Inkling 2's prompt attention on Turing (sm_75) goes back to ink_flash75_kernel (PR 209) instead of ink_mma75_kernel (attn_mma_kernel's shape, the position bias on the tensor cores as hi+lo halves; 98.3% top-1 against ink_flash75_kernel's greedy answers)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_INK_PROJECT_MIXED",
    "backends": [
     "cuda"

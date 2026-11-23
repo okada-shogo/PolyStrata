@@ -79,6 +79,12 @@ whatever its launch, so the answers are the same to the bit. It was measured +1.
 Ti (22 GB, every expert in VRAM) and no change on an RTX 2070 (8 GB). `STRATA_POLY_EXPERT_TILES=0` goes back to a
 launch for each run.
 
+On an RTX 20 card a prompt's attention runs in a tensor-core kernel shaped for Turing: one layer's call of 1,024 rows
+takes 1.0 ms in a sliding-window layer and 18 ms in a full layer at 32K keys (RTX 2070 Super). It rounds the
+attention's sums in another order than the kernel before it, which `STRATA_INK_MMA75=0` goes back to (2.8 ms and
+39 ms; a 32K prompt reads about 9% slower). Against that kernel's greedy answers to the three prompts above (64 tokens
+each, the three files) it gives the same most likely token at 566 of the 576 steps (98.3%).
+
 On an RTX 30 card or newer, most of a prompt's products run on the int8 tensor cores, with the prompt's numbers
 rounded to 8 bits. UD-Q2_K_XL's IQ1_S experts (the gate and up of 6 layers) are the exception: they stay on halves
 unless `STRATA_PREFILL_IQ1S=int8` is set. On an RTX 3090 that setting reads a 2,048-token prompt 7.7% faster (2,159
