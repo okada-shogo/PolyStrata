@@ -217,6 +217,13 @@ bool gemm_iq_i8_takes(int ty, int K);
 /// same sums as on Ampere.  Off by default on Turing, where the products are the halves' (mmq_own.cu), and on by
 /// default on HIP; a model's engine says (Inkling 2: --prompt-int8 on Turing, --no-prompt-int8 on HIP).
 void gemm_iq_i8_turing(bool on);
+/// Turing's code (sm_75) on a card without tensor cores (GeForce GTX 16) runs the int8 kernel's products by dp4a in
+/// place of the MMAs, which are slow there: the same int32 sums and float sums, so the same bits (i8_mma.cuh,
+/// i8m_dp4a_pick: the card's name, then a probe of the two).  mode -1: that pick (the default); 0: the MMAs; 1: dp4a on
+/// any Turing code (a test of the bits on a card with tensor cores).  gemm_iq_i8_dp4a_on: the current card takes the
+/// int8 kernel and runs it by dp4a.
+void gemm_iq_i8_dp4a(int mode);
+bool gemm_iq_i8_dp4a_on();
 /// The int8 kernel also takes type ty, from now on in this process (on false: no longer), for a type it takes only when
 /// asked: IQ1_S (19), MXFP4 (39), and Q2_0 (42) in rows that are not whole 256s.  A model's engine asks for them at
 /// load (Inkling 2: IQ1_S with STRATA_PREFILL_IQ1S=int8, MXFP4 unless STRATA_PREFILL_MXFP4=fp16, Q2_0), so that other

@@ -254,6 +254,10 @@ void Inkling2::load_geometry() {
     if (opt_.prompt_int8 >= 0)   // on AMD the int8 kernel is the default: only --no-prompt-int8 (or --prompt-int8) says
 #endif
         kernels::gemm_iq_i8_turing(opt_.prompt_int8 == 1);
+    // A GeForce GTX 16 (Turing without tensor cores) runs those int8 products by dp4a, the same bits as the MMAs,
+    // which are slow there (gemm_iq_i8_dp4a(): the card's name and a probe; STRATA_I8M_DP4A=0 keeps the MMAs)
+    if (opt_.prompt_int8 == 1 && kernels::gemm_iq_i8_dp4a_on())
+        std::fprintf(stderr, "strata-poly: --prompt-int8's products by dp4a (a card without tensor cores)\n");
     // STRATA_PREFILL_IQ1S=int8: IQ1_S (UD-Q2_K_XL's gate|up in 6 layers) on the int8 prompt kernel, as the file's
     // other types are on Ampere and newer (i8_mma.cuh: activations int8 a 32 values).  Opt-in: on a 302-token prompt
     // it cost more KL a matrix than those types do.  Unset or =fp16: the FP16 kernel, as before.  Other models never
