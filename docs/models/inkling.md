@@ -126,8 +126,8 @@ rows took 3.4 s.
 | **Disk** | 9.1 to 17.6 GB for the model file. |
 | **System** | Linux or Windows 10 / 11, and a current NVIDIA driver; or macOS 15 or newer. |
 
-Not run yet: an AMD card, two cards (`--expert-gpu`, built but not run; `--layer-split`, below, run only as two
-parts on one card, where a split at layer 6 still hangs), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
+Not run yet: an AMD card, `--expert-gpu` on two cards (built but not run), `--layer-split` on two unequal cards
+(below; it has run on two RTX 2070 Super), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL
 on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on
 the CPU. The draft file is an
 option (`--draft-model`). The engine takes one request at a time
@@ -165,8 +165,9 @@ log line `layer split auto: the loop ... on the faster card` says when it did. E
 `STRATA_POLY_CARD_GBS=a,b` gives the cards' bandwidths in GB/s where the driver's figure is wrong (on AMD cards it
 is not read, so they get the plain layout unless it is set). This has not been run on two unequal cards yet. The
 idea of keeping the loop on the faster card comes from cobra91 and kuraneko1 (Strata PR #6506).
-Known bug, not fixed yet: a card that starts at layer 6 (`--layer-split 6` or `6,18`, and `"auto"` when it takes
-6) hangs before the first token; use 18 until it is fixed.
+On two RTX 2070 Super 8 GB (IQ4_NL, a 302-token prompt, 256 tokens written, mean of 3 runs) one card wrote 37.0
+tok/s, `--layer-split 18` 51.0 and `6` 48.5. Every split (3, 6, 18, 20, `6,18`, `"auto"`) gave one card's tokens and
+top-20 probabilities with every expert on the CPU.
 Once a token, a card hands the next one the token's residual streams and the loop's inputs, 64.5 KB. The DSpark
 drafter (`--draft-model`) runs on one card only.
 
