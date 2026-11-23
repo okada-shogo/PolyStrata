@@ -10947,13 +10947,21 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             cfg["parallel"] = a.parallel if a.parallel >= 2 else 1
         for line in poly_parallel_note(a.parallel, d, vram):
             (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
-        if (a.parallel or 1) >= 2 and "--tail-skip" in args:
-            # the skip is decided over a step's rows, which are several chats' tokens (docs/BATCHING.md)
-            warn(f"--parallel {a.parallel} with --tail-skip: while chats write at once, which experts one chat's tokens "
-                 "skip depends on the other chats, so its answer can differ from the same request alone")
     poly_kv_whole(cfg)
     warm_start_into(cfg, a)
-    write_setup_config(cfg_path, cfg, earlier)
+
+    def tail_skip_note(done: dict) -> None:
+        # The config as written ("parallel" asked now or kept from the one before, the person's own options in its
+        # args): --tail-skip is decided over a step's rows, which are several chats' tokens (docs/BATCHING.md).  Not
+        # on a Mac for a family that answers one request at a time there ("one_request": "mac").
+        parallel = int(done.get("parallel") or 1)
+        if fam.get("one_request") is True or (fam.get("one_request") == "mac" and sys.platform == "darwin"):
+            return
+        if parallel >= 2 and "--tail-skip" in done.get("args", []):
+            warn(f"\"parallel\": {parallel} with --tail-skip: while chats write at once, which experts one chat's "
+                 "tokens skip depends on the other chats, so its answer can differ from the same request alone")
+
+    write_setup_config(cfg_path, cfg, earlier, after_carry=tail_skip_note)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is True)
     ok(f"start script: {script.name}")
 

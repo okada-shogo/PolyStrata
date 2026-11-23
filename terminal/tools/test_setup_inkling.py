@@ -108,7 +108,12 @@ class Main(unittest.TestCase):
         code, out, _ = self.main(("--parallel", "2"), family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
         self.assertEqual(code, 0, out)
         self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 2)
-        self.assertIn("--parallel 2 with --tail-skip", out)
+        self.assertIn('"parallel": 2 with --tail-skip', out)
+        # setup again without --parallel: the config keeps "parallel": 2, and the warning with it
+        code, out, _ = self.main(family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 2)
+        self.assertIn('"parallel": 2 with --tail-skip', out)
 
 
 
