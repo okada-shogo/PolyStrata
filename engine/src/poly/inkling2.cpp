@@ -911,7 +911,9 @@ bool Inkling2::control3(const float* const* cur, float* const* msg, const Ctrl* 
 
 // A layer from its input to its router's copy: the attention, the block's residual, and the experts' input.
 void Inkling2::layer_head(Layer& L, int il, int n) {
-    if (il == lo_) pass_ = 0;   // a call starts at its first layer
+    // A call starts at its card's first layer.  A card that starts at the loop's first layer comes back to it for
+    // each later pass, so it keeps the pass there: next_layer() leaves it 0 after the last pass.
+    if (il == lo_ && il != core_start_) pass_ = 0;
     Block& B = blocks_[(size_t) il];
     if (ds_file_) {   // the drafter's features: the inputs of three layer runs
         const int visit = visit_of(il, pass_of(il));
