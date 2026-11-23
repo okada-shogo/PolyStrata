@@ -205,6 +205,9 @@ struct Layer {
     std::vector<void*> card_moe;       ///< the routed experts, routed on the card (moe_card())
     /// the head of step()'s rows in one call (Engine::batch_heads()): by the rows, their sequences and head keys
     std::map<std::vector<int>, void*> rows_heads;
+    /// the tail of step()'s rows in one call, where it reads them too (Engine::tail_by_rows()): by the rows, their
+    /// sequences and the tail key
+    std::map<std::vector<int>, void*> rows_tails;
 };
 
 /// A routed expert is run from the VRAM cache or on the CPU when tokens come a few at a time, as an answer's do
@@ -623,6 +626,10 @@ protected:
     /// state and attention rows from its own sequence (rows_of_, seq_state(), seq_buf()), its position from at_.
     /// Otherwise step() runs the head a row at a time, with the row's sequence bound.
     virtual bool batch_heads() const { return false; }
+    /// With batch_heads(): layer_tail() takes step()'s rows too (rows_of_ set), for a recurrent state of each row's
+    /// own sequence after the experts (Inkling 2's convolution of the experts' sum).  step() then records a tail by
+    /// its rows' sequences, as a head, and does not split the rows into halves.
+    virtual bool tail_by_rows() const { return false; }
     /// The architecture's step() rows leave the recurrent state after a row at Row::snap (step() with guesses).
     virtual bool rows_snaps() const { return false; }
     /// While step() runs a head in one call: each row's sequence and position, row after row; else null.  snap: for
@@ -730,6 +737,13 @@ protected:
     void moe_add(int n);
     template <class F>
     void* record(F&& work);
+    // step()'s recordings where the tails take the rows (tail_by_rows(): Inkling 2).  They are keyed by the rows'
+    // sequences and rooms, so slots that come and go make more of them for as long as the engine runs: at most
+    // step_cap_ are held, the least recently launched dropped first (trim_step_graphs()), and a recording the card has
+    // no memory for runs unrecorded (record_step()).  The other families' step() records as before.
+    bool step_replay(std::map<std::vector<int>, void*>& in, const std::vector<int>& key, const std::function<void()>& work);
+    void* record_step(const std::function<void()>& work);
+    void trim_step_graphs(size_t keep, bool all);
     void moe_rows(Layer& L, int il, int n);
     void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
     void stage_rest(const Layer& L, const int32_t* experts, const std::vector<int>& which, int m, void* stream,
@@ -938,6 +952,15 @@ protected:
                                                  ///< every layer's head_key()
     /// step()'s layers and logits recorded as one: by its rows, each row's sequence, guess and head_key()s
     std::map<std::vector<int>, void*> step_passes_;
+    /// step_replay()'s recordings: the step that last launched each one (step_no_)
+    std::map<void*, uint64_t> step_used_;
+    uint64_t step_no_ = 0;          ///< step()s so far
+    uint64_t step_rec_retry_ = 0;   ///< after a recording the card had no memory for: none before this step
+    uint64_t step_tries_ = 0;       ///< record_step()'s instantiations (STRATA_POLY_STEP_RECORD_FAIL)
+    size_t step_cap_ = 0;           ///< the most step_used_ holds (STRATA_POLY_STEP_GRAPHS; 0 until the first)
+    size_t step_bytes_ = 0;         ///< what cudaMemGetInfo() lost to them before the first drop (for the log)
+    size_t step_made_ = 0, step_dropped_ = 0, step_unrecorded_ = 0, step_logged_ = 0;
+    bool in_step_ = false;          ///< inside step(): record() keeps this step's step recordings
     void* tail_ = nullptr;        ///< one token's launches from the last layer to the logits, recorded
     void* tail_picks_ = nullptr;  ///< the same, the most likely token in place of the logits (eval_picks())
     // A recorded launch cannot be given the position as an argument: it reads it here when it runs.  eval() writes
@@ -1146,6 +1169,9 @@ protected:
     int32_t* d_ids_ = nullptr;                    ///< a batch's experts and weights when it routes on the card
     float* d_wts_ = nullptr;
     int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card
+    float* h_wts_ = nullptr;                      ///< pinned: their weights, for step()'s rows (bells(), --batch)
+    /// While moe() takes step()'s rows: their picks from the card (h_ids_, h_wts_), as a token alone routes there
+    const int32_t* step_ids_ = nullptr;
     void** d_slots_ = nullptr;                    ///< every layer's L.slot on the card, n_expert_ a layer (moe_card())
     std::vector<void*> h_slots_;                  ///< what d_slots_ holds
     // card_far_: with most experts cached, a few tokens route on the card even so (card_moe()), and a call's experts

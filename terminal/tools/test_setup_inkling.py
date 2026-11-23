@@ -61,9 +61,9 @@ class Main(unittest.TestCase):
                 for flag in ("--draft-model", "--tail-skip", "--prompt-batch", "--batch", "--attn-requant",
                              "--loop-bf16", "--expert-swaps"):
                     self.assertNotIn(flag, args)
-                self.assertEqual(cfg["parallel"], 1)
+                self.assertNotIn("parallel", cfg)                                 # opt-in: written when asked
                 self.assertNotIn("vision", cfg)
-                self.assertNotIn("--parallel", out)                               # not offered
+                self.assertIn("--parallel 2 to 4", out)                           # offered, as for the other families
 
     def test_a_card_that_holds_part_of_the_experts_gets_the_small_card_flags(self):
         # an 8 GB card: Q5_0 attention, BF16 loop controllers, tail skip 4; expert swaps stay on (the default)
@@ -95,11 +95,27 @@ class Main(unittest.TestCase):
         self.assertIsInstance(cfg["gpu"], int)
         self.assertNotIn("layer_split", cfg)
 
-    def test_requests_at_once_are_not_taken(self):
+    def test_requests_at_once_are_taken(self):
+        # the engine's batch slots ("parallel"), opt-in as for the other strata-poly families
         code, out, _ = self.main(("--parallel", "4"), family="inkling", model="UD-Q3_K_XL", ram=64.0, vram=32607 / 1024)
         self.assertEqual(code, 0, out)
-        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 1)
-        self.assertIn("answers one request at a time", out)
+        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 4)
+        self.assertNotIn("answers one request at a time", out)
+        self.assertIn("parallel requests: 4 at once", out)
+        self.assertNotIn("with --tail-skip", out)                          # a card that holds every expert: no skip
+
+    def test_requests_at_once_with_the_tail_skip_are_warned_of(self):
+        # an 8 GB card's small_card_args skip tail experts over a step's rows, which are several chats' tokens
+        code, out, _ = self.main(("--parallel", "2"), family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 2)
+        self.assertIn('"parallel": 2 with --tail-skip', out)
+        # setup again without --parallel: the config keeps "parallel": 2, and the warning with it
+        code, out, _ = self.main(family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 2)
+        self.assertIn('"parallel": 2 with --tail-skip', out)
+
 
 
 if __name__ == "__main__":

@@ -931,8 +931,9 @@ FAMILIES = {
     # context token is the rows of the eight full-attention applications ("row_bytes"); the forty window ones keep
     # rings.  The files are the repository's Mainline_Support ones, the layout llama.cpp runs: the repository names them
     # .gguf_file ("remote_suffix").  Its top-level files are Unsloth's layout (architecture inkling2), which the
-    # engine also reads: a --gguf-dir or --custom-gguf file of either is taken.  The engine keeps one sequence's state for it, so it answers one
-    # request at a time ("one_request": setup writes "parallel": 1).  "vram_beside_gb" is the peak VRAM measured on an RTX 5090 with no expert on the card, a 10,081-token
+    # engine also reads: a --gguf-dir or --custom-gguf file of either is taken.  "parallel" (the engine's batch slots) is
+    # opt-in as for the other strata-poly families; on a Mac the engine keeps one sequence's state for it, so it answers
+    # one request at a time there ("one_request": "mac": setup_mac.py writes "parallel": 1).  "vram_beside_gb" is the peak VRAM measured on an RTX 5090 with no expert on the card, a 10,081-token
     # prompt read 1,024 tokens at a time at a 32K context (2,916 MiB), plus the rows of the context's other tokens.
     "inkling": {"title": "Inkling 2 Mini", "by": "Thinking Machines; quantized by Unsloth",
                 "about": "experimental, on the strata-poly engine: one NVIDIA card, Linux or Windows, or a Mac (beta); "
@@ -942,7 +943,7 @@ FAMILIES = {
                 "tag": "inkling-", "name": "inkling-2-mini", "engine": "poly", "vision": True, "experimental": True,
                 # --custom-gguf takes a file of another quantization (IQ4_NL, Q4_K_M, ...) as a size of its own
                 "custom_sizes": True,
-                "windows": True, "ran_on_gb": 8, "row_bytes": 32768, "one_request": True,
+                "windows": True, "ran_on_gb": 8, "row_bytes": 32768, "one_request": "mac",
                 # the engine's layer split is not built for Inkling 2 yet: it exits with "Inkling 2 runs on one
                 # card (--layer-split is not supported for it yet)", so setup never offers a pair to this family
                 "one_card": True,
@@ -10936,8 +10937,9 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     # requests at once: written only when given, else an earlier "parallel" is carried over (write_setup_config).
-    # A family the engine answers one request at a time ("one_request") is written 1, whatever was asked or kept.
-    if fam.get("one_request"):
+    # A family the engine answers one request at a time ("one_request": True) is written 1, whatever was asked or kept
+    # ("mac": on a Mac only, which setup_mac.py writes).
+    if fam.get("one_request") is True:
         cfg["parallel"] = 1
         if (a.parallel or 1) >= 2:
             warn(f"--parallel {a.parallel}: {title} answers one request at a time on this engine; \"parallel\" is "
@@ -10949,7 +10951,19 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
     poly_kv_whole(cfg)
     warm_start_into(cfg, a)
-    write_setup_config(cfg_path, cfg, earlier)
+
+    def tail_skip_note(done: dict) -> None:
+        # The config as written ("parallel" asked now or kept from the one before, the person's own options in its
+        # args): --tail-skip is decided over a step's rows, which are several chats' tokens (docs/BATCHING.md).  Not
+        # on a Mac for a family that answers one request at a time there ("one_request": "mac").
+        parallel = int(done.get("parallel") or 1)
+        if fam.get("one_request") is True or (fam.get("one_request") == "mac" and sys.platform == "darwin"):
+            return
+        if parallel >= 2 and "--tail-skip" in done.get("args", []):
+            warn(f"\"parallel\": {parallel} with --tail-skip: while chats write at once, which experts one chat's "
+                 "tokens skip depends on the other chats, so its answer can differ from the same request alone")
+
+    write_setup_config(cfg_path, cfg, earlier, after_carry=tail_skip_note)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is True)
     ok(f"start script: {script.name}")
 
