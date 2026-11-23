@@ -6820,6 +6820,16 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         if (!made[key]) made[key] = record(work);
         ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
     };
+    // A step of one row rings the doorbell as run() rings it for a token (bell_on(): card_moe() routes such a row on
+    // the card for it): its misses go to this thread's workers from inside the launches, which bell_serve() answers
+    // once they are handed to the card.  Without the ring, moe_card() would read the mirror's table that card_moe()
+    // did not fill for it.
+    bell_ = bell_on(R);
+    bell_counts_ |= bell_;
+    struct BellOff {
+        bool& on;
+        ~BellOff() { on = false; }
+    } bell_off{bell_};
     const bool card = R < kStageRows && card_moe(R);
     // an architecture that takes the rows in one head: their sequences and positions while it does
     std::vector<Row> rows;
@@ -6868,7 +6878,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     }
     if (whole) {
         const int64_t keep = pos_;
-        std::vector<int> wkey{R, picks ? 1 : 0};
+        std::vector<int> wkey{R, picks ? 1 : 0, bell_ ? 1 : 0};
         for (int i = 0; i < R; ++i) {
             pos_ = at[(size_t) i];
             wkey.push_back(rseq[(size_t) i]);
@@ -6899,6 +6909,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         for (int il = lo_; il < hi_; il = next_layer(il))
             stats_.gpu_experts += layers_[(size_t) il].moe ? R * n_used_ : 0;
         out_done[0] = out_done[1] = true;
+        if (bell_) bell_serve();
     }
     // With experts on the CPU, the rows go through the layers in two halves, a sequence's rows in one, as a window's
     // tokens do (run()): this thread routes a half and computes its CPU experts, and meanwhile the thread that hands
@@ -7052,11 +7063,12 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
             if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
             else moe_shared(L, il, R);
-            if (card && L.card == 1 && replay) {
-                replayed(L.card_moe, rec, [&] { moe_card(L, il, R); });
+            bool on_card = true;
+            if (card && L.card == 1 && replay) replayed(L.card_moe, rec, [&] { moe_card(L, il, R); });
+            else on_card = card && moe_card(L, il, R);
+            if (on_card) {
                 stats_.gpu_experts += R * n_used_;
-            } else if (card && moe_card(L, il, R)) {
-                stats_.gpu_experts += R * n_used_;
+                if (bell_) bell_serve();   // as run() layer by layer: what this thread does next may wait for the card
             } else if (moe(L, il, R)) {
                 moe_add(R);
             }
