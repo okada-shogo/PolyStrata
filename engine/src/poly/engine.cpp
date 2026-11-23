@@ -5905,20 +5905,31 @@ bool Engine::card_moe(int n) {
 // on the host, or its formats have no kernel for picks on the card.
 bool Engine::moe_card(Layer& L, int il, int n) {
     if (L.card == 0) return false;
-    if (!kernels::native_mmvq_ids_supported((int) L.gu_type) || !kernels::native_mmvq_ids_supported((int) L.u_type) ||
-        !kernels::native_mmvq_ids_supported((int) L.d_type) || !route_card(il, n, d_ids_, d_wts_)) {
+    const int rr = n * n_used_;
+    const void* const* table = d_slots_ + (size_t) il * n_expert_;
+    [[maybe_unused]] const bool rings = bell_ && n >= 1;
+    [[maybe_unused]] bool rung = false;   // route_card_ring() has counted the picks and rung the bell
+    const bool kernels_for_picks = kernels::native_mmvq_ids_supported((int) L.gu_type) &&
+                                   kernels::native_mmvq_ids_supported((int) L.u_type) &&
+                                   kernels::native_mmvq_ids_supported((int) L.d_type);
+#if !defined(STRATA_GPU_METAL)
+    // the doorbell: the misses to the host / second card, a token's place under --tail-skip's
+    const BellRing ring{table, rings && !block_pass_ ? d_use_ + (size_t) il * n_expert_ : nullptr,
+                        opt_.tail_skip > 0 ? opt_.tail_skip : n_used_, il, xn_, h_x_, n_embd_, h_bell_, d_bell_seq_};
+    rung = kernels_for_picks && rings && n == 1 && route_card_ring(il, ring);   // (one token's ring: one row)
+#endif
+    if (!kernels_for_picks || (!rung && !route_card(il, n, d_ids_, d_wts_))) {
         L.card = 0;
         return false;
     }
     L.card = 1;
-    const int rr = n * n_used_;
-    const void* const* table = d_slots_ + (size_t) il * n_expert_;
-    [[maybe_unused]] const bool rings = bell_ && n >= 1;
 #if !defined(STRATA_GPU_METAL)
-    if (rings) {   // the doorbell: the misses to the host / second card, a token's place under --tail-skip's
-        if (!block_pass_) count_picks(d_ids_, rr, n_expert_, d_use_ + (size_t) il * n_expert_, st_);
-        bell_ring(table, d_ids_, d_wts_, n_used_, opt_.tail_skip > 0 ? opt_.tail_skip : n_used_, il, xn_, h_x_, n_embd_,
-                  h_bell_, d_bell_seq_, st_, n);
+    if (rings) {
+        if (!rung) {
+            if (ring.uses) count_picks(d_ids_, rr, n_expert_, ring.uses, st_);
+            bell_ring(table, d_ids_, d_wts_, n_used_, ring.skip_from, il, xn_, h_x_, n_embd_, h_bell_, d_bell_seq_,
+                      st_, n);
+        }
         table = d_zslots_ + (size_t) il * n_expert_;
     } else if (!all_cached()) {   // card_far_: the experts it lacks, from the mirror into the staging buffer first
         far_plan(table, d_far_ + (size_t) il * n_expert_, d_ids_, rr, n_expert_, stage_, ahead_stride_, d_tab_,
@@ -5958,7 +5969,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     if (moe_sum_later(n)) moe_left_ = true;
     else moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
 #if !defined(STRATA_GPU_METAL)
-    if (rings) bell_add(h_bell_, d_bell_seq_, h_cpu_, fo_, n * n_embd_, st_);   // (bells(): no sum later then)
+    if (rings && !moe_sum_later(n)) bell_add(h_bell_, d_bell_seq_, h_cpu_, fo_, n * n_embd_, st_);   // (later: the family's)
 #endif
     return true;
 }

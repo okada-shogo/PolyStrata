@@ -2297,6 +2297,14 @@ void Inkling2::tail_rows(int il, int n) {
             return;
         }
         flush_pending_convs();
+#if !defined(STRATA_USE_HIP)
+        if (bell_) {   // and the doorbell's (a token: moe_sum_later()), as moe_sum(), bell_add() and ink_conv_add()
+            ink_moe_bell_conv_add(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, h_bell_, d_bell_seq_, h_cpu_,
+                                  past_f(run_slot(il, 0)), fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, n_embd_,
+                                  taps_, st_);
+            return;
+        }
+#endif
         if (can_fuse_next) {
             const Block& NB = blocks_[(size_t) next_il];
             const int next_pass = next_il >= core_start_ && next_il < core_end_ ? pass_ : 0;
@@ -2450,14 +2458,25 @@ void Inkling2::route_by(const float* logits, const float* bias, int* ids, float*
     }
 }
 
-bool Inkling2::route_card(int il, int n, int32_t* ids, float* w) {
+const float* Inkling2::card_bias(int il, int n) const {
     const Block& B = blocks_[(size_t) il];
     const float* bias = B.probs_b_dev.p ? fp(B.probs_b_dev) : nullptr;
     // a few tokens (moe_card()) with --cache-bias pick by slots_moved()'s bias; a prompt batch as before
     if (cache_b_ && n < kStageRows) bias = cache_b_ + (size_t) il * n_expert_;
-    route_rows(rl_, n_expert_, n_used_, n, 1, 1.f, bias, nullptr, true, w_scale_, ids, w, st_);
+    return bias;
+}
+
+bool Inkling2::route_card(int il, int n, int32_t* ids, float* w) {
+    route_rows(rl_, n_expert_, n_used_, n, 1, 1.f, card_bias(il, n), nullptr, true, w_scale_, ids, w, st_);
     return true;
 }
+
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+bool Inkling2::route_card_ring(int il, const BellRing& ring) {
+    route_ring(rl_, n_expert_, n_used_, 1, 1.f, card_bias(il, 1), nullptr, true, w_scale_, d_ids_, d_wts_, ring, st_);
+    return true;
+}
+#endif
 
 // No shared expert: the routed experts' sum starts from nothing (where layer_tail() sums them, it starts there).
 void Inkling2::moe_shared(const Layer&, int, int n) {

@@ -85,6 +85,9 @@ protected:
                       float* tmp) override;
     void slots_moved() override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+    bool route_card_ring(int il, const BellRing& ring) override;
+#endif
     void moe_shared(const Layer& L, int il, int n) override;
 
 private:
@@ -152,9 +155,14 @@ private:
     bool control_ffn_row(const float* msg, const Ctrl& c, const Block& B, int row);
     void guess_block(int32_t token) override;
     bool own_blocks() const override { return ds_file_ != nullptr; }
-    // only where moe_card() and layer_tail() are recorded together (whole_rec_), and not with the doorbell, whose
-    // experts' sum comes in after the card's
+    // only where moe_card() and layer_tail() are recorded together (whole_rec_).  With the doorbell, on CUDA a token's
+    // layer_tail() adds the host's sum too (ink_moe_bell_conv_add()); a few tokens' (--expert-gpu) and HIP's experts'
+    // sum comes in after the card's, as bell_add() adds it
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
     bool moe_sum_later(int n) const override { return n >= 1 && n <= kConvFew && whole_rec_ && !bell_; }
+#else
+    bool moe_sum_later(int n) const override { return n >= 1 && n <= kConvFew && whole_rec_ && (!bell_ || n == 1); }
+#endif
     bool bells() const override { return true; }
     // follow()'s half-life: 32 tokens, not 128.  Replayed on routing traces of 18 answers (code, chat and prose
     // after 2K-32K prompts, 512 tokens each, IQ4_NL on an 8 GB RTX 2070), the experts found in VRAM went from 80.7%
@@ -210,6 +218,8 @@ private:
     float w_scale_ = 0;
     float* cache_b_ = nullptr;   ///< --cache-bias: each layer's pick bias for the card (slots_moved())
     void route_by(const float* logits, const float* bias, int* ids, float* w, float* probs) const;
+    /// route_card()'s bias for layer il: the router's own, or for a few tokens with --cache-bias slots_moved()'s.
+    const float* card_bias(int il, int n) const;
     void cached_bias(const Layer& L, int il, float* b) const;
     uint32_t attn_type_ = 0;   ///< --attn-requant's type for the attention's matrices; 0: the file's
     bool unsloth_ = false;     ///< an "inkling2" file: block_count counts applications, the loop's names are Unsloth's

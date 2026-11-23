@@ -10,6 +10,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 
 #include "strata/poly/kernels.hpp"
+#include "bell.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -989,20 +990,34 @@ __global__ void ink_conv_add_rows_kernel(const float* x, InkStateRows state, con
                 norm, c);
 }
 
+// BELL: ink_moe_bell_conv_add()'s, bell_add_kernel's wait and sum between the experts' sum and the convolution
+template <bool BELL>
 __global__ void ink_moe_conv_add_kernel(const float* x, const float* w, const float* __restrict__ scale,
                                         const int* ids, int n_used,
                                         float* fo, float* state, const float* __restrict__ cw, float* __restrict__ out,
-                                        float* acc, float a, int channels, int taps, float norm) {
+                                        float* acc, float a, int channels, int taps, float norm,
+                                        const ExpertBell* bell, const uint32_t* seq, const float* hy) {
     pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
     pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= channels) return;
+    if (!BELL && i >= channels) return;
     float s = 0.0f;
-    for (int k = 0; k < n_used; ++k) {
+    for (int k = 0; k < n_used && i < channels; ++k) {
         const float wk = scale ? w[k] * scale[ids[k]] : w[k];   // expert_weights_kernel's product
         s += wk * x[size_t(k) * channels + i];
     }
-    fo[i] = 0.0f + s;   // moe_sum() onto the zeros fo was
+    float f = 0.0f + s;   // moe_sum() onto the zeros fo was
+    if (BELL) {
+        const uint32_t r = seq[1];
+        if (r != 0) {
+            if (threadIdx.x == 0) bell_wait(bell, r);
+            __syncthreads();
+            __threadfence_system();
+            if (i < channels) f = f + *(volatile const float*) (hy + i);
+        }
+        if (i >= channels) return;
+    }
+    fo[i] = f;
     const float y = conv_value(fo, state, cw, nullptr, channels, 1, taps, 0, i, norm);
     out[i] = y;
     conv_state_at(fo, state, channels, taps, 1, i);
@@ -3725,9 +3740,20 @@ void ink_moe_conv_add(const float* x, const float* w, const float* scale, const 
                       void* stream) {
     if (taps < 2 || taps > 8) throw std::invalid_argument("ink_moe_conv_add: 2 to 8 taps");
     const float norm = 1.0f / std::sqrt((float) (taps + 1));
-    launch_pdl(ink_moe_conv_add_kernel, dim3(grid((size_t) channels, 256)), dim3(256), 0, cs(stream), x, w, scale, ids,
-               n_used, fo, state, cw, out, acc, a, channels, taps, norm);
+    launch_pdl(ink_moe_conv_add_kernel<false>, dim3(grid((size_t) channels, 256)), dim3(256), 0, cs(stream), x, w,
+               scale, ids, n_used, fo, state, cw, out, acc, a, channels, taps, norm, (const ExpertBell*) nullptr,
+               (const uint32_t*) nullptr, (const float*) nullptr);
     launched("ink_moe_conv_add");
+}
+
+void ink_moe_bell_conv_add(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
+                           const ExpertBell* bell, const uint32_t* seq, const float* hy, float* state, const float* cw,
+                           float* out, float* acc, float a, int channels, int taps, void* stream) {
+    if (taps < 2 || taps > 8) throw std::invalid_argument("ink_moe_bell_conv_add: 2 to 8 taps");
+    const float norm = 1.0f / std::sqrt((float) (taps + 1));
+    launch_pdl(ink_moe_conv_add_kernel<true>, dim3(grid((size_t) channels, 256)), dim3(256), 0, cs(stream), x, w,
+               scale, ids, n_used, fo, state, cw, out, acc, a, channels, taps, norm, bell, seq, hy);
+    launched("ink_moe_bell_conv_add");
 }
 
 void ink_moe_conv_add_rows(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
