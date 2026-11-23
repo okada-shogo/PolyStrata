@@ -1212,6 +1212,7 @@ void Engine::metal_invalidate_graphs() {
     }
     passes_.clear();
     step_passes_.clear();
+    step_used_.clear();   // (destroyed with graphs_ above)
     tail_ = tail_picks_ = nullptr;
     for (Seq& q : seqs_) {
         q.heads.clear(); q.passes.clear(); q.tail = q.tail_picks = nullptr;
@@ -6470,7 +6471,15 @@ void* Engine::record(F&& work) {
     recording_ = false;
     ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
     cudaGraphExec_t exec = nullptr;
-    const cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    if (made == cudaErrorMemoryAllocation && !step_used_.empty()) {
+        // Inkling 2's step recordings (step_replay(): only where tail_by_rows()) give their place to this one: run()'s
+        // and step()'s other recordings.  Every family else has none, and fails here as before.
+        cudaGetLastError();
+        trim_step_graphs(0, !in_step_);
+        exec = nullptr;
+        made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    }
     cudaGraphDestroy(g);
     ck(made, "cudaGraphInstantiate");
     graphs_.push_back(exec);
@@ -6479,7 +6488,9 @@ void* Engine::record(F&& work) {
 
 // step()'s recording `in[key]` launched, made first if it is not there; false when `work` ran unrecorded instead.  A
 // recording that fails for memory has already run `work` on the host once (its launches captured, nothing run on the
-// card), so `work` runs again unrecorded: a step's host side is the same each time it is recorded or run.
+// card), so `work` runs again unrecorded: a step's host side is the same each time it is recorded or run (layer_head()
+// and layer_tail() keep no host state across a call: moe_left_ is never set in step(), whose whole_rec_ is false, and
+// next_layer() brings pass_ back to 0).  STRATA_POLY_STEP_RECORD_FAIL=N (tests) fails every Nth recording that way.
 bool Engine::step_replay(std::map<std::vector<int>, void*>& in, const std::vector<int>& key,
                          const std::function<void()>& work) {
     const auto it = in.find(key);
@@ -6490,6 +6501,7 @@ bool Engine::step_replay(std::map<std::vector<int>, void*>& in, const std::vecto
     }
     if (!g) {
         work();
+        ++step_unrecorded_;
         return false;
     }
     ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "layer graph");
@@ -6497,18 +6509,24 @@ bool Engine::step_replay(std::map<std::vector<int>, void*>& in, const std::vecto
     return true;
 }
 
-// record() for step_replay(), which takes the VRAM each recording holds into account.  A recording the card has no
-// memory for drops every step recording but this step's and tries again; failing still, it is not made (null), and
-// no step records again for 256 steps.
+// record() for step_replay(), with the step recordings held to a count (step_cap_).  The count, not the VRAM they
+// seem to take: cudaGraphExecDestroy() gives the driver's memory back to no cudaMemGetInfo(), and the recordings
+// made after a drop take the memory it kept, so a fixed number held keeps the VRAM flat where a sum of what
+// cudaMemGetInfo() showed would not.  A recording the card has no memory for drops every step recording but this
+// step's and tries again; failing still, it is not made (null), and no step records for the next 256 steps.
 void* Engine::record_step(const std::function<void()>& work) {
-    if (step_budget_ == 0) {
-        // the budget: a 64th of the card, 64 to 256 MiB (an 8 GB card's 128), or STRATA_POLY_STEP_GRAPH_MIB
+    if (step_cap_ == 0) {
+        // the cap: a recording is 220-250 KiB (an Inkling 2 layer's head or tail, RTX 2070 and 2080 Ti); 4 a MiB of a
+        // 64th of the card, 256 to 1,024 recordings (512, 128 MiB, on an 8 GB card), or STRATA_POLY_STEP_GRAPHS
         size_t free_b = 0, total_b = 0;
         ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-        size_t mib = std::clamp<size_t>(total_b >> 26, 64, 256);
-        if (const char* v = std::getenv("STRATA_POLY_STEP_GRAPH_MIB"); v && std::atoi(v) > 0) mib = (size_t) std::atoi(v);
-        step_budget_ = mib << 20;
+        step_cap_ = std::clamp<size_t>((total_b >> 26) * 4, 256, 1024);
+        if (const char* v = std::getenv("STRATA_POLY_STEP_GRAPHS"); v && std::atoi(v) > 0) step_cap_ = (size_t) std::atoi(v);
     }
+    static const int fail_every = [] {
+        const char* v = std::getenv("STRATA_POLY_STEP_RECORD_FAIL");
+        return v ? std::max(0, std::atoi(v)) : 0;
+    }();
     cudaGraph_t g = nullptr;
     ck(cudaStreamBeginCapture(cs(st_), cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
     recording_ = recorded_ = true;
@@ -6522,54 +6540,54 @@ void* Engine::record_step(const std::function<void()>& work) {
     }
     recording_ = false;
     ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
+    const bool forced = fail_every > 0 && ++step_tries_ % (uint64_t) fail_every == 0;
     size_t f0 = 0, f1 = 0, total = 0;
     ck(cudaMemGetInfo(&f0, &total), "cudaMemGetInfo");
     cudaGraphExec_t exec = nullptr;
-    cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    cudaError_t made = forced ? cudaErrorMemoryAllocation : cudaGraphInstantiateWithFlags(&exec, g, 0);
     if (made == cudaErrorMemoryAllocation) {
         cudaGetLastError();
-        trim_step_graphs(0);
+        trim_step_graphs(0, false);
         ck(cudaMemGetInfo(&f0, &total), "cudaMemGetInfo");
         exec = nullptr;
-        made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+        made = forced ? cudaErrorMemoryAllocation : cudaGraphInstantiateWithFlags(&exec, g, 0);
     }
     cudaGraphDestroy(g);
     if (made == cudaErrorMemoryAllocation) {
         cudaGetLastError();
-        step_rec_retry_ = step_no_ + 256;
-        std::fprintf(stderr, "strata-poly: no VRAM for a step's recording: the steps run unrecorded for a while\n");
+        step_rec_retry_ = step_no_ + (forced ? 1 : 256);
+        if (!forced)
+            std::fprintf(stderr, "strata-poly: no VRAM for a step's recording: the steps run unrecorded for a while\n");
         return nullptr;
     }
     ck(made, "cudaGraphInstantiate");
     ck(cudaMemGetInfo(&f1, &total), "cudaMemGetInfo");
-    step_bytes_ += f0 > f1 ? f0 - f1 : 0;
+    if (step_dropped_ == 0) step_bytes_ += f0 > f1 ? f0 - f1 : 0;   // (for the log: right only until the first drop)
     graphs_.push_back(exec);
     step_used_[exec] = step_no_;
-    if (step_bytes_ > step_budget_) trim_step_graphs(step_budget_ / 4 * 3);
-    // what they take, for the budget: a line each time the count doubles
-    if (step_used_.size() >= 2 * std::max<size_t>(step_logged_, 128)) {
+    ++step_made_;
+    if (step_used_.size() > step_cap_) trim_step_graphs(step_cap_ / 4 * 3, false);
+    if (step_dropped_ == 0 && step_used_.size() >= 2 * std::max<size_t>(step_logged_, 128)) {   // the size, for the cap
         step_logged_ = step_used_.size();
-        std::fprintf(stderr, "strata-poly: step recordings: %zu held, %.1f MiB (%.0f KiB each), %zu dropped, budget %zu MiB\n",
+        std::fprintf(stderr, "strata-poly: step recordings: %zu held, %.1f MiB (%.0f KiB each), cap %zu\n",
                      step_used_.size(), step_bytes_ / 1048576.0, step_bytes_ / 1024.0 / (double) step_used_.size(),
-                     step_dropped_, step_budget_ >> 20);
+                     step_cap_);
     }
     return exec;
 }
 
-// The step recordings launched longest ago go, but none of this step's, until the VRAM they hold, at their average
-// size, is at most `target`.  Those are done on the card: step() waits for the step before it first.
-void Engine::trim_step_graphs(size_t target) {
-    if (step_used_.empty() || step_bytes_ <= target) return;
+// The step recordings launched longest ago go until `keep` are held: never this step's own (`all`: every one, from
+// outside step(), where none is under way).  Those are done on the card: step() waits for the step before it first.
+void Engine::trim_step_graphs(size_t keep, bool all) {
+    if (step_used_.size() <= keep) return;
     std::vector<std::pair<uint64_t, void*>> old;
     for (const auto& [g, used] : step_used_)
-        if (used != step_no_) old.push_back({used, g});
+        if (all || used != step_no_) old.push_back({used, g});
     std::sort(old.begin(), old.end());
-    const size_t each = std::max<size_t>(1, step_bytes_ / step_used_.size());
     std::set<void*> gone;
     for (const auto& [used, g] : old) {
-        if (step_bytes_ <= target) break;
+        if (step_used_.size() - gone.size() <= keep) break;
         gone.insert(g);
-        step_bytes_ -= std::min(step_bytes_, each);
     }
     if (gone.empty()) return;
     const auto drop = [&](std::map<std::vector<int>, void*>& in) {
@@ -6587,6 +6605,9 @@ void Engine::trim_step_graphs(size_t target) {
         step_used_.erase(g);
     }
     step_dropped_ += gone.size();
+    std::fprintf(stderr, "strata-poly: step recordings: dropped %zu, %zu held (cap %zu); %zu made, %zu dropped, %zu runs "
+                         "unrecorded in all\n",
+                 gone.size(), step_used_.size(), step_cap_, step_made_, step_dropped_, step_unrecorded_);
 }
 
 // n tokens from pos() through every layer.  The sequence is not longer for it: the caller says by how much.
@@ -6882,6 +6903,10 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     // step_picks() asks this step only: taken first, so a step that throws (KvFull below) leaves no ask for the next
     const bool picks = std::exchange(step_picks_, false) && d_picks_;
     ++step_no_;   // (step_replay()'s clock)
+    struct InStep {
+        bool& on;
+        ~InStep() { on = false; }
+    } in_step{in_step_ = true};
     if (n < 1 || n > std::min(rows_, sequences())) throw std::logic_error("step takes 1 to sequences() tokens");
     if (guesses && !steps_guesses()) throw std::logic_error("step: guesses need --batch-mtp, a draft block and one card");
     if (!step_seqs_.empty()) throw std::logic_error("step: the rows of the step before are not kept yet (keep_step())");
