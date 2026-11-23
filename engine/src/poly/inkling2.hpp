@@ -75,6 +75,10 @@ protected:
     // the runs a group at a time.  With the drafter, its taps of three runs and the final normed state too, which
     // ds_commit() reads at the call's last layer run (ds_tap_'s four blocks).
     int carry_rows() const override { return kBlocks + 2 + (ds_file_ ? kDsTaps : 0) + (loopcd_hidden_ != 0.f ? 2 : 0); }
+    // A read gives up hundreds of cached experts (the carried rows, the wider staging buffer) and the next request
+    // takes them back: with a copy of each kept in pinned memory they need no copy back from the card, and none goes
+    // to the card through the two pinned buffers, whose turns wait behind the next layer run's experts (prestage).
+    bool full_mirror_default() const override { return true; }
     void carry_at(float* at) override;
     float* carried(int i) override;
     void save_run(int il, int64_t pos, uint8_t* dst) override;
