@@ -34,7 +34,7 @@ const char* const kUsage =
     "  --out DIR              where the .f32 files go (default .)\n"
     "  --vocab N              write a row's first N scores (Inkling 2: 200058, the unpadded vocabulary)\n"
     "  --max-context N        the engine's context (default 4096)\n"
-    "  --prompt-batch N       the prompt's tokens a call, as strata-poly's\n"
+    "  --prompt-batch N|auto|auto:N  the prompt's tokens a call, as strata-poly's (default 1024)\n"
     "  --kv fp16|fp8          the attention caches' format, as strata-poly's\n"
     "  --threads N            the CPU experts' threads\n"
     "  --no-graphs            no recorded launches\n"
@@ -150,7 +150,12 @@ int main(int argc, char** argv) {
             else if (a == "--out") out = val();
             else if (a == "--vocab") vocab = number(a, val(), 0);
             else if (a == "--max-context") o.max_context = number(a, val(), 1);
-            else if (a == "--prompt-batch") o.prompt_batch = number(a, val(), 1);
+            else if (a == "--prompt-batch") {
+                const std::string v = val();
+                if (v == "auto") o.prompt_batch = 0;
+                else if (v.rfind("auto:", 0) == 0) o.prompt_batch = 0, o.prompt_batch_max = number(a, v.c_str() + 5, 1);
+                else o.prompt_batch = number(a, v.c_str(), 1);
+            }
             else if (a == "--kv") {
                 const std::string f = val();
                 if (f == "fp16") o.kv_format = strata::poly::KvFmt::kFp16;
