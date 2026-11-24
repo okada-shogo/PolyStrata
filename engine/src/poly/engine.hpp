@@ -67,6 +67,10 @@ struct Options {
     int max_context = 8192;
     int threads = 0;              ///< 0: the CPUs this process may use
     int vram_reserve_mib = -1;    ///< left free after the expert cache is filled; below 0: by the card's size
+    /// --vram-elastic (opt-in): the expert cache keeps its whole reserve free while it serves - it gives VRAM back to
+    /// another program that takes some (between requests, and while the engine waits for one: main.cpp's idle watch)
+    /// and takes it again when it is free, the experts it gave up first; the VRAM command resizes it the same way
+    bool vram_elastic = false;
     bool vram_pool = false;       ///< one pool of VRAM claimed at load, kept for the whole run: the expert cache and the
                                   ///< attention caches trade pieces of it and nothing is given back to the card; the
                                   ///< reserve above is then the margin left outside it (needs VMM)
@@ -441,6 +445,14 @@ public:
     /// Between requests: the cache gives up VRAM when little is free, and takes VRAM that came free (see the
     /// definition for how much stays free).  True when it changed.
     bool mind_vram();
+    /// --vram-elastic: mind_vram() while the engine waits for its next line (between requests, no batch slot writing).
+    /// A freeze (STRATA_FREEZE_EXPERTS) gives way to it as to the VRAM command.  True when the cache changed.
+    bool idle_vram(bool served);
+    /// --vram-elastic: the VRAM command - keep `mib` free (below 0: the reserve load() was given), the cache shrunk or
+    /// grown a piece at a time rather than filled again.
+    void elastic_resize(int mib);
+    bool elastic() const { return opt_.vram_elastic && vmm_ && !pool_on_; }
+    bool elastic_asked() const { return opt_.vram_elastic; }
     /// At a request's start, the engine at the furthest point of its `end` tokens it could come back to: the
     /// attention caches give back the rows past `end` that the request before did not reach either.  One long
     /// request leaves them grown, and the expert cache would stay that much smaller for every request after it.
@@ -1220,6 +1232,12 @@ protected:
     int reserve_mib_ = 0;        ///< what the cache was sized to leave free
     bool ram_tight_ = false;     ///< the machine's RAM is within 5 GiB of the model's files (fill_expert_cache())
     int minds_ = 0;              ///< mind_vram()'s calls
+    /// --vram-elastic: [layer * n_expert + expert] set for each expert an elastic shrink took out of the cache, which a
+    /// grow brings back first (the cache before the shrink and after the grow holds the same experts); empty until one
+    std::vector<uint8_t> gave_back_;
+    bool give_back_ = false;     ///< shrink_cache() is an elastic one: it notes what it takes out (gave_back_)
+    bool idle_ = false;          ///< idle_vram() is running (its grows are capped)
+    bool elastic_card(int64_t free_mib, bool exact);   ///< --vram-elastic: mind_card_vram()'s and the VRAM command's step
     int full_cached_ = 0;        ///< the cache as load() filled it: its experts and their bytes
     size_t full_bytes_ = 0;
     float* scratch_ = nullptr;
