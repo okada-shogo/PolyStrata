@@ -4,6 +4,8 @@
     python polystrata.py --list-models
     python polystrata.py --model <name>                chat with it; /model in the chat changes it
     python polystrata.py benchmark --model <name>      speeds, memory and cache figures, as a table and as JSON
+    python polystrata.py bench-report --model <name>   the engine's own report to post: probes, speeds, where the
+                                                       GPU's time goes (strata-poly models; the server stopped)
 
 A model is one that setup installed (its run config, strata-<name>.json, is beside this file).  One model is in
 memory at a time.  With a server already running on the port, --model switches that server to the model; without
@@ -200,9 +202,55 @@ def benchmark(a) -> int:
     return 0
 
 
+def bench_report(a) -> int:
+    """strata-poly --bench-report with the model's own settings (its run config, as the server starts it)."""
+    entry = entry_of(a.model)
+    cfg = json.loads(Path(entry["config"]).read_text(encoding="utf-8-sig"))
+    from serve import server as srv
+    if not srv.poly_engine(cfg):
+        raise SystemExit(f"polystrata: {entry['id']} runs on the Strata project's engine: bench-report is strata-poly's")
+    port = port_of(entry, a.port)
+    code, _ = terminal.api(f"http://127.0.0.1:{port}", "/health", None, a.api_key, timeout=3)
+    if code:
+        raise SystemExit(f"polystrata: a server answers on port {port}: stop it first, the report needs the GPU to itself")
+    exe = srv._component_exe(cfg["exe"], cfg) if srv.engine_component.is_reference(cfg["exe"]) else srv.engine_exe(cfg)
+    args = [x for x in srv.engine_args(cfg, exe, announce=False) if x != "--serve"]
+    out = os.path.abspath(a.out or "bench-report")
+    cmd = [exe, *args, "--bench-report", out] + (["--long"] if a.long else [])
+    # the prompts: bench_text's fixed English, in the model's own tokens (random token ids where there is no tokenizer)
+    import tempfile
+    import bench_text
+    tok = srv.load_tokenizer(Path(cfg["tokenizer"])) if cfg.get("tokenizer") else None
+    ids_file = None
+    if tok is None:
+        print("(no tokenizer in the run config: the prompts are random tokens, which route unlike real text)")
+    else:
+        ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 8192
+        ids = bench_text.tokens(tok, 12000 + (ctx if a.long else 0))
+        fd, ids_file = tempfile.mkstemp(prefix="bench-text-", suffix=".ids")
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(",".join(map(str, ids)))
+        cmd += ["--bench-text", f"{ids_file}@bench_text v{bench_text.VERSION} (synthetic English, fixed seed)"]
+    if a.dry_run:
+        print(" ".join(cmd))
+        if ids_file:
+            os.unlink(ids_file)
+        return 0
+    print(f"bench report of {entry['id']} with its own settings: about a minute after the model loads on an RTX 2070 Super, more on a slower card"
+          + (", and the long conversation after that" if a.long else ""), flush=True)
+    try:
+        rc = subprocess.call(cmd, env=srv.child_env(cfg), cwd=cfg.get("cwd") or None)
+    finally:
+        if ids_file:
+            os.unlink(ids_file)
+    if rc == 0:
+        print(f"written: {out}.json and {out}.md; post them with the \"Bench report\" issue form")
+    return rc
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", nargs="?", choices=["chat", "benchmark"], default="chat")
+    ap.add_argument("command", nargs="?", choices=["chat", "benchmark", "bench-report"], default="chat")
     ap.add_argument("--list-models", action="store_true", help="the installed models, and which is in memory")
     ap.add_argument("--model", help="a model's name, as --list-models shows it (a part of it is enough when only "
                                     "one name has it)")
@@ -213,6 +261,9 @@ def main() -> int:
     ap.add_argument("--prompt-tokens", type=lambda s: [int(x) for x in s.split(",")], default=[2000, 8000],
                     help="benchmark: the long prompts' sizes in tokens, roughly (default 2000,8000)")
     ap.add_argument("--json", help="benchmark: also write the figures to this file")
+    ap.add_argument("--out", help="bench-report: the files' name without .json / .md (default: bench-report here)")
+    ap.add_argument("--long", action="store_true", help="bench-report: add one long conversation read in chunks")
+    ap.add_argument("--dry-run", action="store_true", help="bench-report: print the engine's command, run nothing")
     a = ap.parse_args()
     if a.list_models:
         return list_models(a.port, a.api_key)
@@ -221,6 +272,8 @@ def main() -> int:
     if a.command == "benchmark":
         a.max_tokens = a.max_tokens or 256
         return benchmark(a)
+    if a.command == "bench-report":
+        return bench_report(a)
     entry = entry_of(a.model)
     srv = Server(entry, port_of(entry, a.port), a.api_key)
     try:
