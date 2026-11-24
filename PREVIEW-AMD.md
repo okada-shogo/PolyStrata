@@ -49,25 +49,48 @@ Windows: `START-HERE.bat --setup --family inkling` compiles `strata-poly.exe` fr
 Windows wheels (ROCm 10.2). **We have not built or run this branch on Windows.** main's Windows HIP build works
 (#323), and this branch adds no Windows-only code. Please report if it does not build.
 
-## Recommended settings (16 GB cards)
+## Run it for best speed
+
+int8 prompt products are on by default (auto: the int8 kernel for every type it takes, RDNA3 and RDNA4). You don't
+need to set anything for it. It rounds the activations to int8 with a scale per 32 values: the same rounding class as
+llama.cpp's MMQ, PolyStrata 0.1.45 and CUDA's default on Ampere and newer. `STRATA_POLY_HIP_INT8=0` gives main's path.
+
+**Linux, native (fastest).** ROCm 7.2.x recommended. No small-card flags. The default window and `--prompt-batch auto`
+need no flags either:
 
 ```
-./build/strata-poly --model Inkling-2-Mini-IQ4_NL.gguf --serve --max-context 32768 --threads <cores - 1>
+./build/strata-poly --model Inkling-2-Mini-IQ4_NL.gguf --serve --max-context 32768 --threads $(( $(nproc --all) / 2 - 1 ))
 ```
 
-- int8 prompt products are on by default here: on RDNA3 (gfx11) and RDNA4 (gfx12), every prompt product of a type
-  the int8 kernel takes runs on the int8 matrix cores. main uses FP16 tiles on RDNA3, and on RDNA4 it dequantizes
-  each expert to FP16 and multiplies it through rocBLAS / hipBLASLt, one call per expert, which is slow, more so on
-  ROCm 10.x.
-  The activations are rounded to int8 (a scale per 32 values): the same rounding class as llama.cpp's MMQ, PolyStrata
-  0.1.45, and CUDA's default on Ampere and newer. `STRATA_POLY_HIP_INT8=0` turns it off (main's path).
-- No small-card flags. Setup adds `--attn-requant q5_0 --loop-bf16 --tail-skip 4` on any card that does not hold every
-  expert. They exist for 8 GB cards. `--tail-skip 4` skips some experts entirely, so the answers change. On a 16 GB
-  card the decode below is reached without them. Use `--inkling-small-card off` with setup, or remove the three flags
-  from the run config (docs/models/inkling.md).
-- Linux desktop on the same card: leave the default reserve, or `--vram-elastic` so the cache gives VRAM back when
-  the desktop takes more.
-- Windows: setup's run config, with `--inkling-small-card off` on a 16 GB card.
+`--threads` is the physical cores minus one. On a 16 GB card add the DSpark drafter
+([dspark-Inkling-2-Mini-Q8_0.gguf](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/dspark-Inkling-2-Mini-Q8_0.gguf), 400 MB):
+
+```
+  --draft-model dspark-Inkling-2-Mini-Q8_0.gguf
+```
+
+On our RX 9070 XT (with an earlier combined build, without #306) it wrote 121-124 tok/s on IQ4_NL and 143-155 on
+UD-Q2_K_XL after 2K-8K prompts, against 64-73 without. After a short prompt it can be a few percent slower (IQ4_NL
+after 302: 68.0 against 70.3). With a desktop on the same card, add `--vram-elastic`: the expert cache then gives VRAM back when
+the desktop takes more.
+
+**Windows.** `START-HERE.bat --setup --family inkling` builds and writes the run config. On a 16 GB card, remove
+`--attn-requant q5_0`, `--loop-bf16` and `--tail-skip 4` from its `"args"`, or run setup with
+`--inkling-small-card off`. They are for 8 GB cards, and `--tail-skip` skips experts, so it changes the answers.
+Setup installs AMD's TheRock ROCm 10.2. We measured main's prompts much slower with it (below). The int8 default
+may avoid most of that, but this is not confirmed. The ROCm 10 work is not in this preview.
+
+**Reporting.** So that reports compare, please post these four runs (one request each, the same prompt) as one
+table:
+
+| Run | Settings | Prompt (tok/s) | Decode (tok/s) |
+|---|---|---:|---:|
+| 1 | default | | |
+| 2 | `STRATA_POLY_HIP_INT8=0` | | |
+| 3 | default + `--draft-model` | | |
+| 4 | default, `STRATA_POLY_BELL=0` | | |
+
+Add the card, OS, ROCm version, model file and the "N of 3072 routed experts in VRAM" line of the log.
 
 ## Speed to expect
 
