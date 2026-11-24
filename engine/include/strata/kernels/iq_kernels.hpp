@@ -40,6 +40,8 @@ void iq_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_o
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale = nullptr);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
+/// Loads this file's kernels (CUDA loads them at the first launch otherwise), so that the first launch does not wait.
+void iq_kernels_load();
 /// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
 /// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
 void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok,

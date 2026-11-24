@@ -77,6 +77,8 @@ void ink_gate(const float* cur, const float* msg, const float* gain, const float
 /// state at snap + j * snap_stride floats (a window's snapshots: Engine::snap_at_).
 void ink_conv(const float* x, float* state, const float* w, const float* dyn, float* out, int channels, int heads,
               int taps, int rows, void* stream, float* snap = nullptr, size_t snap_stride = 0, unsigned snap_bits = 0);
+/// Loads this file's kernels (CUDA loads them at the first launch otherwise), so that the first launch does not wait.
+void ink_kernels_load();
 
 /// One token's ink_conv() (no dyn, one head) and its state, out written, then the stream acc updated: mode 0
 /// acc = acc + out * a (axpy()), mode 1 keep = acc and then acc = out, mode 2 acc = out.  The same bits.

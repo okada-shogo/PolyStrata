@@ -3758,6 +3758,19 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
     launch_check();
 }
 
+// CUDA loads a file's kernels at the first launch of one of them (lazy loading, the default since CUDA 12.2): 50 to
+// 70 ms for this file's on an RTX 2070 Super, inside the first prompt.  Asking for a kernel's attributes loads them
+// here instead.  A card the file has no code for answers with an error, which is not kept.
+void native_mmvq_load() {
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)   // (HIP builds keep the first launch's load)
+    // an error an earlier launch left is not this call's to clear: it stays for the caller to see
+    if (cudaPeekAtLastError() != cudaSuccess) return;
+    cudaFuncAttributes a{};
+    if (cudaFuncGetAttributes(&a, (const void*) native_add_rms_norm_q8_1_kernel<1024>) != cudaSuccess)
+        (void) cudaGetLastError();
+#endif
+}
+
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, QK);
