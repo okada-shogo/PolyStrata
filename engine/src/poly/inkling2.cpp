@@ -556,7 +556,9 @@ void Inkling2::guess_block(int32_t token) {
     input(token, pos_, h_ds_row_);
     for (int t = 0; t < kDsRows; ++t) h_ds_at_[2 * t] = pos_ + t;
     h_ds_at_[2 * kDsRows] = token;
-    if (opt_.graphs && !prompt_scratch_) {   // the recording holds the few tokens' scratch
+    // (unrecorded where the card has no VRAM for the recording: instantiate(), graph_room())
+    // (the recording holds the few tokens' scratch)
+    if (opt_.graphs && !prompt_scratch_ && (ds_graph_[nb] || (rec_off_ == 0 && !rec_short_))) {
         void*& g = ds_graph_[nb];
         if (!g) {
             cudaGraph_t graph = nullptr;
@@ -569,15 +571,14 @@ void Inkling2::guess_block(int32_t token) {
                 throw;
             }
             ck(cudaStreamEndCapture(cs(st_), &graph), "cudaStreamEndCapture");
-            cudaGraphExec_t exec = nullptr;
-            const cudaError_t made = cudaGraphInstantiateWithFlags(&exec, graph, 0);
+            void* exec = instantiate(graph);
             cudaGraphDestroy(graph);
-            ck(made, "cudaGraphInstantiate");
-            graphs_.push_back(exec);
+            if (exec) graphs_.push_back(exec);
             g = exec;
             recorded_ = true;
         }
-        ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "the drafter");
+        if (g) ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "the drafter");
+        else ds_block(nb);
     } else {
         ds_block(nb);
     }
