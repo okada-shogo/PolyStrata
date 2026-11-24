@@ -413,13 +413,21 @@ struct RmsMany {
     float* y[3];
 };
 
+// The input's pointers are picked by comparisons, not by m.x[blockIdx.y]: indexed by a register, the parameters
+// were copied to local memory by every block, and the pointers read from there made the loads generic ones that
+// do not go through the read-only cache.  That took 236 ns a row on the RTX 2070 Super where rms_norm_kernel took
+// 85.  The sums are the same.
+template <class T>
+__device__ __forceinline__ T rms_pick(const T (&p)[3], int j) {
+    return j == 0 ? p[0] : j == 1 ? p[1] : p[2];
+}
+
 __global__ void rms_norm_many_kernel(RmsMany m, int n, float eps) {
     __shared__ float part[32];
-    const float* __restrict__ x = m.x[blockIdx.y];
-    const float* __restrict__ w = m.w[blockIdx.y];
-    float* y = m.y[blockIdx.y];
-    const float* xr = x + size_t(blockIdx.x) * n;
-    float* yr = y + size_t(blockIdx.x) * n;
+    const int j = blockIdx.y;
+    const float* __restrict__ xr = rms_pick(m.x, j) + size_t(blockIdx.x) * n;
+    const float* __restrict__ w = rms_pick(m.w, j);
+    float* yr = rms_pick(m.y, j) + size_t(blockIdx.x) * n;
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
     ss = block_sum(ss, part);

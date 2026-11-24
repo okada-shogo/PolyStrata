@@ -893,6 +893,24 @@ void case_norms() {
         compare(fmt("rms_norm_many input %d against the reference", j), ys2[(size_t) j].get(),
                 h_rms_norm(hx[(size_t) j].data(), hw[(size_t) j].data(), kEmbd, 1, kEps), 1e-5);
     }
+    // rms_norm_many() of several rows, each input's = rms_norm()'s of it, bit for bit (the prompt's three norms)
+    for (const int rows : {5, 300}) {
+        std::vector<Dev<float>> mx, mw, my, my2;
+        const float* mxp[3];
+        const float* mwp[3];
+        float* myp[3];
+        for (int j = 0; j < 3; ++j) {
+            mx.emplace_back(randv((size_t) rows * kEmbd, 1.0f + j)), mw.emplace_back(randv(kEmbd, 0.2f, 1.0f));
+            my.emplace_back((size_t) rows * kEmbd), my2.emplace_back((size_t) rows * kEmbd);
+            mxp[j] = mx.back(), mwp[j] = mw.back(), myp[j] = my.back();
+        }
+        rms_norm_many(mxp, mwp, myp, 3, kEmbd, rows, kEps, stream());
+        for (int j = 0; j < 3; ++j) {
+            rms_norm(mx[(size_t) j], mw[(size_t) j], my2[(size_t) j], kEmbd, rows, kEps, stream());
+            same_bits(fmt("rms_norm_many %d rows, input %d = rms_norm()", rows, j), my[(size_t) j].get(),
+                      my2[(size_t) j].get());
+        }
+    }
     // ink_gate_norm_q8()
     const auto cur = randv(kEmbd, 1.0f), msg = randv(kEmbd, 1.0f), g = randv(kEmbd, 1.0f), f = randv(kEmbd, 1.0f),
                w = randv(kEmbd, 0.2f, 1.0f);
