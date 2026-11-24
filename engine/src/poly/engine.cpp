@@ -8493,6 +8493,9 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     if (n_co > 0 && !co_reads()) throw std::logic_error("read: co-reads are one card's, where a read is several calls");
     OnCard prof_card(device_, split_);   // the profiler's events go on this card's stream
     const ProfCall prof_call(*this, n);
+    // the host's setup before the read's first launch (the attention caches' growth, the prompt's buffers and staging
+    // taken back from the expert cache): the stream idles meanwhile, so it is not the copies' time
+    pmark(prof::kHostSetup);
     // (a read of no tokens of its own takes co-reads: a request whose prompt the conversation holds but its last token)
     if (n < (n_co > 0 ? 0 : 1) || all > read_rows_)
         throw std::logic_error("read takes 1 to max_read() tokens, co-reads among them");
@@ -8585,6 +8588,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     if (n_co == 0 &&
         (n_calls == 1 || !mmq_ || all_cached() || all < opt_.stage_ahead || !(reads_by_layer() || groups))) {
         turn = share_to(n_layer_);   // eval() takes the calls through the cards after this one
+        pmark(prof::kCopyH2D);   // the first call's embeddings, as a call's own start marks them
         // On several cards the next one takes a call on a thread of its own, while this one runs the call after
         // it.  Each card runs the calls as eval() does, in the same order.
         Behind behind;
@@ -8654,7 +8658,10 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     ck(cudaStreamSynchronize(cs(st_)), "read");
     lock_settle();
     if (n_swap_ > 0) follow(0);
-    if (groups) return read_groups(marks, n_marks, turn, n);
+    if (groups) {
+        pmark(prof::kCopyH2D);
+        return read_groups(marks, n_marks, turn, n);
+    }
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row, r_bytes = r_row * sizeof(float);
     const size_t part = (size_t) std::max(streams(), draft_ ? 3 : 1) * rows_ * e_row;   // a call's rows of r_
     float* const r0 = r_;
@@ -8666,6 +8673,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         h_res_rows_ = std::min(read_rows_, (all + 4095) / 4096 * 4096);
         h_res_ = (float*) hmalloc((size_t) h_res_rows_ * r_bytes, "pinned memory");
     }
+    pmark(prof::kCopyH2D);
     const auto home = [&](int p) { return h_res_ + (size_t) packs_[(size_t) p].at * r_row; };
     const auto half = [&](int p) { return r0 + (size_t) (host ? p % 2 : p) * part; };
     // pack p's rows back into its half of r_, behind whatever the stream has there of the half's last pack

@@ -212,6 +212,7 @@ Diagnosis diagnose_one(const Report& r, const std::string& phase, const std::str
     g.wait_cpu_ms = split.fam_ms[prof::kWaitCpu] / split_per;
     g.wait_upload_ms = split.fam_ms[prof::kWaitUpload] / split_per;
     g.host_gap_ms = split.fam_ms[prof::kHostGap] / split_per;
+    const double setup_ms = split.fam_ms[prof::kHostSetup] / split_per;
     const double looked = (double) (all.gpu_experts + all.cpu_experts) + all.staged_experts;
     if (looked > 0) g.hit_rate = (double) all.gpu_experts / looked;
     g.cpu_gb = all.cpu_expert_bytes / all_per / 1e9;
@@ -256,6 +257,7 @@ Diagnosis diagnose_one(const Report& r, const std::string& phase, const std::str
                         "): the card idles while the host routes";
         else if (f == prof::kWaitUpload) v.verdict = "waiting on expert uploads";
         else if (f == prof::kHostGap) v.verdict = "idle: the host between calls";
+        else if (f == prof::kHostSetup) v.verdict = "idle: the host setting the read up";
         else if (v.launches > 0 && fam_direct_bound && r.launches_wrapped)
             v.verdict = "launch-bound (" + fmt("%.1f", v.avg_kernel_us) + " us a kernel, the probed floor " +
                         fmt("%.1f", k_us) + " us)";
@@ -286,6 +288,9 @@ Diagnosis diagnose_one(const Report& r, const std::string& phase, const std::str
         rec.push_back({g.round_trip_ms, "fewer host round trips (" + fmt("%.0f", g.round_trips) + " " + unit +
                                             "): routing on the card, or the host's experts behind a doorbell"});
     if (g.host_gap_ms > 0.05) rec.push_back({g.host_gap_ms, "less host work between calls"});
+    if (setup_ms > 0.05)
+        rec.push_back({setup_ms, "less host setup before a read (the caches' growth, staging taken back from the expert "
+                                 "cache)"});
     std::sort(rec.begin(), rec.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     if (rec.size() > 3) rec.resize(3);
     g.recover = rec;
@@ -387,6 +392,14 @@ std::vector<Finding> explain(const Report& r) {
         if (gap > 0.05) {
             Finding f{ph, pct(gap) + " of the GPU's time it is idle between calls (the host's own work)"};
             f.flag = gap > 0.15;
+            out.push_back(f);
+        }
+        const double setup = share(a, prof::kHostSetup);
+        if (setup > 0.05) {
+            Finding f{ph, pct(setup) + " of the GPU's time (" + fmt("%.0f", a.fam_ms[prof::kHostSetup]) +
+                              " ms) it is idle while the host sets a read up (the caches' growth, staging taken back "
+                              "from the expert cache)"};
+            f.flag = setup > 0.15;
             out.push_back(f);
         }
         if (cpu > 0.05) {
