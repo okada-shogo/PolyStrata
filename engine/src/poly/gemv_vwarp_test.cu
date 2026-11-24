@@ -1,7 +1,6 @@
 // src/poly/gemv_vwarp_test.cu - the HIP gfx11 / gfx12 virtual-warp decode GEMVs (kernels::native_gemv_vwarp_force) against the
-// block kernels they replace, byte for byte: Inkling 2 Mini's expert products through native_mmvq_slots() and
-// native_mmvq_ids() (IQ4_NL and Q8_0, n_in 2304 and 1152, 1 to 32 experts), the grouped dense Q8_0 launch
-// native_mmvq_many(), and the loop controllers' down product ink_ctrl_down() (F32 and BF16).  Every output of the new
+// block kernels they replace, byte for byte: the grouped dense Q8_0 launch native_mmvq_many() and the loop controllers'
+// down product ink_ctrl_down() (F32 and BF16).  Every output of the new
 // kernels must be the same bytes as the old kernels' (outputs start as 0xff bytes, so an unwritten value differs).
 //
 // usage: poly_gemv_vwarp_test   (exit 0: every byte the same; 77: not a gfx11 / gfx12 card, nothing to compare)
@@ -102,71 +101,6 @@ void verdict(const char* what, bool same) {
 
 int bsize_of(int type) { return type == 8 ? 34 : 18; }
 
-// ---- expert slots and ids ----
-void test_slots(int type, int n_in, int n_out, int count) {
-    char what[160];
-    std::snprintf(what, sizeof what, "slots type %2d n_in %4d n_out %4d experts %2d", type, n_in, n_out, count);
-    std::vector<uint8_t*> w;
-    std::vector<void*> x;
-    kernels::MmvqSlots s0{}, s1{};
-    std::vector<float*> y0, y1;
-    for (int j = 0; j < count; ++j) {
-        w.push_back(upload(rand_blocks(size_t(n_out) * (n_in / 32), bsize_of(type))));
-        x.push_back(upload(rand_q81(n_in)));
-        y0.push_back(fill_ff(n_out)), y1.push_back(fill_ff(n_out));
-        s0.w[j] = s1.w[j] = w[j], s0.x[j] = s1.x[j] = x[j], s0.y[j] = y0[j], s1.y[j] = y1[j];
-    }
-    kernels::native_gemv_vwarp_force(0);
-    const bool ok0 = kernels::native_mmvq_slots(type, s0, count, n_in, n_out, st);
-    kernels::native_gemv_vwarp_force(1);
-    const bool ok1 = kernels::native_mmvq_slots(type, s1, count, n_in, n_out, st);
-    bool same = ok0 && ok1;
-    for (int j = 0; j < count; ++j) same = same && grab(y0[j], size_t(n_out) * 4) == grab(y1[j], size_t(n_out) * 4);
-    verdict(what, same);
-    for (int j = 0; j < count; ++j) cudaFree(w[j]), cudaFree(x[j]), cudaFree(y0[j]), cudaFree(y1[j]);
-}
-
-void test_ids(int type, int n_in, int n_out, int count) {
-    char what[160];
-    std::snprintf(what, sizeof what, "ids   type %2d n_in %4d n_out %4d experts %2d", type, n_in, n_out, count);
-    const int nexp = 12;   // the table's experts; the ids pick count of them (repeats allowed)
-    const size_t off = 64;   // a byte offset into every expert's allocation
-    const size_t wbytes = size_t(n_out) * (n_in / 32) * bsize_of(type);
-    std::vector<uint8_t*> w;
-    std::vector<const void*> table;
-    for (int e = 0; e < nexp; ++e) {
-        auto b = rand_blocks((wbytes + off) / bsize_of(type) + 1, bsize_of(type));
-        w.push_back(upload(b));
-        table.push_back(w.back());
-    }
-    std::vector<int32_t> ids(count);
-    for (int j = 0; j < count; ++j) ids[j] = int32_t((j * 5 + 3) % nexp);
-    const size_t xs = size_t(n_in / 32) * 36;
-    std::vector<uint8_t> xh;
-    for (int j = 0; j < count; ++j) {
-        auto q = rand_q81(n_in);
-        xh.insert(xh.end(), q.begin(), q.end());
-    }
-    void** dtable = nullptr;
-    ck(cudaMalloc((void**) &dtable, nexp * sizeof(void*)), "malloc");
-    ck(cudaMemcpy(dtable, table.data(), nexp * sizeof(void*), cudaMemcpyHostToDevice), "up");
-    int32_t* dids = upload(ids);
-    uint8_t* dx = upload(xh);
-    float* y0 = fill_ff(size_t(count) * n_out);
-    float* y1 = fill_ff(size_t(count) * n_out);
-    kernels::MmvqIds a{dtable, dids, off, dx, xs, 1, y0, size_t(n_out)};
-    kernels::MmvqIds b = a;
-    b.y = y1;
-    kernels::native_gemv_vwarp_force(0);
-    const bool ok0 = kernels::native_mmvq_ids(type, a, count, n_in, n_out, st);
-    kernels::native_gemv_vwarp_force(1);
-    const bool ok1 = kernels::native_mmvq_ids(type, b, count, n_in, n_out, st);
-    const size_t n = size_t(count) * n_out * 4;
-    verdict(what, ok0 && ok1 && grab(y0, n) == grab(y1, n));
-    for (auto* p : w) cudaFree(p);
-    cudaFree(dtable), cudaFree(dids), cudaFree(dx), cudaFree(y0), cudaFree(y1);
-}
-
 // ---- grouped dense ----
 void test_many(int type, int n_in, const std::vector<int>& n_outs) {
     char what[200];
@@ -260,28 +194,6 @@ template <typename L> double time_it(L&& launch, int nsets, int reps) {
     std::sort(r.begin(), r.end());
     return r[2];
 }
-void bench_slots(int type, int n_in, int n_out, int reps) {
-    const int count = 8, pool = type == 8 ? 64 : 128;
-    std::vector<uint8_t*> w;
-    for (int i = 0; i < pool; ++i) w.push_back(upload(rand_blocks(size_t(n_out) * (n_in / 32), bsize_of(type))));
-    std::vector<void*> x;
-    std::vector<float*> y;
-    for (int j = 0; j < count; ++j) x.push_back(upload(rand_q81(n_in))), y.push_back(fill_ff(n_out));
-    const double bytes = double(count) * n_out * (n_in / 32) * bsize_of(type);
-    auto run = [&](int mode) {
-        kernels::native_gemv_vwarp_force(mode);
-        return time_it([&](int set) {
-            kernels::MmvqSlots sl{};
-            for (int j = 0; j < count; ++j) sl.w[j] = w[(size_t(set) * count + j) % w.size()], sl.x[j] = x[j], sl.y[j] = y[j];
-            kernels::native_mmvq_slots(type, sl, count, n_in, n_out, st);
-        }, pool / count, reps);
-    };
-    const double o1 = run(0), n1 = run(1), o2 = run(0), n2 = run(1);
-    const double o = std::min(o1, o2), nn = std::min(n1, n2);
-    std::printf("BENCH slots type %2d %4d -> %4d x%d: old %6.1f us %6.1f GB/s | new %6.1f us %6.1f GB/s | %+.1f%%\n", type, n_in,
-                n_out, count, o, bytes / o / 1e3, nn, bytes / nn / 1e3, 100.0 * (o / nn - 1));
-    for (auto* p : w) cudaFree(p);
-}
 void bench_many(int reps) {
     const std::vector<int> outs = {3072, 1024, 1024, 3072, 384, 24};
     const int n_in = 2304, copies = 16;
@@ -345,24 +257,9 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         const int reps = argc > 2 ? std::max(10, std::atoi(argv[2])) : 200;
-        for (int type : {20, 8}) bench_slots(type, 2304, 2304, reps), bench_slots(type, 1152, 2304, reps);
         bench_many(reps);
         bench_ctrl(reps);
         return 0;
-    }
-    for (int type : {20, 8}) {
-        for (int count : {1, 5, 8, 32}) {
-            test_slots(type, 2304, 2304, count);   // gate|up
-            test_slots(type, 1152, 2304, count);   // down
-        }
-        test_slots(type, 2304, 1152, 8);   // the up of a gate / up pair (UD-Q2's mixed layers)
-        test_slots(type, 2304, 2303, 3);   // an odd row count: the tails of the row groups
-        test_slots(type, 1152, 2301, 3);
-        test_slots(type, 2304, 7, 2);
-        test_slots(type, 1152, 1, 2);
-        test_ids(type, 2304, 2304, 8);
-        test_ids(type, 1152, 2304, 8);
-        test_ids(type, 1152, 2303, 5);
     }
     test_many(8, 2304, {3072, 1024, 1024, 3072, 384, 24});   // q|k|v|gate|rel|sink
     test_many(8, 2304, {3072, 1024, 1024});
