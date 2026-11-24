@@ -20,7 +20,7 @@ by us: RX 9060 XT (gfx1200), Windows, ROCm 10.x.
 | #294 | AMD: fewer launches for the attention projections |
 | #295 | AMD: the clip and KV-store kernels fused |
 | #299 | faster expert-cache refill after long prompts |
-| #271 | opt-in prefetch of the next layer's experts (`STRATA_INK_PRESTAGE=1`) |
+| #271 | opt-in prefetch of the next layer's experts (`STRATA_INK_PRESTAGE=1`; CUDA only, it does nothing on AMD) |
 | #301 | a graph that does not fit in VRAM no longer fails the request |
 | #302 | AMD under WSL2: no 4 s stall when the expert cache shrinks |
 | #306 | AMD: the GPU asks the CPU for the experts it lacks without a host round trip a layer (`STRATA_POLY_BELL=0`: off) |
