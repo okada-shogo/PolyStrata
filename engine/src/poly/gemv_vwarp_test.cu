@@ -145,9 +145,9 @@ void test_ids(int type, int n_in, int n_out, int count) {
         auto q = rand_q81(n_in);
         xh.insert(xh.end(), q.begin(), q.end());
     }
-    const void* const* dtable = nullptr;
+    void** dtable = nullptr;
     ck(cudaMalloc((void**) &dtable, nexp * sizeof(void*)), "malloc");
-    ck(cudaMemcpy(const_cast<void**>(reinterpret_cast<void* const*>(dtable)), table.data(), nexp * sizeof(void*), cudaMemcpyHostToDevice), "up");
+    ck(cudaMemcpy(dtable, table.data(), nexp * sizeof(void*), cudaMemcpyHostToDevice), "up");
     int32_t* dids = upload(ids);
     uint8_t* dx = upload(xh);
     float* y0 = fill_ff(size_t(count) * n_out);
@@ -162,7 +162,7 @@ void test_ids(int type, int n_in, int n_out, int count) {
     const size_t n = size_t(count) * n_out * 4;
     verdict(what, ok0 && ok1 && grab(y0, n) == grab(y1, n));
     for (auto* p : w) cudaFree(p);
-    cudaFree(const_cast<void**>(reinterpret_cast<void* const*>(dtable))), cudaFree(dids), cudaFree(dx), cudaFree(y0), cudaFree(y1);
+    cudaFree(dtable), cudaFree(dids), cudaFree(dx), cudaFree(y0), cudaFree(y1);
 }
 
 // ---- grouped dense ----
