@@ -1974,7 +1974,11 @@ void usage() {
                  "  --no-full-mirror       Inkling 2: the pinned copy of the experts holds only the ones outside VRAM\n"
                  "                         (default: every expert where the RAM keeps max(8 GiB, 20%%) free beside it;\n"
                  "                         STRATA_POLY_MIRROR=partial does the same)\n"
-                 "  --prompt-batch N       prompt tokens read at a time (default 1024); about 1.4 MiB of VRAM each\n"
+                 "  --prompt-batch N|auto|auto:N  prompt tokens read at a time; about 1.4 MiB of VRAM each.  auto\n"
+                 "                         (the default): Inkling 2 on one CUDA card reads a long prompt in calls\n"
+                 "                         of up to 4096, out of the expert cache while it is read (8192 where every\n"
+                 "                         expert fits in VRAM); on ROCm one batch up to 4096 where every expert\n"
+                 "                         fits beside it; else 1024.  auto:N: up to N\n"
                  "  --stage-mib N          VRAM the experts outside the cache pass through in a prompt batch (default\n"
                  "                         128 on an NVIDIA card where a longer read widens it, else 2048; never more\n"
                  "                         than a layer's experts take); with less, more of them are copied after the\n"
@@ -2124,6 +2128,7 @@ int main(int argc, char** argv) {
     }
 #endif
     Options o;
+    o.prompt_batch = 0;   // auto: by the VRAM where the model can (else 1024)
     CacheFlags cache;
     Sampling s;
     bool want_serve = false;
@@ -2232,7 +2237,18 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--draft-vocab") o.draft_vocab = std::atoi(val());
-        else if (a == "--prompt-batch") o.prompt_batch = std::atoi(val());
+        else if (a == "--prompt-batch") {
+            const std::string v = val();
+            if (v.rfind("auto", 0) == 0) {   // auto, or auto:N for at most N tokens a call
+                o.prompt_batch = 0;
+                o.prompt_batch_max = v.size() > 5 && v[4] == ':' ? std::atoi(v.c_str() + 5) : 0;
+                if (v.size() > 4 && (v[4] != ':' || o.prompt_batch_max < 1))
+                    throw std::runtime_error("--prompt-batch takes N, auto or auto:N");
+            } else {
+                o.prompt_batch = std::atoi(v.c_str());
+                if (o.prompt_batch < 1) throw std::runtime_error("--prompt-batch takes N, auto or auto:N");
+            }
+        }
         else if (a == "--stage-mib") o.stage_mib = std::atoi(val());
         else if (a == "--stage-ahead") o.stage_ahead = std::atoi(val());
         else if (a == "--stage-read-mib") o.stage_read_mib = std::atoi(val());
