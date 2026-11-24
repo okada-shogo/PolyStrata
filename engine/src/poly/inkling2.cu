@@ -3671,6 +3671,8 @@ void ink_gate(const float* cur, const float* msg, const float* gain, const float
 // here instead.  A card the file has no code for answers with an error, which is not kept.
 void ink_kernels_load() {
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)   // (HIP builds keep the first launch's load)
+    // an error an earlier launch left is not this call's to clear: it stays for the caller to see
+    if (cudaPeekAtLastError() != cudaSuccess) return;
     cudaFuncAttributes a{};
     if (cudaFuncGetAttributes(&a, (const void*) ink_conv_kernel) != cudaSuccess) (void) cudaGetLastError();
 #endif

@@ -170,7 +170,7 @@ private:
 #else
     int default_swaps() const override { return 128; }
 #endif
-#if !defined(STRATA_GPU_METAL)
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
     void load_kernels() override;
 #endif
 #if defined(STRATA_USE_HIP)

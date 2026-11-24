@@ -100,7 +100,7 @@ Dev Inkling2::msg_query(int il) {
     return d;
 }
 
-#if !defined(STRATA_GPU_METAL)
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
 // CUDA loads a file's kernels at the first launch of one of them (lazy loading), and the first prompt waited for
 // the files it launches from: on the RTX 2070 Super 68 ms at its first add-norm (native_mmvq.cu), 50 at its first
 // dequantization (iq_kernels.cu, UD-Q2_K_XL's IQ1_S halves), 7 and 5 at the first of this model's and poly's own,

@@ -3719,6 +3719,8 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
 // here instead.  A card the file has no code for answers with an error, which is not kept.
 void native_mmvq_load() {
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)   // (HIP builds keep the first launch's load)
+    // an error an earlier launch left is not this call's to clear: it stays for the caller to see
+    if (cudaPeekAtLastError() != cudaSuccess) return;
     cudaFuncAttributes a{};
     if (cudaFuncGetAttributes(&a, (const void*) native_add_rms_norm_q8_1_kernel<1024>) != cudaSuccess)
         (void) cudaGetLastError();
