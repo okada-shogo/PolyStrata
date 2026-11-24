@@ -96,9 +96,10 @@ class EngineCommand(unittest.TestCase):
         self.assertEqual(engine_args({**cfg, "vram_elastic": True, "vram_segment_mib": 256}),
                          ["--max-context", "8192", "--vram-elastic", "--vram-segment-mib", "256"])
         self.assertEqual(engine_args({**cfg, "vram_elastic": "yes"}), ["--max-context", "8192"])
-        # strata-poly has no such option and ends at one it does not know: its cache is resized as it is
+        # strata-poly takes --vram-elastic (its cache is in VMM pieces already) but no segment size
         poly = {**cfg, "exe": "engine-poly/strata-poly.exe", "vram_elastic": True, "vram_segment_mib": 256}
-        self.assertEqual(engine_args(poly), ["--max-context", "8192"])
+        self.assertEqual(engine_args(poly), ["--max-context", "8192", "--vram-elastic"])
+        self.assertEqual(engine_args({**poly, "vram_elastic": False}), ["--max-context", "8192"])
 
 
 class Route(unittest.TestCase):
