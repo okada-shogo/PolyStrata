@@ -2127,6 +2127,9 @@ class StrataEngine:
         born = self.gen                                 # the engine process this request is sent to
         hold = (sampling or {}).get(HOLD_KEY)           # the thinking budget's hold (P2b): the reasoning tokens left when this pass starts, and </think>'s id
         keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}, hy4=getattr(self, "hy4_engine", False))   # (the hold's key goes on per leg: leg_keys below)
+        # turn_at as the one-request path sends it: the engine reads a prompt in calls that stop at that checkpoint,
+        # and Inkling 2's greedy answer depends on how a prompt's rows are grouped into calls
+        keys0 += "" if getattr(self, "hy4_engine", False) else self.turn_key(ids)
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
