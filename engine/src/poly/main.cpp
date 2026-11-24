@@ -1931,6 +1931,9 @@ void usage() {
                  "  --lock-experts         keep the experts outside VRAM in RAM, so the system cannot give it to other\n"
                  "                         programs: copied into pinned memory for the card where the RAM that is free\n"
                  "                         holds them, else their pages in the model file locked (Linux: up to ulimit -l)\n"
+                 "  --no-full-mirror       Inkling 2: the pinned copy of the experts holds only the ones outside VRAM\n"
+                 "                         (default: every expert where the RAM keeps max(8 GiB, 20%%) free beside it;\n"
+                 "                         STRATA_POLY_MIRROR=partial does the same)\n"
                  "  --prompt-batch N       prompt tokens read at a time (default 1024); about 1.4 MiB of VRAM each\n"
                  "  --stage-mib N          VRAM the experts outside the cache pass through in a prompt batch (default\n"
                  "                         128 on an NVIDIA card where a longer read widens it, else 2048; never more\n"
@@ -2123,6 +2126,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-gpu-experts") o.gpu_experts = false;
         else if (a == "--any-node") o.stay_near = false;
         else if (a == "--lock-experts") o.lock_experts = true;
+        else if (a == "--no-full-mirror") o.full_mirror = false;
         else if (a == "--no-graphs") o.graphs = false;
         else if (a == "--kv-whole") o.kv_grow = false;
         else if (a == "--kv-resident") o.kv_resident = std::atoi(val());

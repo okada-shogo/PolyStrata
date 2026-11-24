@@ -67,6 +67,10 @@ protected:
     // A call's residual streams and the core's bank from one layer run to the next: read() takes the calls through
     // the runs a group at a time.  Not with the drafter, whose taps of three runs are a call's too.
     int carry_rows() const override { return ds_file_ ? 0 : kBlocks + 2; }
+    // A read gives up hundreds of cached experts (the carried rows, the wider staging buffer) and the next request
+    // takes them back: with a copy of each kept in pinned memory they need no copy back from the card, and none goes
+    // to the card through the two pinned buffers, whose turns wait behind the next layer run's experts (prestage).
+    bool full_mirror_default() const override { return true; }
     void carry_at(float* at) override;
     float* carried(int i) override;
     void save_run(int il, int64_t pos, uint8_t* dst) override;

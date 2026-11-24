@@ -827,6 +827,51 @@ size_t ram_available(bool* own = nullptr) {
 #endif
 }
 
+// The RAM the machine has, or under a cgroup's limit (a container, WSL's VM shows its own in /proc/meminfo) that
+// limit if it is less; 0 when it cannot tell.
+size_t ram_total() {
+#if defined(STRATA_GPU_METAL)
+    return 0;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    return GlobalMemoryStatusEx(&st) ? (size_t) st.ullTotalPhys : 0;
+#else
+    size_t kb = 0;
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[128];
+        while (std::fgets(line, sizeof(line), f))
+            if (std::sscanf(line, "MemTotal: %zu kB", &kb) == 1) break;
+        std::fclose(f);
+    }
+    size_t total = kb << 10;
+#ifdef __linux__
+    std::string path;
+    if (FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof(line), f))
+            if (std::strncmp(line, "0::", 3) == 0) {
+                path = line + 3;
+                while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+            }
+        std::fclose(f);
+    }
+    // the tightest limit on the way to the root, as cgroup_room()
+    while (!path.empty()) {
+        if (FILE* f = std::fopen(("/sys/fs/cgroup" + path + "/memory.max").c_str(), "r")) {
+            unsigned long long max = 0;
+            if (std::fscanf(f, "%llu", &max) == 1 && max > 0) total = std::min(total, (size_t) max);
+            std::fclose(f);
+        }
+        if (path == "/") break;
+        const size_t cut = path.find_last_of('/');
+        path = cut == 0 ? "/" : path.substr(0, cut);
+    }
+#endif
+    return total;
+#endif
+}
+
 }  // namespace
 
 // One expert on its way into the cache.  The engine's thread asks, the follower copies and sends, and the engine's
@@ -3533,7 +3578,8 @@ void Engine::follow(int written) {
             ck(arrived, "expert upload");
             layers_[(size_t) s.il].slot[(size_t) s.e] = s.slot;
             coming_[(size_t) s.il * ne + (size_t) s.e] = 0;
-            if (s.mirror && !(s.adds && refills_mirror())) mirror_give(s.il, s.e);
+            // its copy stays where the mirror keeps them (a refill with --lock-experts, every expert with mirror_all_)
+            if (s.mirror && !(refills_mirror() && (s.adds || mirror_all_))) mirror_give(s.il, s.e);
             if (s.spare) mirror_of_[(size_t) s.out] = s.spare;
             s.mirror = nullptr;
             s.spare = nullptr;
@@ -6473,30 +6519,52 @@ void Engine::build_mirror() {
     std::vector<std::vector<Want>> want((size_t) n_trade_);
     std::vector<size_t> stride((size_t) n_trade_, 0), cached((size_t) n_trade_, 0), spares((size_t) n_trade_, 0);
     size_t cached_all = 0;
-    for (int il = 0; il < (int) layers_.size(); ++il) {
-        const Layer& L = layers_[(size_t) il];
-        if (L.trade < 0) continue;
-        stride[(size_t) L.trade] = (L.slot_bytes + 63) / 64 * 64;
-        for (int e = 0; e < n_expert_; ++e) {
-            if (L.slot[(size_t) e]) {
-                ++cached[(size_t) L.trade];
-                ++cached_all;
-            } else {
-                want[(size_t) L.trade].push_back({il, e});
-            }
-        }
-    }
-    size_t total = 0;
-    for (size_t c = 0; c < (size_t) n_trade_; ++c) {
-        if (!stride[c]) continue;
-        spares[c] = 1 + (size_t) (64.0 * (cached_all ? (double) cached[c] / (double) cached_all : 1.0));
-        total += (want[c].size() + spares[c]) * stride[c];
-    }
     constexpr size_t kHeadroom = size_t(4) << 30;   // as the RAM budget's (load())
     size_t avail = ram_available();
 #ifdef _WIN32
     if (avail) avail -= std::min(avail, cached_file_bytes());   // as the budget counts them (load())
 #endif
+    // The whole mirror (full_mirror_default(), unless --no-full-mirror or STRATA_POLY_MIRROR=partial): the cached
+    // experts have their copies too, where the RAM free to this process keeps max(8 GiB, 20% of its RAM) beside them.
+    // The RAM is the process's: under WSL or a container, the VM's or the group's, not the host's.
+    const bool partial_asked = !opt_.full_mirror || (asked && std::string(asked) == "partial");
+    const size_t ram = ram_total(), keep = std::max(size_t(8) << 30, ram / 5);
+    size_t total = 0;
+    for (int pass = full_mirror_default() && !partial_asked && !mirror_short_ ? 0 : 1; pass < 2; ++pass) {
+        mirror_all_ = pass == 0;
+        for (auto& w : want) w.clear();
+        std::fill(cached.begin(), cached.end(), 0);
+        cached_all = 0;
+        for (int il = 0; il < (int) layers_.size(); ++il) {
+            const Layer& L = layers_[(size_t) il];
+            if (L.trade < 0) continue;
+            stride[(size_t) L.trade] = (L.slot_bytes + 63) / 64 * 64;
+            for (int e = 0; e < n_expert_; ++e) {
+                if (L.slot[(size_t) e]) {
+                    ++cached[(size_t) L.trade];
+                    ++cached_all;
+                }
+                if (!L.slot[(size_t) e] || mirror_all_) want[(size_t) L.trade].push_back({il, e});
+            }
+        }
+        total = 0;
+        for (size_t c = 0; c < (size_t) n_trade_; ++c) {
+            if (!stride[c]) continue;
+            spares[c] = 1 + (size_t) (64.0 * (cached_all ? (double) cached[c] / (double) cached_all : 1.0));
+            total += (want[c].size() + spares[c]) * stride[c];
+        }
+        if (!mirror_all_) break;
+        if (ram && avail >= total + keep) {
+            std::fprintf(stderr, "strata-poly: mirror: all experts (%.1f GiB pinned; %.1f of %.1f GiB of RAM free "
+                                 "before it)\n",
+                         (double) total / (1 << 30), (double) avail / (1 << 30), (double) ram / (1 << 30));
+            break;
+        }
+        std::fprintf(stderr, "strata-poly: mirror: the experts outside VRAM only, RAM short for all of them (%.1f GiB "
+                             "would leave %.1f of %.1f GiB free, under the %.1f kept)\n",
+                     (double) total / (1 << 30), (double) (avail > total ? avail - total : 0) / (1 << 30),
+                     (double) ram / (1 << 30), (double) keep / (1 << 30));
+    }
     if (!avail || total + kHeadroom > avail) {
         std::fprintf(stderr, "strata-poly: %.1f GiB of RAM available for a %.1f GiB pinned copy of the experts outside VRAM: "
                              "prompts are staged from the mapped files%s\n",
@@ -6581,6 +6649,12 @@ void Engine::build_mirror() {
     if (failed.load()) {
         cudaGetLastError();
         free_pieces(got);
+        if (mirror_all_) {   // the whole copy did not get its memory: the one of the experts outside VRAM, as before
+            std::fprintf(stderr, "strata-poly: mirror: no memory for all experts, the experts outside VRAM only\n");
+            mirror_all_ = false;
+            mirror_short_ = true;
+            return build_mirror();
+        }
         std::fprintf(stderr, "strata-poly: no pinned copy of the experts outside VRAM: no memory for it%s\n",
                      opt_.lock_experts ? ", so --lock-experts locks their pages in the model file" : "");
         return;
@@ -6608,13 +6682,14 @@ void Engine::build_mirror() {
     mirror_spare_ = std::move(spare);
     mirror_stride_ = std::move(stride);
     mirror_registered_ = same != 0;
-    std::fprintf(stderr, "strata-poly: the %zu experts outside VRAM in %.1f GiB of pinned memory in %.1f s\n", n,
-                 (double) total / (1 << 30), ms_since(t0) / 1000.0);
+    std::fprintf(stderr, "strata-poly: the %zu experts %s in %.1f GiB of pinned memory in %.1f s\n", n,
+                 mirror_all_ ? "of the model" : "outside VRAM", (double) total / (1 << 30), ms_since(t0) / 1000.0);
     if (opt_.lock_experts) {
-        std::fprintf(stderr, "strata-poly: --lock-experts: copied the %zu experts outside VRAM into %.1f GiB of RAM and "
+        std::fprintf(stderr, "strata-poly: --lock-experts: copied the %zu experts %s into %.1f GiB of RAM and "
                              "locked all of it: pinned for the card, which the system does not page out%s; one that "
                              "leaves VRAM later is copied in too, from the model file, between requests\n",
-                     n, (double) total / (1 << 30), memlock_note().c_str());
+                     n, mirror_all_ ? "of the model" : "outside VRAM", (double) total / (1 << 30),
+                     memlock_note().c_str());
         lock_asked_.assign(layers_.size() * ne, 0);
         lock_thread_ = std::thread([this] { lock_loop(); });
     }
