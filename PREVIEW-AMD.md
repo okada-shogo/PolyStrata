@@ -55,6 +55,11 @@ int8 prompt products are on by default (auto: the int8 kernel for every type it 
 need to set anything for it. It rounds the activations to int8 with a scale per 32 values: the same rounding class as
 llama.cpp's MMQ, PolyStrata 0.1.45 and CUDA's default on Ampere and newer. `STRATA_POLY_HIP_INT8=0` gives main's path.
 
+**Setup on any OS** adds `--attn-requant q5_0 --loop-bf16 --tail-skip 4` whenever the card cannot hold every expert of
+the size (for example IQ4_NL or UD-Q4_K_XL on a 16 GB card). They are for 8 GB cards, and `--tail-skip` skips experts,
+so it changes the answers. Run setup with `--inkling-small-card off` (setup keeps that choice), or remove the three
+flags from the run config's `"args"`.
+
 **Linux, native (fastest).** ROCm 7.2.x recommended. No small-card flags. The default window and `--prompt-batch auto`
 need no flags either:
 
@@ -74,9 +79,7 @@ UD-Q2_K_XL after 2K-8K prompts, against 64-73 without. After a short prompt it c
 after 302: 68.0 against 70.3). With a desktop on the same card, add `--vram-elastic`: the expert cache then gives VRAM back when
 the desktop takes more.
 
-**Windows.** `START-HERE.bat --setup --family inkling` builds and writes the run config. On a 16 GB card, remove
-`--attn-requant q5_0`, `--loop-bf16` and `--tail-skip 4` from its `"args"`, or run setup with
-`--inkling-small-card off`. They are for 8 GB cards, and `--tail-skip` skips experts, so it changes the answers.
+**Windows.** `START-HERE.bat --setup --family inkling --inkling-small-card off` builds and writes the run config.
 Setup installs AMD's TheRock ROCm 10.2. We measured main's prompts much slower with it (below). The int8 default
 may avoid most of that, but this is not confirmed. The ROCm 10 work is not in this preview.
 
