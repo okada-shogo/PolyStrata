@@ -205,8 +205,8 @@ void Inkling2::load_geometry() {
     need(!inside(lo_) && !(end_ >= 0 && inside(end_)), "a card of a split starts inside the loop");
     // every expert's scale goes on its joined gate and up product, whatever the experts' type
     joined_scales_ = true;
-    // the cached experts' IQ3_S / IQ3_XXS and IQ1_S / IQ2_* products through the kernels that keep all lanes busy (CUDA;
-    // the same bits)
+    // the cached experts' IQ3_S / IQ3_XXS and IQ1_S / IQ2_* products, and IQ4_NL, Q8_0, Q2_0, MXFP4 and most other
+    // native_mmvq.cu formats a warp a row, through the kernels that keep all lanes busy (CUDA; the same bits)
     lane_slots_ = true;
 #if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
     // In a prompt's read of several calls, a call's row tables go to the card by a kernel, not behind the experts'

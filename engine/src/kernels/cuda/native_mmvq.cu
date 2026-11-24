@@ -2079,9 +2079,58 @@ __global__ void native_mmvq_slots_warp_kernel(S slots, int n_in, int n_out) {
     }
 }
 
+#if !defined(__HIPCC__)   // CUDA only: measured on CUDA; the HIP launches stay as they were
+// native_mmvq_slots_kernel<F, ROWS> with a warp a row (MmvqSlots::lanes): lane l does the work of the block's threads
+// l, 32 + l, 64 + l and 96 + l, each into its own sum, and adds them in the order the block adds its warps' partials -
+// the same terms in the same order, so the same bits, with no shared memory or barrier and no thread idle for a K
+// the block's threads do not divide evenly (an expert's 2304 and 1152 IQ4_NL values: 72 and 36 blocks for the
+// block's 64 pairs of threads).  From PR #200's engine (a4fa51021).
+template<typename F, typename S>
+__launch_bounds__(WARPS * WARP)
+__global__ void native_mmvq_slots_lanes_kernel(S slots, int n_in, int n_out) {
+    static_assert(F::BPI * F::T == WARPS * WARP, "a pass over the block's threads is one stride of the block kernel");
+    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
+    const int row = int(blockIdx.x) * WARPS + int(threadIdx.y);
+    if (row >= n_out) return;   // whole warps: no barrier below
+    const auto* w = static_cast<const typename F::Block*>(at.w) + std::size_t(row) * (n_in / F::DIV);
+    const auto* x = static_cast<const Q81Block*>(at.x);
+    const int lane = int(threadIdx.x), blocks_per_row = n_in / F::DIV;
+    float tmp[WARPS] = {};
+    for (int base = 0; base < blocks_per_row; base += F::BPI) {
+#pragma unroll
+        for (int v = 0; v < WARPS; ++v) {
+            const int tid = WARP * v + lane, kbx = base + tid / F::T, kqs = F::kqs(tid);
+            if (kbx < blocks_per_row) tmp[v] += F::apply(F::load(w + kbx, kqs), x + kbx * F::KBY, kqs);
+        }
+    }
+#pragma unroll
+    for (int v = 1; v < WARPS; ++v) tmp[0] += tmp[v];
+    tmp[0] = warp_sum(tmp[0]);
+    if (lane == 0) at.y[row] = tmp[0];
+}
+
+// The formats whose lanes launches are slower than the block kernel's (RTX 2070, 8 experts of Inkling 2's shapes,
+// 2304 or 1152 / 1280 -> 2304: Q3_K 131 -> 181 us, Q5_K 94 -> 112, Q6_K 119 -> 152, Q5_0 1152 -> 2304 53 -> 59)
+// keep the block kernel with MmvqSlots::lanes set.
+template<typename F> constexpr bool kSlotsLanesFaster = true;
+template<> constexpr bool kSlotsLanesFaster<SmallTraits<Q50Block, 4>> = false;
+template<> constexpr bool kSlotsLanesFaster<Q3KTraits> = false;
+template<> constexpr bool kSlotsLanesFaster<Q5KTraits> = false;
+template<> constexpr bool kSlotsLanesFaster<Q6KTraits> = false;
+#endif
+
 template<typename F, typename S>
 void launch_slots(const S& slots, int count, int n_in, int n_out, cudaStream_t s) {
     const dim3 threads(WARP, WARPS);
+#if !defined(__HIPCC__)
+    if constexpr (kSlotsLanesFaster<F>) {
+        if (slots.lanes) {
+            const dim3 blocks(unsigned((std::size_t(n_out) + WARPS - 1) / WARPS), unsigned(count));
+            native_mmvq_slots_lanes_kernel<F, S><<<blocks, threads, 0, s>>>(slots, n_in, n_out);
+            return;
+        }
+    }
+#endif
     if (native_mmvq_slots_wide() && n_in / F::DIV * F::T <= WARP && n_in % F::DIV == 0) {
         constexpr int ROWS = 2;
         if (n_in / F::DIV * F::T <= WARP / 2) {   // a row in half a warp: two rows' groups a warp
