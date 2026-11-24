@@ -69,7 +69,7 @@ __device__ __forceinline__ int dot4_s8(int w, int a, int acc) {
     defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
     return __builtin_amdgcn_sudot4(true, w, true, a, acc, false);
 #else
-    return __builtin_amdgcn_sdot4(w, a, acc, false);
+    return strata::hip_compat::dp4a(w, a, acc);
 #endif
 }
 
