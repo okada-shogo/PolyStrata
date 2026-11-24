@@ -245,6 +245,14 @@ void Inkling2::load_geometry() {
         const char* v = std::getenv("STRATA_INK_KERNEL_TABLES");
         kernel_tables_ = !(v && std::string(v) == "0");
     }
+    // STRATA_INK_PRESTAGE=1: a prompt's read copies the next layer run's experts that are not cached while a run's
+    // calls go, into a second part of the staging buffer that the expert cache lends for the read (prestage()).
+    // The experts and the launches are the same, so the results are too.  Opt-in: the cache holds fewer experts
+    // during the read.
+    {
+        const char* v = std::getenv("STRATA_INK_PRESTAGE");
+        prestage_ = v && std::string(v) == "1";
+    }
 #endif
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;

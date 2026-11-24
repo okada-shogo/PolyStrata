@@ -16717,6 +16717,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_INK_PRESTAGE",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/inkling2.cpp",
+     "line": 193,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/models/inkling.md:93"
+   ],
+   "first_commit": null,
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": null,
+   "last_date": "2026-11-23",
+   "status": "opt-in",
+   "owner": "poly",
+   "note": "off unless =1: Inkling 2 on CUDA, in a prompt read of several calls (read_groups()), the staging buffer gets a second part as large (one layer's experts, about 627 MB of IQ4_NL's), lent by the expert cache for the read only and given back after it (widen_stage()/narrow_stage()), and the next layer run's uncached experts are copied there from the pinned mirror while the current run computes (prestage()). Same bits: the same experts, layout and launches. Opt-in because the cache holds fewer experts during the read. Needs the pinned mirror (Linux default); HIP and Metal never take it (engine/src/poly/inkling2.cpp, engine.cpp prestage())",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_INK_PROJECT_MIXED",
    "backends": [
     "cuda"
