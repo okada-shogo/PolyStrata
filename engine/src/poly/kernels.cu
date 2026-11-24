@@ -2,6 +2,7 @@
 // ggml ops it builds.  Where a kernel takes several tokens, blockIdx.y is the token unless it says otherwise.
 #include "strata/poly/kernels.hpp"
 #include "strata/core/temp_file.hpp"
+#include "bell.cuh"
 #include "strata/kernels/dp4a.hpp"
 #ifdef STRATA_POLY_GDN_MMA
 #include "gdn_mma.hpp"
@@ -4516,14 +4517,14 @@ __device__ __forceinline__ void bell_ring_block(const void* const* __restrict__ 
         return;
     }
     for (int i = threadIdx.x; i < n; i += blockDim.x) hx[i] = x[i];
-    __threadfence_system();   // the input and the jobs are the host's before the ring
+    __threadfence_system();   // the input and the jobs are the host's before the ring (bell_poke())
     __syncthreads();
     if (threadIdx.x == 0) {
         bell->layer = layer;
         bell->n = jobs;
         __threadfence_system();
         const uint32_t s = ++seq[0];
-        bell->ring = s;
+        bell_poke(&bell->ring, s);
         __threadfence_system();
         seq[1] = s;
     }
@@ -4554,18 +4555,12 @@ __global__ void route_ring_kernel(const float* __restrict__ logits, int n_expert
     bell_ring_block(r.slots, ids, w, n_used, r.skip_from, r.layer, r.x, r.hx, r.n, r.bell, r.seq);
 }
 
-// One block: one thread asks the bell every half microsecond or so, the others sleep at the barrier (a spinning card
-// draws power that a laptop's CPU, computing the experts meanwhile, would rather have).
+// One block: one thread asks the bell every half microsecond or so (bell_wait()), the others sleep at the barrier.
 __global__ void bell_add_kernel(const ExpertBell* bell, const uint32_t* __restrict__ seq, const float* hy,
                                 float* __restrict__ acc, int n) {
     const uint32_t s = seq[1];
     if (s == 0) return;
-    if (threadIdx.x == 0)
-        while (bell->ack != s && !bell->abort) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-            __nanosleep(500);
-#endif
-        }
+    if (threadIdx.x == 0) bell_wait(bell, s);
     __syncthreads();
     __threadfence_system();
     for (int i = threadIdx.x; i < n; i += blockDim.x) acc[i] += *(volatile const float*) (hy + i);

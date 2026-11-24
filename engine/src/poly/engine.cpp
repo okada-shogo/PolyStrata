@@ -1414,13 +1414,19 @@ void* Engine::dmalloc(size_t bytes, const char* what) {
     return p;
 }
 
-void* Engine::hmalloc(size_t bytes, const char* what) {
+void* Engine::hmalloc(size_t bytes, const char* what, [[maybe_unused]] bool live) {
     void* p = nullptr;
     const std::string why = std::string(what) + " (" + std::to_string(bytes) + " bytes)";
     // A container at its memory limit refused pinned memory with "invalid argument" five times in five minutes
     // while a download filled its page cache; a moment later the kernel has reclaimed some.
     cudaError_t e = cudaSuccess;
     for (int tries = 0; tries < 4; ++tries) {
+#if defined(STRATA_USE_HIP)
+        // hipHostMalloc's default memory is not coherent (HIP_HOST_COHERENT=0): a kernel may read it from a cache
+        // and see the host's writes only at its next launch
+        if (live) e = hipHostMalloc(&p, std::max<size_t>(bytes, 256), hipHostMallocMapped | hipHostMallocCoherent);
+        else
+#endif
         e = cudaMallocHost(&p, std::max<size_t>(bytes, 256));
         if (e == cudaSuccess) break;
         cudaGetLastError();
@@ -4923,8 +4929,9 @@ void Engine::alloc() {
     at_ = (long long*) dmalloc(at_rows * 2 * sizeof(long long), "scratch");
     h_at_ = (long long*) hmalloc(at_rows * 2 * sizeof(long long), "pinned memory");
     h_rl_ = (float*) hmalloc(nc * n_expert_ * sizeof(float), "pinned memory");
-    h_x_ = (float*) hmalloc(nc * n_embd_ * sizeof(float), "pinned memory");
-    h_cpu_ = (float*) hmalloc(nc * n_embd_ * sizeof(float), "pinned memory");
+    // the doorbell's input and answer (bells()): the card writes h_x_ and reads h_cpu_ while the host works on them
+    h_x_ = (float*) hmalloc(nc * n_embd_ * sizeof(float), "pinned memory", bells());
+    h_cpu_ = (float*) hmalloc(nc * n_embd_ * sizeof(float), "pinned memory", bells());
     h_logits_ = (float*) hmalloc((size_t) n_vocab_ * sizeof(float), "pinned memory");
 
     if (mmq_) {
@@ -4982,7 +4989,6 @@ void Engine::alloc() {
         d_nfetch_ = (int*) dmalloc(sizeof(int), "scratch");
         d_use_ = (int32_t*) dmalloc(layers_.size() * (size_t) n_expert_ * sizeof(int32_t), "scratch");
         ck(cudaMemset(d_use_, 0, layers_.size() * (size_t) n_expert_ * sizeof(int32_t)), "expert uses");
-#if !defined(STRATA_USE_HIP)
         // the doorbell (bell_on()): every layer's experts by picks on the card, or none of them; STRATA_POLY_BELL=0: none
         const char* bell_env = std::getenv("STRATA_POLY_BELL");
         bool bell = bells() && !split_ && !(bell_env && bell_env[0] == '0');
@@ -4995,7 +5001,7 @@ void Engine::alloc() {
             most = std::max(most, L.gu2() + L.d_bytes);   // (slot_bytes is not known before fill_expert_cache())
         }
         if (bell && most > 0) {
-            h_bell_ = (ExpertBell*) hmalloc(sizeof(ExpertBell), "pinned memory");
+            h_bell_ = (ExpertBell*) hmalloc(sizeof(ExpertBell), "pinned memory", true);
             std::memset((void*) h_bell_, 0, sizeof(ExpertBell));
             d_bell_seq_ = (uint32_t*) dmalloc(2 * sizeof(uint32_t), "scratch");
             ck(cudaMemset(d_bell_seq_, 0, 2 * sizeof(uint32_t)), "the doorbell");
@@ -5007,7 +5013,6 @@ void Engine::alloc() {
             ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
             ev_bell_ = ev;
         }
-#endif
 #endif
         tab_ = (int32_t*) dmalloc(tab, "scratch");
         h_tab_ = (int32_t*) hmalloc(tab, "pinned memory");
@@ -6750,7 +6755,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
 }
 
 bool Engine::bell_on(int n) const {
-#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
+#if defined(STRATA_GPU_METAL)
     (void) n;
     return false;
 #else
@@ -6763,9 +6768,18 @@ bool Engine::bell_on(int n) const {
 // the card is past the token's last launch.  Here, not on threads of its own: the token's launches are all handed
 // over by then, and this thread would wait for the card anyway.
 void Engine::bell_serve() {
-#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+#if !defined(STRATA_GPU_METAL)
     ck(cudaEventRecord((cudaEvent_t) ev_bell_, cs(st_)), "the doorbell");
-    for (;;) {
+#if defined(STRATA_USE_HIP)
+    // Under WSL2 (dxg) HIP may hold launches back until the host makes another HIP call: a launch followed only by
+    // a look at host memory was not submitted within 2 s in 32 of 40 tries on an RX 9070 XT, and one hipStreamQuery
+    // after it was enough.  This query is that call; the loop's queries go on making them.
+    (void) cudaStreamQuery(cs(st_));
+#endif
+    // A minute with neither a ring nor the card's end (a ring this thread never sees, a launch never submitted): the
+    // card's waits end as on a failed job, and the call throws, where the process hung before.
+    Clock::time_point moved = Clock::now();
+    for (unsigned spins = 0;; ++spins) {
         const uint32_t r = h_bell_->ring;
         if (r != bell_seen_) {
             std::atomic_thread_fence(std::memory_order_acquire);
@@ -6773,21 +6787,33 @@ void Engine::bell_serve() {
             try {
                 bell_job();
             } catch (...) {
-                h_bell_->abort = 1;   // the card's waits end; what it adds is spoiled, and the call throws
-                cudaStreamSynchronize(cs(st_));
-                h_bell_->abort = 0;
-                bell_seen_ = h_bell_->ring;
+                bell_unwind();   // the card's waits end; what it adds is spoiled, and the call throws
                 throw;
             }
             std::atomic_thread_fence(std::memory_order_release);
             h_bell_->ack = r;
+            moved = Clock::now();
             continue;
         }
         const cudaError_t q = cudaEventQuery((cudaEvent_t) ev_bell_);
         if (q == cudaSuccess) return;
         if (q != cudaErrorNotReady) ck(q, "the doorbell");
+        if (spins % 4096 == 0 && Clock::now() - moved > std::chrono::seconds(60)) {
+            bell_unwind();
+            throw std::runtime_error("the doorbell: no ring and no end from the card in 60 s");
+        }
         _mm_pause();
     }
+#endif
+}
+
+// The card's waits on the bell end at once (abort): what it adds is spoiled.  Then the bell as the card left it.
+void Engine::bell_unwind() {
+#if !defined(STRATA_GPU_METAL)
+    h_bell_->abort = 1;
+    cudaStreamSynchronize(cs(st_));
+    h_bell_->abort = 0;
+    bell_seen_ = h_bell_->ring;
 #endif
 }
 
@@ -8500,10 +8526,15 @@ void Engine::run(const int32_t* tokens, int n) {
     // workers from inside the launches, which bell_serve() answers once they are all handed to the card.
     bell_ = bell_on(n);
     bell_counts_ |= bell_;
+    // a throw after a ring was launched and before bell_serve() answers it: the card's waits end (bell_unwind())
     struct BellOff {
-        bool& on;
-        ~BellOff() { on = false; }
-    } bell_off{bell_};
+        Engine& e;
+        const int unwinding = std::uncaught_exceptions();
+        ~BellOff() {
+            if (e.bell_ && std::uncaught_exceptions() > unwinding) e.bell_unwind();
+            e.bell_ = false;
+        }
+    } bell_off{*this};
     const bool card = n < kStageRows && card_moe(n);
     const auto on_card = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
@@ -8724,10 +8755,15 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     // did not fill for it.
     bell_ = bell_on(R);
     bell_counts_ |= bell_;
+    // a throw after a ring was launched and before bell_serve() answers it: the card's waits end (bell_unwind())
     struct BellOff {
-        bool& on;
-        ~BellOff() { on = false; }
-    } bell_off{bell_};
+        Engine& e;
+        const int unwinding = std::uncaught_exceptions();
+        ~BellOff() {
+            if (e.bell_ && std::uncaught_exceptions() > unwinding) e.bell_unwind();
+            e.bell_ = false;
+        }
+    } bell_off{*this};
     const bool card = R < kStageRows && card_moe(R);
     // a token alone is routed on the card (the doorbell, bell_on()), so the rows the host takes are too (below)
     // (card_moe(1)'s test without its side effects: the doorbell, the card's slot table, no --expert-gpu; a layer that

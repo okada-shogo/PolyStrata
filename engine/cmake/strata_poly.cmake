@@ -312,6 +312,13 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
   target_include_directories(poly_route_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                     ${_strata_gpu_include_directories})
   target_link_libraries(poly_route_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # the doorbell between a running card and the host (bell_ring(), bell_add()); needs a card (77 without one)
+  add_executable(poly_bell_test src/poly/bell_test.cu src/poly/kernels.cu)
+  target_include_directories(poly_bell_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                   ${_strata_gpu_include_directories})
+  target_link_libraries(poly_bell_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  add_test(NAME poly_bell_test COMMAND poly_bell_test)
+  set_tests_properties(poly_bell_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the fused residual sum, RMS norm and Q8_1 quantization against the three launches; needs a card, run by hand
   add_executable(poly_norm_q8_test src/poly/norm_q8_test.cu src/poly/kernels.cu)
   target_include_directories(poly_norm_q8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -346,7 +346,7 @@ struct ExpertBell {
 };
 /// One token's picks ids[0..n_used) with weights w at layer `layer`: the ones whose slots[] entry is null, at a place
 /// under skip_from, go into the bell, x (n floats) into hx, and the bell rings (seq[0] counts the rings; seq[1] is
-/// this one, or 0 when there is none).  One block.  CUDA only.
+/// this one, or 0 when there is none).  One block.  CUDA and HIP.
 void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_used, int skip_from, int layer,
                const float* x, float* hx, int n, ExpertBell* bell, uint32_t* seq, void* stream);
 /// bell_ring()'s arguments besides the picks, for route_ring(); uses: count_picks()'s counts (null: none).

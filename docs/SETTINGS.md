@@ -450,7 +450,7 @@ version made it the default.
 | `STRATA_PF_XMX` | text | Intel Arc | v0.2.16 | [INTEL.md](INTEL.md), [release-notes-0.2.0.md](release-notes-0.2.0.md) |
 | `STRATA_PIPELINE_ADAPT_ASYNC` | number | NVIDIA and AMD | v0.2.16 | - |
 | `STRATA_PLE_AUTO_MMAP` | number | NVIDIA and AMD, Intel Arc | v0.2.16 | [DETAILS.md](DETAILS.md) |
-| `STRATA_POLY_BELL` | on / off | NVIDIA | - | - |
+| `STRATA_POLY_BELL` | on / off | NVIDIA and AMD | - | [inkling.md](models/inkling.md) |
 | `STRATA_POLY_EXPERT_TILES` | on / off | NVIDIA and AMD | - | [inkling.md](models/inkling.md) |
 | `STRATA_POLY_F32_AUTOTUNE` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_POLY_HIP_GROUPED` | on / off | NVIDIA and AMD | - | - |

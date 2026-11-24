@@ -34121,13 +34121,13 @@
   {
    "name": "STRATA_POLY_BELL",
    "backends": [
-    "cuda"
+    "cuda-hip"
    ],
    "reads": [
     {
      "file": "engine/src/poly/engine.cpp",
      "line": 3731,
-     "backend": "cuda",
+     "backend": "cuda-hip",
      "fn": "getenv"
     }
    ],

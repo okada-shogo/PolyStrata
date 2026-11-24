@@ -180,7 +180,7 @@ private:
 #endif
 #if defined(STRATA_USE_HIP)
     // the shared expert is one memset (moe_shared()), and a graph launch a layer for it cost an RX 9070 XT's host
-    // more than the memset: with experts on the CPU (no doorbell on HIP) a token's layers are launched one by one
+    // more than the memset: with experts on the CPU and no doorbell a token's layers are launched one by one
     bool shared_recorded() const override { return false; }
 #endif
     // routed on the card in that recording: the host reads neither
