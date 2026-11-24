@@ -626,6 +626,9 @@ protected:
     virtual void finish_logits(float* logits, int rows) { (void) logits, (void) rows; }
     /// What a token's embedding is multiplied by on its way in.
     virtual float embed_scale() const { return 1.f; }
+    /// At the end of the load, after the expert cache is filled: load the kernels a prompt launches, which CUDA
+    /// loads at their first launch otherwise (lazy loading), inside the first prompt.
+    virtual void load_kernels() {}
     /// What a sequence has beside its recurrent state and its rows, in bytes: it is saved and brought back with
     /// the state (save_state(), load_state()).  load_extra() gets the position the state is for.
     virtual size_t extra_bytes() const { return 0; }

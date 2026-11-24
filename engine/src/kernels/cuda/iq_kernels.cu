@@ -6052,6 +6052,18 @@ void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* to
     check("iq_embed_rows");
 }
 
+// CUDA loads a file's kernels at the first launch of one of them (lazy loading, the default since CUDA 12.2): 50 to
+// 70 ms for this file's on an RTX 2070 Super, inside the first prompt.  Asking for a kernel's attributes loads them
+// here instead.  A card the file has no code for answers with an error, which is not kept.
+void iq_kernels_load() {
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)   // (HIP builds keep the first launch's load)
+    // an error an earlier launch left is not this call's to clear: it stays for the caller to see
+    if (cudaPeekAtLastError() != cudaSuccess) return;
+    cudaFuncAttributes a{};
+    if (cudaFuncGetAttributes(&a, (const void*) dequant_flat_kernel<__half>) != cudaSuccess) (void) cudaGetLastError();
+#endif
+}
+
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
     if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst, nullptr);

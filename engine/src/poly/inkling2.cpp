@@ -6,12 +6,14 @@
 #include "strata/poly/kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #if !defined(STRATA_GPU_METAL)
+#include "mmq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #endif
 
 #include <cuda.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -95,6 +97,33 @@ Dev Inkling2::msg_query(int il) {
     h2d(d.p, q.data(), bytes);
     return d;
 }
+
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+// CUDA loads a file's kernels at the first launch of one of them (lazy loading), and the first prompt waited for
+// the files it launches from: on the RTX 2070 Super 68 ms at its first add-norm (native_mmvq.cu), 50 at its first
+// dequantization (iq_kernels.cu, UD-Q2_K_XL's IQ1_S halves), 7 and 5 at the first of this model's and poly's own,
+// 130 ms of a 302-token prompt in all.  They load here, after the expert cache is filled: the cache is sized as
+// before, and the first prompt finds them loaded, as the ones after it do.  The dequantizers' file only where a
+// prompt's expert products take it (a type without the int8 product).
+void Inkling2::load_kernels() {
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t free0 = 0, free1 = 0, total = 0;
+    (void) cudaMemGetInfo(&free0, &total);
+    kernels::native_mmvq_load();
+    kernels_load();
+    ink_kernels_load();
+    bool halves = false;
+    for (const Layer& L : layers_)
+        if (L.moe && mmq_)
+            halves = halves || !Mmq::int8((int) L.gu_type, n_embd_) || !Mmq::int8((int) L.u_type, n_embd_) ||
+                     !Mmq::int8((int) L.d_type, n_ff_exp_);
+    if (halves) kernels::iq_kernels_load();
+    (void) cudaMemGetInfo(&free1, &total);
+    std::fprintf(stderr, "strata-poly: the prompt's kernels loaded in %.0f ms (%.0f MiB of VRAM)\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                 free0 > free1 ? (double) (free0 - free1) / (1 << 20) : 0.);
+}
+#endif
 
 void Inkling2::begin_pass() {
     blocks_.assign(layers_.size(), Block{});

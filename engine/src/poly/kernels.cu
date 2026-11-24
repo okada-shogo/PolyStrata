@@ -3564,6 +3564,18 @@ void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream) {
     bf16_to_f32_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(w, out, n);
 }
 
+// CUDA loads a file's kernels at the first launch of one of them (lazy loading, the default since CUDA 12.2): 50 to
+// 70 ms for this file's on an RTX 2070 Super, inside the first prompt.  Asking for a kernel's attributes loads them
+// here instead.  A card the file has no code for answers with an error, which is not kept.
+void kernels_load() {
+#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)   // (HIP builds keep the first launch's load)
+    // an error an earlier launch left is not this call's to clear: it stays for the caller to see
+    if (cudaPeekAtLastError() != cudaSuccess) return;
+    cudaFuncAttributes a{};
+    if (cudaFuncGetAttributes(&a, (const void*) rms_norm_kernel) != cudaSuccess) (void) cudaGetLastError();
+#endif
+}
+
 void rms_norm(const float* x, const float* w, float* y, int n, int rows, float eps, void* stream, int y_stride) {
     rms_norm_kernel<<<rows, sum_threads(n), 0, cs(stream)>>>(x, w, y, n, eps, y_stride ? y_stride : n);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
