@@ -1208,6 +1208,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
 #else
     const bool rows_launch = per_row && n > 1;
 #endif
+    pmark(prof::kNorms);   // the profiler's families (profile.hpp): the mixes, controls and norms first
 
     // the tokens' embeddings, normed (a picture's rows are not: whole(); step()'s rows have none)
     if (il == 0 && (per_row || !image_at(pos_))) {
@@ -1291,6 +1292,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     // the stream that it joins after them.  gemv_bf16() is lin()'s launch for them.  Not on Metal: a recording there
     // is the capturing stream's alone, so the branch's launches ran once as it was made and never in its replays (the
     // sink and the taps stayed the recording token's), and each event committed a command buffer.
+    pmark(prof::kDense);
     const auto plain_bf16 = [](const Dev& d) { return !d.p || (d.type == kTypeBF16 && d.scale == 1.0f); };
 #if defined(STRATA_GPU_METAL)
     constexpr bool kBranch = false;
@@ -1328,6 +1330,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     }
     const float alpha = B.swa ? 0.f : log_alpha_;
     const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the tokens' positions from what at_ holds
+    pmark(prof::kKvStore);
     // one launch for all of it, the same bits (step()'s rows: a launch a row; load_geometry() takes no other heads)
     if ((n == 1 || per_row) && head_dim_ <= 128 && n_rel_ <= 128) {
         for (int i = 0; i < each; ++i) {
@@ -1423,6 +1426,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         c.kvq8 = kvq8_;
         ink_clips(c, st_);
     }
+    pmark(prof::kAttention);
     InkAttn a;
     a.q = q_;
     a.r = rr_;
@@ -1520,7 +1524,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         if (n == 1) a.q8 = xqo_;   // and the output quantized for wo
         ink_attend(a, st_);
     }
+    pmark(prof::kDense);
     lin(B.wo, att_, aoraw_, n, n == 1 && n < kStageRows ? xqo_ : nullptr);
+    pmark(prof::kNorms);
     // the first layer of a block starts a new stream from the attention's output; the one it had joins the mixes
     if (n == 1 || per_row) {   // the convolution and the stream's update in one launch (a launch a row of step()'s)
         const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
@@ -1587,6 +1593,7 @@ void Inkling2::layer_tail(Layer&, int il, int n) {
 }
 
 void Inkling2::tail_rows(int il, int n) {
+    pmark(prof::kNorms);
     const Slot& S = slots_[(size_t) slot_of(il, pass_of(il))];
     if (n == 1 && std::exchange(moe_left_, false)) {   // moe_card() left the experts' sum here
         ink_moe_conv_add(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(run_slot(il, 0)),

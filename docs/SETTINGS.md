@@ -11,7 +11,7 @@ A number or a word is set like any environment variable, for example `STRATA_KVA
 (`terminal/strata-<model>.json`), which the server passes to the engine. The Strata project's Terminal writes it there with
 `strata launch --set NAME=value`.
 
-## Switches you can turn on (347)
+## Switches you can turn on (350)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -277,6 +277,9 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PREFILL_ROUTED_STREAM_DEPTH` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PREFILL_STREAM_ALL` | on / off | Intel Arc | [INTEL.md](INTEL.md) |
 | `STRATA_PRIMARY_DEVICE` | number | NVIDIA and AMD | [SECOND_GPU.md](SECOND_GPU.md) |
+| `STRATA_PROFILE` | on / off | NVIDIA and AMD | [COMMUNITY_BENCHMARKS.md](COMMUNITY_BENCHMARKS.md) |
+| `STRATA_PROFILE_EVERY` | number | NVIDIA and AMD | - |
+| `STRATA_PROFILE_OUT` | text | NVIDIA and AMD | [COMMUNITY_BENCHMARKS.md](COMMUNITY_BENCHMARKS.md) |
 | `STRATA_PROMPT_ATTN_IMMA` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PROMPT_DIRECT` | on / off | NVIDIA and AMD | [QUANTS.md](QUANTS.md) |
 | `STRATA_PW_WITH_BATCH` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |

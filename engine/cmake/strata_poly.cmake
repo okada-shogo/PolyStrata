@@ -10,8 +10,42 @@
 # builds the products llama.cpp's way instead (its MMQ kernels, its flash-attention kernel from its headers and the GDN
 # adapter that needs them), from a llama.cpp checkout given as -DSTRATA_GGML_DIR: an override kept for two releases.
 
+# --bench-report names the commit the engine was built from: -DSTRATA_GIT_COMMIT=<id> when given (a build host that
+# copies the tree without .git passes its own: rbuild does), else git's at configure time, else a COMMIT file beside
+# engine/ (a source package can carry one), else "unknown".
+set(STRATA_GIT_COMMIT "" CACHE STRING "the commit --bench-report names (empty: git describe at configure time)")
+function(strata_poly_commit src)
+  set(_commit "${STRATA_GIT_COMMIT}")
+  if(NOT _commit)
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+      execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev=10
+                      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE _out RESULT_VARIABLE _rc
+                      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      if(_rc EQUAL 0 AND _out)
+        set(_commit "${_out}")
+      endif()
+    endif()
+  endif()
+  if(NOT _commit AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../COMMIT")
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../COMMIT" _lines LIMIT_COUNT 1)
+    if(_lines)
+      list(GET _lines 0 _commit)
+    endif()
+  endif()
+  if(NOT _commit)
+    set(_commit "unknown")
+  endif()
+  string(REGEX REPLACE "[^A-Za-z0-9._+-]" "" _commit "${_commit}")   # a short id, nothing that needs quoting
+  set_property(SOURCE ${src} APPEND PROPERTY COMPILE_DEFINITIONS "STRATA_GIT_COMMIT=\"${_commit}\"")
+endfunction()
+
 macro(strata_poly)
 if(STRATA_BUILD_TESTS)
+  # --bench-report's JSON, Markdown, explain section and privacy scrub, from figures of the test's own (no card)
+  add_executable(poly_bench_report_test src/poly/bench_report_test.cpp src/poly/bench_report.cpp)
+  target_include_directories(poly_bench_report_test PRIVATE include)
+  add_test(NAME poly_bench_report_test COMMAND poly_bench_report_test)
   add_executable(glm_conversations_test src/poly/conversations_test.cpp src/poly/spill.cpp)
   add_test(NAME glm_conversations_test COMMAND glm_conversations_test)
   add_executable(poly_guesses_test src/poly/guesses_test.cpp src/spec/draft_policy.cpp)
@@ -205,8 +239,20 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/expert_card.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
                             src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
-                            src/poly/spill.cpp src/core/conversation_memory.cpp src/core/conversation_file.cpp)
+                            src/poly/spill.cpp src/core/conversation_memory.cpp src/core/conversation_file.cpp
+                            src/poly/bench_report.cpp src/poly/bench_probe.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  strata_poly_commit(src/poly/bench_report.cpp)
+  # the profiler's launch counter (src/poly/launch_count.cpp): the runtime's launch call wrapped at link time, Linux
+  # only (elsewhere the profile counts the recordings' kernel nodes alone)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(strata-poly PRIVATE src/poly/launch_count.cpp)
+    if(STRATA_ENABLE_HIP)
+      target_link_options(strata-poly PRIVATE "LINKER:--wrap=hipLaunchKernel")
+    else()
+      target_link_options(strata-poly PRIVATE "LINKER:--wrap=cudaLaunchKernel" "LINKER:--wrap=cudaLaunchKernelExC")
+    endif()
+  endif()
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
   # memory management calls, which the HIP runtime itself provides (hip_compat/cuda.h)
   if(STRATA_ENABLE_HIP)

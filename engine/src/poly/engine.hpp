@@ -15,6 +15,7 @@
 #pragma once
 
 #include "cpu_experts.hpp"
+#include "profile.hpp"
 #include "strata/poly/kernels.hpp"
 
 #include <atomic>
@@ -274,6 +275,8 @@ public:
     double numa_share() const { return node_share_; }
     int64_t pos() const { return pos_; }
     int64_t meta_u(const char* key, int64_t fallback) const;
+    /// A string of the metadata (general.architecture, general.name, ...); "" when the file has none.
+    std::string meta_s(const char* key) const;
     /// The mapped bytes of each of the model's files, the one with the metadata first; {nullptr, 0} for a file
     /// without tensors.
     std::vector<std::pair<const uint8_t*, size_t>> model_views() const;
@@ -472,6 +475,23 @@ public:
     int step_rows_alone() const;
     /// Sequence `to` becomes what sequence `from` is: its position, state, rows and pictures, copied on the card.
     void copy_seq(int from, int to);
+
+    /// The event profiler (STRATA_PROFILE=1, --bench-report; profile.hpp says what it records): on from here, an
+    /// answer's tokens split one in `every`.  Off (the default), the engine records nothing and launches as before.
+    void enable_profile(int every);
+    bool profiling() const { return tl_ != nullptr; }
+    /// The calls so far are a prompt's (prof::kPrompt) or an answer's (prof::kDecode); `request`: a new request
+    /// starts, so the time since the last call is not the stream's gap.
+    void prof_phase(int phase, bool request);
+    /// The figures so far, once the stream is done with the calls made (it waits for them); null when off.
+    const prof::Profile* profile();
+    void profile_reset();
+    /// The routed experts' shape, for the CPU probe of --bench-report: the first MoE layer's types and sizes.
+    struct ExpertShape {
+        int gu_type = -1, u_type = -1, d_type = -1, n_embd = 0, n_ff = 0, n_used = 0, n_expert = 0, n_moe = 0;
+        size_t gu_bytes = 0, u_bytes = 0, d_bytes = 0;   ///< one expert's gate, up and down
+    };
+    ExpertShape expert_shape() const;
 
 protected:
     // ---- what an architecture supplies ----
@@ -974,6 +994,45 @@ protected:
     long long* at_ = nullptr;     ///< on the card: {pos(), turn(pos())}, and the same for a window's later tokens
     long long* h_at_ = nullptr;   ///< pinned
     bool recording_ = false;      ///< a layer's launches are being recorded: positions are read from at_
+    // ---- the event profiler (profile.hpp); tl_ null: off ----
+    struct Timeline;
+    std::unique_ptr<Timeline> tl_;
+    /// From here the stream's work is family f (prof::Fam), in a call that is split.
+    void pmark(int f) {
+        if (tl_) pmark_on(f);
+    }
+    void pmark_on(int f);
+    /// A call into the engine starts (n tokens) and ends; calls inside calls count as the outer one.
+    void prof_begin(int n) {
+        if (tl_) prof_begin_on(n);
+    }
+    void prof_end() {
+        if (tl_) prof_end_on();
+    }
+    void prof_begin_on(int n);
+    void prof_end_on();
+    struct ProfCall {   ///< prof_begin() and prof_end() around a call into the engine
+        Engine& e;
+        ProfCall(Engine& engine, int n) : e(engine) { e.prof_begin(n); }
+        ~ProfCall() {
+            try {
+                e.prof_end();
+            } catch (...) {
+            }
+        }
+    };
+    /// The call under way is split (its families are recorded), and a way to stop that (threads that share the stream).
+    bool prof_split() const;
+    void prof_unsplit();
+    /// cudaGraphLaunch, with a mark of family `fam` before it in a split call.
+    void launch_graph(void* exec, int fam, const char* what);
+    /// A copy on another stream than st_ (the upload stream): its time and bytes, beside the work.
+    int pside_begin(void* stream);
+    void pside_end(int id, void* stream, double bytes);
+    /// Bytes of experts copied into VRAM in the stream in the call under way.
+    void prof_bytes(double bytes);
+    /// keep(): the window just called keeps n of the tokens it was fed.
+    void prof_kept(int n);
     bool recorded_ = false;       ///< took_record()
 
     // geometry

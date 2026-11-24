@@ -7,6 +7,10 @@
 // STOP and QUIT in, and RESUME, PP, T, DONE and ERR out.
 #include "conversations.hpp"
 #include "engine.hpp"
+#if !defined(STRATA_GPU_METAL)
+#include "bench_report.hpp"
+#include "strata/quant/types.hpp"
+#endif
 #include "guesses.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -45,6 +49,9 @@
 #endif
 #include <windows.h>
 #undef far   // a word of this file's
+#endif
+#if !defined(_WIN32)
+extern char** environ;
 #endif
 
 #ifndef STRATA_VERSION
@@ -387,6 +394,7 @@ struct Session {
     std::string pinned;                   // --pinned-session: the file serve() pins before its first request
     std::vector<Engine::CoRead> co_read;  // BCO: prompts for generate()'s first read() to take along
     bool co_done = false;                 // and that read took them
+    std::function<void()> after_request;  // STRATA_PROFILE=1: the profile written after each request
 
     Session(Engine& e, std::vector<int32_t> eos_ids, const CacheFlags& f, int lookup)
         : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
@@ -423,6 +431,7 @@ struct Session {
                     OnProgress on_progress, const std::function<bool(int64_t)>* between = nullptr) {
         Result r;
         const int64_t n = (int64_t) ids.size();
+        engine.prof_phase(strata::poly::prof::kPrompt, true);
         Clock::time_point t0 = Clock::now(), shown = t0;   // bringing a parked conversation back is prompt time
         engine.images(pictures.at.data(), (int) pictures.at.size());
         r.resume = kept.resume(ids);
@@ -522,6 +531,7 @@ struct Session {
         r.prompt_ms = ms_since(t0);
         if (std::strcmp(r.finish, "cancel") == 0) return r;
 
+        engine.prof_phase(strata::poly::prof::kDecode, false);
         t0 = Clock::now();
         std::vector<int32_t> history = kept.seq();
         std::replace_if(history.begin(), history.end(), [](int32_t t) { return t < 0; }, pad);
@@ -1383,6 +1393,7 @@ int serve(Session& ss) {
                     r.prompt_ms, r.decode_ms, r.finish, (long long) r.guessed_right, (long long) r.guessed,
                     (long long) r.resume, hits, hits + misses, (long long) r.read);
         std::fflush(stdout);
+        if (ss.after_request) ss.after_request();
         engine.trim();
         ss.kept.release();
         if (admit >= 0) {
@@ -1496,6 +1507,7 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                  st.route_wait_ms / (double) std::max<int64_t>(st.tokens, 1), (long long) st.swapped_experts,
                  (long long) st.ahead_sent, (long long) st.ahead_used, (long long) st.tail_experts,
                  (long long) r.guessed_right, (long long) r.guessed);
+    if (ss.after_request) ss.after_request();
     return 0;
 }
 
@@ -1628,6 +1640,227 @@ int check_batch(Engine& engine, const std::vector<int32_t>& ids, int k, long lon
     return rc;
 }
 
+#if !defined(STRATA_GPU_METAL)
+namespace bench = strata::poly::bench;
+namespace prof = strata::poly::prof;
+
+// The report's header: the card, the CPU, the model and the settings (no probes), for --bench-report and the
+// STRATA_PROFILE=1 session file.
+bench::Report report_base(Engine& engine, const Options& o, const std::vector<std::string>& args,
+                          const std::vector<std::pair<std::string, std::string>>& env) {
+    bench::Report r;
+    r.engine_version = STRATA_VERSION;
+    r.commit = bench::build_commit();
+    r.settings = bench::clean_args(args);
+    r.env = env;
+    r.gpu = bench::gpu_info(0);
+    r.host = bench::host_info();
+    r.host.engine_threads = engine.threads();
+    const Engine::ExpertShape x = engine.expert_shape();
+    std::string name = engine.meta_s("general.name");
+    if (name.empty()) name = std::filesystem::path(o.model).stem().string();
+    r.model.name = name;
+    r.model.arch = engine.meta_s("general.architecture");
+    const auto type_name = [](int t) {
+        const strata::quant::TypeInfo* ti = t >= 0 ? strata::quant::type_info(t) : nullptr;
+        return std::string(ti ? ti->name : "?");
+    };
+    r.model.file_type = x.gu_type < 0 ? "none" : type_name(x.gu_type) + (x.u_type != x.gu_type ? "/" + type_name(x.u_type) : "") +
+                                                     "/" + type_name(x.d_type);
+    double bytes = 0;
+    for (const auto& v : engine.model_views()) bytes += (double) v.second;
+    r.model.size_gib = bytes / (double) (1ull << 30);
+    r.model.n_expert = x.n_expert;
+    r.model.n_used = x.n_used;
+    r.model.n_moe = x.n_moe;
+    r.model.expert_mib = (double) (x.gu_bytes + x.u_bytes + x.d_bytes) / 1048576.0;
+    r.cached_experts = engine.cached_experts();
+    r.total_experts = engine.total_experts();
+    r.cached_gib = engine.cached_gib();
+    r.max_context = engine.max_context();
+    return r;
+}
+
+// An environment variable's text, "" when it is not set.
+std::string env_text(const char* name) {
+    const char* v = std::getenv(name);
+    return v ? std::string(v) : std::string();
+}
+
+// The prompts: random tokens from a fixed seed, among the vocabulary's first 32,000 past its first 1,000 (where the
+// special tokens of most vocabularies are), never an end-of-reply token.  The same on every PC for the same file.
+std::vector<int32_t> synthetic_tokens(size_t n, uint64_t seed, int n_vocab, const std::vector<int32_t>& eos) {
+    int lo = std::min(1000, n_vocab / 10), hi = std::min(n_vocab, 32000);
+    if (hi - lo < 100) lo = 0, hi = n_vocab;
+    std::vector<int32_t> out;
+    out.reserve(n);
+    uint64_t x = seed * 0x9E3779B97F4A7C15ull + 1;
+    while (out.size() < n) {
+        uint64_t z = (x += 0x9E3779B97F4A7C15ull);   // splitmix64
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        const int32_t t = lo + (int32_t) (z % (uint64_t) (hi - lo));
+        if (std::find(eos.begin(), eos.end(), t) == eos.end()) out.push_back(t);
+    }
+    return out;
+}
+
+// --bench-report: probes (before the load, in main()), a warm-up, the quick tier and, with --long, one long
+// conversation read in chunks with an answer at each checkpoint.  Greedy; no answer stops early.
+int bench_report(Session& ss, bench::Report& rep, bool long_tier, const std::string& out,
+                 const Clock::time_point started, const std::vector<int32_t>& text) {
+    Engine& engine = ss.engine;
+    const std::vector<int32_t> eos = ss.eos;
+    ss.eos.clear();   // every answer as long as asked
+    Sampling greedy;
+    greedy.temperature = 0.f;
+    std::atomic<bool> stop{false};
+    const int ctx = engine.max_context();
+    std::vector<int32_t> said;
+    const int most = ss.most;
+    const bool look = ss.look;
+    // `single`: one token a call (no guesses), whatever the settings: what the card, the link and the CPU do for a
+    // token, apart from how often the guesses are right
+    const auto one = [&](const std::string& name, const std::vector<int32_t>& ids, long long max_new, bool single) {
+        std::fprintf(stderr, "strata-poly: bench %s: %zu prompt tokens, %lld to write\n", name.c_str(), ids.size(), max_new);
+        engine.profile_reset();
+        said.clear();
+        ss.most = single ? 1 : most;
+        ss.look = single ? false : look;
+        const Session::Result r = ss.generate(ids, Pictures{}, -1, -1, max_new, greedy, stop,
+                                              [&](int32_t t) { said.push_back(t); },
+                                              [](int64_t, int64_t, double, bool) {});
+        ss.most = most;
+        ss.look = look;
+        bench::Run run;
+        run.name = name;
+        run.single = single;
+        run.prompt_tokens = (int64_t) ids.size();
+        run.reused = r.resume;
+        run.read = r.read;
+        run.prompt_ms = r.prompt_ms;
+        run.produced = r.produced;
+        run.decode_ms = r.decode_ms;
+        run.guessed = r.guessed;
+        run.guessed_right = r.guessed_right;
+        run.context_end = engine.pos();
+        if (const prof::Profile* p = engine.profile()) run.profile = *p;
+        std::fprintf(stderr, "strata-poly: bench %s: %lld prompt tokens read at %.0f tok/s (%lld from the conversation), "
+                     "%lld generated at %.1f tok/s\n", name.c_str(), (long long) run.read, run.prompt_tok_s(),
+                     (long long) run.reused, (long long) run.produced, run.decode_tok_s());
+        return run;
+    };
+    const int vocab = engine.n_vocab();
+    // the prompts: pieces of --bench-text one after the other (no two start alike, so none goes on from another), or
+    // random tokens where none was given
+    size_t text_at = 0;
+    int seed = 10;
+    const auto take = [&](size_t n) {
+        if (text.empty()) return synthetic_tokens(n, (uint64_t) seed++, vocab, eos);
+        if (text_at + n > text.size()) text_at = 0;
+        std::vector<int32_t> v(text.begin() + (ptrdiff_t) text_at, text.begin() + (ptrdiff_t) std::min(text.size(), text_at + n));
+        text_at += n;
+        return v;
+    };
+    Clock::time_point t = Clock::now();
+    one("warm-up", take(302), 32, false);
+    rep.warm_s = ms_since(t) / 1000.0;
+    t = Clock::now();
+    const long long decode = 128;
+    for (const int n : {302, 2048, 8192}) {
+        if (n + 2 * decode + 8 > ctx) {
+            std::fprintf(stderr, "strata-poly: bench: the %d-token prompt does not fit the context (%d): left out\n", n, ctx);
+            continue;
+        }
+        const std::vector<int32_t> ids = take((size_t) n);
+        rep.runs.push_back(one("prompt " + std::to_string(n), ids, decode, false));
+        // the same prompt again (the conversation holds it: one token is read) and its answer a token a call
+        rep.runs.push_back(one("prompt " + std::to_string(n) + ", one token a call", ids, decode, true));
+    }
+    rep.quick_s = ms_since(t) / 1000.0;
+    std::string base = out;
+    if (base.size() > 5 && base.compare(base.size() - 5, 5, ".json") == 0) base.resize(base.size() - 5);
+    const auto write = [&] {
+        rep.total_s = ms_since(started) / 1000.0;
+        const std::string json = bench::to_json(rep), md = bench::to_markdown(rep);
+        for (const auto& [path, body] : {std::pair<std::string, const std::string*>{base + ".json", &json},
+                                         std::pair<std::string, const std::string*>{base + ".md", &md}}) {
+            std::ofstream f(path, std::ios::binary);
+            f << *body;
+            if (!f) {
+                std::fprintf(stderr, "strata-poly: bench: cannot write %s\n", path.c_str());
+                return false;
+            }
+        }
+        return true;
+    };
+    // the quick tier's report first: a long tier that runs out of memory or is stopped leaves it written
+    if (!write()) return 1;
+    if (long_tier) {
+        t = Clock::now();
+        std::vector<int> points;
+        const int cap = ctx - 256;
+        for (const int c : {8192, 32768, 65536, 131072})
+            if (c <= cap) points.push_back(c);
+        if (cap > 8192 && (points.empty() || cap > points.back() + 4096) && cap <= 131072) points.push_back(cap);
+        // one conversation: each checkpoint's prompt is the one before, its answer, and more of the same random text
+        // (the text from its start again where the quick tier's pieces were: other requests, the same text)
+        std::vector<int32_t> conv;
+        const std::vector<int32_t> more_text =
+            text.empty() ? synthetic_tokens(points.empty() ? 0 : (size_t) points.back(), 99, vocab, eos) : text;
+        size_t used = text.empty() ? 0 : std::min(text_at, more_text.size());
+        for (const int c : points) {
+            const size_t more = (size_t) c > conv.size() ? (size_t) c - conv.size() : 0;
+            if (used + more > more_text.size()) used = 0;
+            conv.insert(conv.end(), more_text.begin() + (ptrdiff_t) used,
+                        more_text.begin() + (ptrdiff_t) std::min(more_text.size(), used + more));
+            used = std::min(more_text.size(), used + more);
+            // the answer at each checkpoint a token a call: how decode slows with the context, guesses aside
+            try {
+                rep.long_points.push_back(one("long " + std::to_string(c / 1024) + "K", conv, 64, true));
+            } catch (const std::exception& e) {   // (out of VRAM at a long context, say): the points so far stay
+                rep.long_error = "stopped at " + std::to_string(c / 1024) + "K: " + e.what();
+                std::fprintf(stderr, "strata-poly: bench: the long tier %s\n", rep.long_error.c_str());
+                break;
+            }
+            conv.insert(conv.end(), said.begin(), said.end());
+            rep.long_s = ms_since(t) / 1000.0;
+            if (!write()) return 1;
+        }
+        rep.long_s = ms_since(t) / 1000.0;
+    }
+    ss.eos = eos;
+    if (!write()) return 1;
+    std::fprintf(stderr, "strata-poly: bench report written: %s.json and %s.md (%.0f s); attach both to a "
+                         "\"[Benchmark] bench report\" issue\n", base.c_str(), base.c_str(), rep.total_s);
+    return 0;
+}
+
+// STRATA_PROFILE=1 in normal use: after every request the session's profile so far goes to a file
+// (STRATA_PROFILE_OUT, default strata-profile.json in the working folder), and a line to the log.
+void write_session_profile(Engine& engine, const bench::Report& base, const std::string& path) {
+    const prof::Profile* p = engine.profile();
+    if (!p) return;
+    const prof::Acc& a = p->all[prof::kPrompt];
+    const prof::Acc& d = p->all[prof::kDecode];
+    const prof::Acc& ds = p->split[prof::kDecode];
+    const prof::Acc& as = p->split[prof::kPrompt];
+    const auto sh = [](const prof::Acc& x, int f) { return x.timeline_ms() > 0 ? 100.0 * x.fam_ms[f] / x.timeline_ms() : 0.0; };
+    std::fprintf(stderr, "strata-poly: profile: prompt %lld tokens %.0f tok/s (uploads %.0f%%, CPU experts %.0f%%, "
+                         "host gaps %.0f%%); decode %lld tokens %.1f tok/s (CPU experts %.0f%%, uploads %.0f%%, host "
+                         "gaps %.0f%%, GPU work %.0f%%)\n",
+                 (long long) a.tokens, a.wall_ms > 0 ? 1000.0 * a.tokens / a.wall_ms : 0.0, sh(as, prof::kWaitUpload),
+                 sh(as, prof::kWaitCpu), sh(as, prof::kHostGap), (long long) d.tokens,
+                 d.wall_ms > 0 ? 1000.0 * d.tokens / d.wall_ms : 0.0, sh(ds, prof::kWaitCpu), sh(ds, prof::kWaitUpload),
+                 sh(ds, prof::kHostGap),
+                 100.0 - sh(ds, prof::kWaitCpu) - sh(ds, prof::kWaitUpload) - sh(ds, prof::kHostGap));
+    std::ofstream f(path, std::ios::binary);
+    f << bench::session_json(base, *p);
+    if (!f) std::fprintf(stderr, "strata-poly: profile: cannot write %s\n", path.c_str());
+}
+#endif
+
 void usage() {
 #if defined(STRATA_GPU_METAL)
     std::fprintf(stderr, "Metal defaults: optimized expert overlap and compact MMQ (disable: --no-metal-optimize), "
@@ -1737,6 +1970,16 @@ void usage() {
                  "  --check-stagger        with --check-batch: prompts of different lengths (the first n >> 3 (K-1-j)\n"
                  "                         tokens), read while the others write, and answers of different lengths\n"
                  "  --eos-ids ID,ID,...    tokens that end a reply (default: the GGUF's eos, eot and eom)\n"
+                 "  --bench-report FILE    in place of --serve or --tokens: probe the card, the PCIe link, the RAM and the\n"
+                 "                         CPU experts' kernel, then read prompts of 302, 2,048 and 8,192 tokens of\n"
+                 "                         --bench-text (random tokens without it)\n"
+                 "                         and answer 128 tokens after each, greedy, with the other options as given;\n"
+                 "                         writes FILE.json and FILE.md with the speeds, the event profile and what\n"
+                 "                         they say against the probes, and nothing that names the PC or its user\n"
+                 "  --long                 with --bench-report: then one conversation read in chunks to 8K, 32K, 64K\n"
+                 "                         and 128K tokens (as far as --max-context goes), 64 answered at each\n"
+                 "  --bench-text IDS[@NAME] with --bench-report: the prompts are pieces of this file of token ids (the\n"
+                 "                         text polystrata.py bench-report makes and tokenizes), not random tokens\n"
                  "  --temperature F --top-k N --top-p F --min-p F --seed N   sampling for --tokens (default greedy)\n"
                  "  --images FILE          with --tokens: the prompt's pictures, as strata-vision writes them\n"
                  "  --image-pad ID         the token whose runs in --tokens are the pictures' places, a token a row\n"
@@ -1770,6 +2013,10 @@ void usage() {
                  "                         comes a few at a time; the weights stay the router's own: fewer\n"
                  "                         experts on the CPU, and the answers move (default 0 = off)\n"
                  "environment: STRATA_ROUTE_TAIL_SKIP=N  in place of --tail-skip (0 turns it off)\n"
+                 "environment: STRATA_PROFILE=1  the event profiler: after every request the GPU's time by kernel\n"
+                 "                         family and its waits, prompt and decode apart and by context, go to\n"
+                 "                         STRATA_PROFILE_OUT (default strata-profile.json) and a line to the log;\n"
+                 "                         STRATA_PROFILE_EVERY=N splits one decode token in N (default 16)\n"
                  "environment: STRATA_FREEZE_EXPERTS=1  hold the split of the routed experts between the card\n"
                  "                         and the CPU still, so the same request gives the same greedy answer\n"
                  "                         bit for bit; with guesses on, add --window 1 for a repeat everywhere\n");
@@ -1811,6 +2058,16 @@ void on_terminate() {
 int main(int argc, char** argv) {
     std::set_terminate(on_terminate);
     no_power_throttling();
+    const Clock::time_point started = Clock::now();
+#if !defined(STRATA_GPU_METAL)
+    // for --bench-report and STRATA_PROFILE's file: the settings as given, before this process sets any of its own
+#if defined(_WIN32)
+    const auto env_given = strata::poly::bench::clean_env(_environ);
+#else
+    const auto env_given = strata::poly::bench::clean_env(environ);
+#endif
+    const std::vector<std::string> args_given(argv + 1, argv + argc);
+#endif
 #if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
     // The cached experts' warp kernel and 32 of them a launch (native_mmvq_slots_wide()), the HIP build's default,
     // here too unless STRATA_SLOTS_WARP says otherwise: the same bits, and on lab-pro6000 (RTX PRO 6000) Qwen3.6
@@ -1830,7 +2087,9 @@ int main(int argc, char** argv) {
     long long max_new = 32;
     int top_probs = 0, lookup = 3, image_pad = -1, check = 0;
     bool stagger = false;   // --check-stagger
-    std::string images, pinned;
+    std::string images, pinned, bench_out, bench_text_name;
+    bool bench_long = false;
+    std::vector<int32_t> bench_text;
     std::vector<int32_t> ids, eos, follow;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1908,6 +2167,25 @@ int main(int argc, char** argv) {
         else if (a == "--batch-mtp") o.batch_mtp = true;
         else if (a == "--check-batch") check = std::atoi(val());
         else if (a == "--check-stagger") stagger = true;
+        else if (a == "--bench-report") bench_out = val();
+        else if (a == "--long") bench_long = true;
+        else if (a == "--bench-text") {   // IDS@NAME: a file of token ids, and the text's name for the report
+            std::string v = val();
+            const size_t at = v.rfind('@');
+            bench_text_name = at == std::string::npos ? "a text given as token ids" : v.substr(at + 1);
+            if (at != std::string::npos) v.resize(at);
+            std::ifstream f(v, std::ios::binary);
+            std::string ids_s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            while (!ids_s.empty() && (ids_s.back() == '\n' || ids_s.back() == '\r' || ids_s.back() == ' ')) ids_s.pop_back();
+            if (!f.good() && ids_s.empty()) {
+                std::fprintf(stderr, "strata-poly: --bench-text: cannot read %s\n", v.c_str());
+                return 2;
+            }
+            if (!parse_ids(ids_s.c_str(), bench_text)) {
+                std::fprintf(stderr, "strata-poly: --bench-text takes a file of token ids separated by commas\n");
+                return 2;
+            }
+        }
         else if (a == "--draft-vocab") o.draft_vocab = std::atoi(val());
         else if (a == "--prompt-batch") o.prompt_batch = std::atoi(val());
         else if (a == "--stage-mib") o.stage_mib = std::atoi(val());
@@ -1952,10 +2230,33 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (o.model.empty() || (!want_serve && ids.empty()) || max_new < 1) {
+    if (o.model.empty() || (!want_serve && ids.empty() && bench_out.empty()) || max_new < 1) {
         usage();
         return 2;
     }
+    if (!bench_out.empty() && (want_serve || !ids.empty() || check > 0)) {
+        std::fprintf(stderr, "strata-poly: --bench-report runs on its own: not with --serve, --tokens or --check-batch\n");
+        return 2;
+    }
+    if (bench_long && bench_out.empty()) {
+        std::fprintf(stderr, "strata-poly: --long goes with --bench-report\n");
+        return 2;
+    }
+#if defined(STRATA_GPU_METAL)
+    if (!bench_out.empty()) {
+        std::fprintf(stderr, "strata-poly: --bench-report is not built for Metal\n");
+        return 2;
+    }
+#else
+    // the probes, before the model takes the card's memory and the RAM's bandwidth
+    strata::poly::bench::Probes probes;
+    if (!bench_out.empty()) {
+        std::fprintf(stderr, "strata-poly: bench: probing the hardware (a few seconds)\n");
+        strata::poly::bench::probe_hardware(probes, 0, [](const char* what) {
+            std::fprintf(stderr, "strata-poly: bench: %s\n", what);
+        });
+    }
+#endif
     if (o.batch < 0 || o.batch > 16 || check < 0 || check > o.batch || (check > 0 && (int) ids.size() <= check)) {
         std::fprintf(stderr, "strata-poly: --batch takes 0 to 16, and --check-batch at most --batch prompts, each "
                              "with tokens left of --tokens\n");
@@ -1996,6 +2297,7 @@ int main(int argc, char** argv) {
         const Clock::time_point t0 = Clock::now();
         loaded = Engine::open(o);
         Engine& engine = *loaded;
+        [[maybe_unused]] const double load_s = ms_since(t0) / 1000.0;
         std::fprintf(stderr, "strata-poly: loaded in %.1f s; %d of %d routed experts in VRAM (%.1f GiB), %d CPU threads\n",
                      ms_since(t0) / 1000.0, engine.cached_experts(), engine.total_experts(), engine.cached_gib(),
                      engine.threads());
@@ -2052,6 +2354,44 @@ int main(int argc, char** argv) {
         Session ss(engine, eos, cache, lookup);
         ss.pinned = pinned;
         int rc = 0;
+#if !defined(STRATA_GPU_METAL)
+        // the event profiler (profile.hpp): STRATA_PROFILE=1 in normal use, and --bench-report
+        const char* prof_env = std::getenv("STRATA_PROFILE");
+        const std::string prof_v = prof_env ? prof_env : "";
+        const bool passive = prof_v == "1" || prof_v == "on" || prof_v == "true";
+        if (passive || !bench_out.empty()) {
+            const char* every = std::getenv("STRATA_PROFILE_EVERY");
+            engine.enable_profile(every ? std::max(1, std::atoi(every)) : 16);
+        }
+        strata::poly::bench::Report base;
+        std::string prof_file;
+        if (passive || !bench_out.empty()) base = report_base(engine, o, args_given, env_given);
+        if (passive && bench_out.empty()) {
+            prof_file = env_text("STRATA_PROFILE_OUT");   // a file name
+            prof_file = prof_file.empty() ? std::string("strata-profile.json") : prof_file;
+            std::fprintf(stderr, "strata-poly: STRATA_PROFILE=1: the event profile goes to %s after every request\n",
+                         prof_file.c_str());
+            ss.after_request = [&] { write_session_profile(engine, base, prof_file); };
+        }
+        if (!bench_out.empty()) {
+            base.probes = probes;
+            base.probe_s = probes.seconds;
+            base.load_s = load_s;
+            base.tier = bench_long ? "long" : "quick";
+            std::vector<std::pair<int, int>> types;
+            const Engine::ExpertShape x = engine.expert_shape();
+            if (x.gu_type >= 0) types = {{x.gu_type, x.n_embd}, {x.d_type, x.n_ff}};
+            const Clock::time_point t = Clock::now();
+            strata::poly::bench::probe_dots(base.probes, types, engine.threads());
+            base.probe_s += ms_since(t) / 1000.0;
+            for (const auto& d : base.probes.dots)
+                std::fprintf(stderr, "strata-poly: bench: CPU dot %s (%s): %.1f GB/s on %d threads, %.1f on one\n",
+                             d.type.c_str(), d.kernel.c_str(), d.gbs_all, d.threads, d.gbs_one);
+            base.prompt_source = bench_text.empty() ? "random tokens of the vocabulary (no --bench-text)" : bench_text_name;
+            rc = bench_report(ss, base, bench_long, bench_out, started, bench_text);
+            return rc;   // the random prompts' expert counts are not saved into --expert-profile
+        }
+#endif
         if (want_serve) {
             rc = serve(ss);
         } else if ((long long) ids.size() + max_new > engine.max_context()) {

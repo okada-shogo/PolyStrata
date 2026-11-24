@@ -848,6 +848,352 @@ struct Engine::Swap {
     bool wait_freed = false;
 };
 
+// ---- the event profiler (profile.hpp) ----
+//
+// The stream's events of each call, kept until the stream is past them (flush()), then turned into the families'
+// times.  No event goes into a recording: a split token launches its kernels one by one (run()), and a replay in a
+// split call is one family (launch_graph()), so the replays every token makes are as they were.
+#if !defined(STRATA_GPU_METAL)
+// The kernel nodes of a recording (the profiler counts a replay's as launches).
+static uint64_t graph_kernels(cudaGraph_t g) {
+    size_t n = 0;
+    if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess || n == 0) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+#if defined(STRATA_USE_HIP)
+    std::vector<hipGraphNode_t> nodes(n);
+#else
+    std::vector<cudaGraphNode_t> nodes(n);
+#endif
+    if (cudaGraphGetNodes(g, nodes.data(), &n) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    uint64_t k = 0;
+    for (size_t i = 0; i < n; ++i) {
+#if defined(STRATA_USE_HIP)
+        hipGraphNodeType t{};
+        if (hipGraphNodeGetType(nodes[i], &t) == hipSuccess && t == hipGraphNodeTypeKernel) ++k;
+#else
+        cudaGraphNodeType t{};
+        if (cudaGraphNodeGetType(nodes[i], &t) == cudaSuccess && t == cudaGraphNodeTypeKernel) ++k;
+#endif
+    }
+    (void) cudaGetLastError();
+    return k;
+}
+
+struct Engine::Timeline {
+    struct Mark {
+        cudaEvent_t ev;
+        int fam;
+        bool pooled;          ///< the pool's, given back once read
+        uint64_t launches;    ///< prof::launch_counter() when it was recorded
+    };
+    struct Side {
+        cudaEvent_t a = nullptr, b = nullptr;
+        double bytes = 0;
+    };
+    struct Call {
+        int phase = prof::kPrompt;
+        int64_t pos = 0;
+        int n = 0;
+        bool split = false, gap = false;
+        std::vector<Mark> marks;
+        std::vector<Side> sides;
+        Clock::time_point t0, t1;
+        Stats s0, s1;
+        double bytes = 0;
+    };
+    std::mutex mu;
+    std::vector<cudaEvent_t> pool;
+    std::unordered_map<void*, uint64_t> kernels_of;   ///< a recording's kernel nodes, counted as it is made
+    std::deque<Call> pending;
+    std::unique_ptr<Call> cur;
+    int depth = 0;
+    cudaEvent_t last = nullptr;   ///< the last call's end, for the gap to the next one
+    Clock::time_point last_t;
+    bool next_gap = false;        ///< the next call goes on from the last one in the same request
+    int phase = prof::kPrompt;
+    int64_t decode_calls = 0;
+    prof::Profile prof;
+
+    ~Timeline() {
+        for (cudaEvent_t e : pool) (void) cudaEventDestroy(e);
+        for (const Call& c : pending) {
+            for (const Mark& m : c.marks)
+                if (m.pooled) (void) cudaEventDestroy(m.ev);
+            for (const Side& s : c.sides) {
+                if (s.a) (void) cudaEventDestroy(s.a);
+                if (s.b) (void) cudaEventDestroy(s.b);
+            }
+        }
+        if (cur)
+            for (const Mark& m : cur->marks)
+                if (m.pooled) (void) cudaEventDestroy(m.ev);
+        if (last) (void) cudaEventDestroy(last);
+    }
+    cudaEvent_t take() {
+        if (pool.empty()) {
+            cudaEvent_t e = nullptr;
+            ck(cudaEventCreate(&e), "the profiler's events");
+            return e;
+        }
+        cudaEvent_t e = pool.back();
+        pool.pop_back();
+        return e;
+    }
+    void give(cudaEvent_t e) {
+        if (e) pool.push_back(e);
+    }
+    // An event's own answers (not ready, not recorded) are taken off the error state; any other error is a launch's,
+    // and stays for the engine's next ck() to report.
+#if defined(STRATA_USE_HIP)
+    static constexpr cudaError_t kEventNotRecorded = hipErrorInvalidResourceHandle;
+#else
+    static constexpr cudaError_t kEventNotRecorded = cudaErrorInvalidResourceHandle;
+#endif
+    static void forget(cudaError_t e) {
+        if (e != cudaSuccess && cudaPeekAtLastError() == e &&
+            (e == cudaErrorNotReady || e == kEventNotRecorded))
+            (void) cudaGetLastError();
+    }
+    static float between(cudaEvent_t a, cudaEvent_t b) {
+        float ms = 0.f;
+        const cudaError_t e = cudaEventElapsedTime(&ms, a, b);
+        if (e != cudaSuccess) {
+            forget(e);
+            return 0.f;
+        }
+        return std::max(ms, 0.f);
+    }
+    static bool done(cudaEvent_t e, bool wait) {
+        const cudaError_t q = wait ? cudaEventSynchronize(e) : cudaEventQuery(e);
+        if (q == cudaSuccess) return true;
+        forget(q);
+        return false;
+    }
+    /// The calls the stream is past (all of them with `wait`) into prof.
+    void flush(bool wait) {
+        while (!pending.empty()) {
+            Call& c = pending.front();
+            bool ready = done(c.marks.back().ev, wait);
+            for (const Side& s : c.sides) ready = ready && (!s.b || done(s.b, wait));
+            if (!ready) return;
+            prof::Acc a;
+            for (size_t i = 0; i + 1 < c.marks.size(); ++i) {
+                a.fam_ms[c.marks[i].fam] += between(c.marks[i].ev, c.marks[i + 1].ev);
+                a.fam_launches[c.marks[i].fam] += (double) (c.marks[i + 1].launches - c.marks[i].launches);
+            }
+            if (c.gap && last) {
+                a.fam_ms[prof::kHostGap] += between(last, c.marks.front().ev);
+                a.wall_ms += std::chrono::duration<double, std::milli>(c.t0 - last_t).count();
+            }
+            a.wall_ms += std::chrono::duration<double, std::milli>(c.t1 - c.t0).count();
+            a.tokens = c.n;
+            a.calls = 1;
+            a.cpu_ms = c.s1.cpu_ms - c.s0.cpu_ms;
+            a.route_wait_ms = c.s1.route_wait_ms - c.s0.route_wait_ms;
+            a.cpu_experts = c.s1.cpu_experts - c.s0.cpu_experts;
+            a.gpu_experts = c.s1.gpu_experts - c.s0.gpu_experts;
+            a.upload_bytes = c.bytes;
+            for (const Side& s : c.sides)
+                if (s.a && s.b) {
+                    a.side_ms += between(s.a, s.b);
+                    a.side_bytes += s.bytes;
+                }
+            prof.add_call(c.phase, c.pos, c.split, a);
+            // the call's last event stays, for the gap to the next call; it is the pool's (prof_end_on())
+            for (size_t i = 0; i + 1 < c.marks.size(); ++i)
+                if (c.marks[i].pooled) give(c.marks[i].ev);
+            give(last);
+            last = c.marks.back().ev;
+            last_t = c.t1;
+            for (const Side& s : c.sides) give(s.a), give(s.b);
+            pending.pop_front();
+        }
+    }
+    /// A mark of the call under way, on stream st (an event of the pool).
+    void mark(int f, void* st) {
+        if (!cur->marks.empty() && cur->marks.back().fam == f) return;   // the same family goes on
+        cudaEvent_t e = take();
+        ck(cudaEventRecord(e, cs(st)), "the profiler's events");
+        cur->marks.push_back({e, f, true, prof::launch_counter()});
+    }
+};
+
+void Engine::enable_profile(int every) {
+    if (!tl_) tl_ = std::make_unique<Timeline>();
+    prof::launch_counting().store(true, std::memory_order_relaxed);
+    tl_->prof.every = std::max(every, 1);
+}
+
+void Engine::prof_phase(int phase, bool request) {
+    if (!tl_) return;
+    std::lock_guard<std::mutex> l(tl_->mu);
+    tl_->phase = phase == prof::kDecode ? prof::kDecode : prof::kPrompt;
+    if (request) {
+        tl_->next_gap = false;
+        ++tl_->prof.requests;
+    }
+}
+
+const prof::Profile* Engine::profile() {
+    if (!tl_) return nullptr;
+    OnCard here(device_, split_);
+    ck(cudaStreamSynchronize(cs(st_)), "the profile");
+    if (up_) ck(cudaStreamSynchronize(cs(up_)), "the profile");
+    std::lock_guard<std::mutex> l(tl_->mu);
+    tl_->flush(true);
+    return &tl_->prof;
+}
+
+void Engine::profile_reset() {
+    if (!profile()) return;
+    std::lock_guard<std::mutex> l(tl_->mu);
+    tl_->prof.reset();
+    tl_->next_gap = false;
+}
+
+void Engine::prof_begin_on(int n) {
+    Timeline& t = *tl_;
+    std::lock_guard<std::mutex> l(t.mu);
+    if (t.depth++ > 0) return;
+    t.flush(false);
+    t.cur = std::make_unique<Timeline::Call>();
+    Timeline::Call& c = *t.cur;
+    c.phase = t.phase;
+    c.pos = pos_;
+    c.n = n;
+    // (a call of no tokens, keep()'s, is never split and does not count for the sampling)
+    c.split = n > 0 && (t.phase == prof::kPrompt || t.decode_calls++ % t.prof.every == 0);
+    c.gap = t.next_gap;
+    c.t0 = Clock::now();
+    c.s0 = stats();
+    t.mark(c.split ? prof::kCopyH2D : prof::kUnsplit, st_);
+}
+
+void Engine::prof_end_on() {
+    Timeline& t = *tl_;
+    std::lock_guard<std::mutex> l(t.mu);
+    if (t.depth == 0 || --t.depth > 0) return;
+    Timeline::Call& c = *t.cur;
+    // the end is always a fresh event of the pool: the next call's gap is measured from it
+    cudaEvent_t e = t.take();
+    ck(cudaEventRecord(e, cs(st_)), "the profiler's events");
+    c.marks.push_back({e, prof::kHostGap, true, prof::launch_counter()});
+    c.t1 = Clock::now();
+    c.s1 = stats();
+    t.pending.push_back(std::move(c));
+    t.cur.reset();
+    t.next_gap = true;
+}
+
+void Engine::pmark_on(int f) {
+    Timeline& t = *tl_;
+    std::lock_guard<std::mutex> l(t.mu);
+    if (!t.cur || !t.cur->split) return;
+    if (recording_) return;   // a recording is replayed by later tokens: it has no events (launch_graph() marks it)
+    t.mark(f, st_);
+}
+
+bool Engine::prof_split() const { return tl_ && tl_->cur && tl_->cur->split; }
+
+void Engine::prof_unsplit() {
+    if (!tl_) return;
+    std::lock_guard<std::mutex> l(tl_->mu);
+    if (!tl_->cur || !tl_->cur->split) return;
+    tl_->mark(prof::kUnsplit, st_);
+    tl_->cur->split = false;
+}
+
+void Engine::launch_graph(void* exec, int fam, const char* what) {
+    if (tl_) {
+        Timeline& t = *tl_;
+        std::lock_guard<std::mutex> l(t.mu);
+        if (t.cur && t.cur->split) t.mark(fam, st_);
+        // a replay hands the card its recording's kernels: they count as launches of the family it is marked as
+        const auto it = t.kernels_of.find(exec);
+        if (it != t.kernels_of.end()) prof::launch_count().fetch_add(it->second, std::memory_order_relaxed);
+    }
+    ck(cudaGraphLaunch((cudaGraphExec_t) exec, cs(st_)), what);
+}
+
+int Engine::pside_begin(void* stream) {
+    if (!tl_) return -1;
+    Timeline& t = *tl_;
+    std::lock_guard<std::mutex> l(t.mu);
+    if (!t.cur || !t.cur->split) return -1;
+    Timeline::Side s;
+    s.a = t.take();
+    ck(cudaEventRecord(s.a, cs(stream)), "the profiler's events");
+    t.cur->sides.push_back(s);
+    return (int) t.cur->sides.size() - 1;
+}
+
+void Engine::pside_end(int id, void* stream, double bytes) {
+    if (!tl_ || id < 0) return;
+    Timeline& t = *tl_;
+    std::lock_guard<std::mutex> l(t.mu);
+    if (!t.cur || id >= (int) t.cur->sides.size()) return;
+    Timeline::Side& s = t.cur->sides[(size_t) id];
+    s.b = t.take();
+    ck(cudaEventRecord(s.b, cs(stream)), "the profiler's events");
+    s.bytes = bytes;
+}
+
+void Engine::prof_bytes(double bytes) {
+    if (!tl_) return;
+    std::lock_guard<std::mutex> l(tl_->mu);
+    if (tl_->cur) tl_->cur->bytes += bytes;
+}
+
+void Engine::prof_kept(int n) {
+    if (!tl_) return;
+    std::lock_guard<std::mutex> l(tl_->mu);
+    if (!tl_->pending.empty() && !tl_->cur) tl_->pending.back().n = std::min(tl_->pending.back().n, n);
+}
+#else   // Metal: no profiler (enable_profile() says so); the launches are as they were
+struct Engine::Timeline {};
+void Engine::enable_profile(int) {
+    std::fprintf(stderr, "strata-poly: the event profiler (STRATA_PROFILE) is not built for Metal\n");
+}
+void Engine::prof_phase(int, bool) {}
+const prof::Profile* Engine::profile() { return nullptr; }
+void Engine::profile_reset() {}
+void Engine::prof_begin_on(int) {}
+void Engine::prof_end_on() {}
+void Engine::pmark_on(int) {}
+bool Engine::prof_split() const { return false; }
+void Engine::prof_unsplit() {}
+void Engine::launch_graph(void* exec, int, const char* what) { ck(cudaGraphLaunch((cudaGraphExec_t) exec, cs(st_)), what); }
+int Engine::pside_begin(void*) { return -1; }
+void Engine::pside_end(int, void*, double) {}
+void Engine::prof_bytes(double) {}
+void Engine::prof_kept(int) {}
+#endif
+
+Engine::ExpertShape Engine::expert_shape() const {
+    ExpertShape x;
+    for (const Layer& L : layers_) {
+        if (!L.moe) continue;
+        x.gu_type = (int) L.gu_type;
+        x.u_type = (int) L.u_type;
+        x.d_type = (int) L.d_type;
+        x.gu_bytes = L.gu_bytes;
+        x.u_bytes = L.u_bytes;
+        x.d_bytes = L.d_bytes;
+        break;
+    }
+    x.n_embd = n_embd_;
+    x.n_ff = n_ff_exp_;
+    x.n_used = n_used_;
+    x.n_expert = n_expert_;
+    x.n_moe = n_moe_;
+    return x;
+}
+
 Engine::Engine() = default;
 
 Engine::~Engine() {
@@ -884,6 +1230,7 @@ Engine::~Engine() {
     aside_.reset();
     workers_.reset();
     mmq_.reset();
+    tl_.reset();   // the profiler's events (some of them recorded in graphs, which go below)
 #if defined(STRATA_GPU_METAL)
     // Metal recordings retain their resources. Retire them before releasing the allocation owners.
     for (void* g : graphs_) cudaGraphExecDestroy((cudaGraphExec_t) g);
@@ -1823,6 +2170,11 @@ std::vector<std::pair<const uint8_t*, size_t>> Engine::model_views() const {
 int64_t Engine::meta_u(const char* key, int64_t fallback) const {
     const MetaValue* v = gg_ ? gg_->get(key) : nullptr;
     return v && v->is_num() ? (int64_t) v->u : fallback;
+}
+
+std::string Engine::meta_s(const char* key) const {
+    const MetaValue* v = gg_ ? gg_->get(key) : nullptr;
+    return v && !v->is_num() ? v->s : std::string();
 }
 
 // A layer's tensor, under any of its names.  The draft block's are in the file it comes from.
@@ -4644,6 +4996,7 @@ int Engine::card_rows() const {
 
 // The router's scores, and the copies of them and of the experts' input to the host.
 void Engine::moe_router(const Layer& L, int n) {
+    pmark(prof::kRouting);
     const size_t ne = (size_t) n_expert_;
     int j = (int) (&L - layers_.data()) + 1;   // the next MoE layer, whose router on this layer's input guesses ahead
     while (j < n_layer_ && !layers_[(size_t) j].moe) ++j;
@@ -4775,10 +5128,12 @@ void Engine::vram_ahead(int j, int n, size_t part) {
     staged_il_ = -1;   // the staging buffer holds other experts now
     ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) g.read, 0), "upload ahead");
     uint8_t* at = stage_ + (size_t) me * ahead_slots_ * ahead_stride_;
+    const int side = pside_begin(up_);
     for (int i = 0; i < g.n; ++i, at += ahead_stride_) {
         ck(cudaMemcpyAsync(at, mirror(j, g.e[i]), L.gu2() + L.d_bytes, cudaMemcpyHostToDevice, cs(up_)), "upload ahead");
         ck(cudaEventRecord((cudaEvent_t) g.arrived[i], cs(up_)), "upload ahead");   // usable on its own
     }
+    pside_end(side, up_, (double) g.n * (double) (L.gu2() + L.d_bytes));
     ck(cudaEventRecord((cudaEvent_t) g.up, cs(up_)), "upload ahead");
     up_last_ = g.up;
     g.here = 0;
@@ -5171,6 +5526,7 @@ void Engine::pool_read(const Layer& L, PoolRead& r) {
 // thread that hands the cached experts to the card and ahead of them.
 bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
     const size_t e_row = (size_t) n_embd_;
+    pmark(prof::kRouting);   // to the experts' launches: the router's copy, and the stream idle while the host routes
     Clock::time_point t0 = Clock::now();
     ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
     stats_.route_wait_ms += ms_since(t0);
@@ -5367,12 +5723,15 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         const std::function<void()> launch = [&] {
             if (split_) cudaSetDevice(device_);   // one of the experts' threads, which every card's engine shares
             if (first && at == 0) (*first)();
+            pmark(prof::kExpertsGpu);
             if (own >= 0) {   // the miss this call took for the card, up before its experts run
                 const Ahead& g = ahead_[kAheadGroups];
                 ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) g.read, 0), "upload ahead");
+                const int side = pside_begin(up_);
                 ck(cudaMemcpyAsync(stage_ + (size_t) kAheadGroups * ahead_slots_ * ahead_stride_, mirror(il, own),
                                    L.gu2() + L.d_bytes, cudaMemcpyHostToDevice, cs(up_)),
                    "upload ahead");
+                pside_end(side, up_, (double) (L.gu2() + L.d_bytes));
                 ck(cudaEventRecord((cudaEvent_t) g.up, cs(up_)), "upload ahead");
                 up_last_ = g.up;
             }
@@ -5389,8 +5748,11 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             for (int i0 = 0, m; i0 < n_cached; i0 += m) {
                 // nor past the end of add_scaled()'s rows: d_'s rows from the start are the ones not added yet
                 m = std::min({per, (i0 < own_at ? own_at : n_cached) - i0, kSumRows - i0 % kSumRows});
-                if (i0 == own_at)
+                if (i0 == own_at) {
+                    pmark(prof::kWaitUpload);
                     ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ahead_[kAheadGroups].up, 0), "upload ahead");
+                    pmark(prof::kExpertsGpu);
+                }
                 kernels::MmvqSlots gate_up{}, up{}, down{};
                 gate_up.lanes = up.lanes = down.lanes = lane_slots_;
                 for (int j = 0; j < m; ++j) {
@@ -5441,6 +5803,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
 #endif
             // the next layer's guesses, up while the CPU computes this layer's experts
             if (ahead_j >= 0 && at == 0) vram_ahead(ahead_j, n, ahead_part);
+            if (n_host > 0) pmark(prof::kWaitCpu);   // the stream's next work is the CPU's experts' sum
         };
 
         // The next layer's router wait is what makes h_cpu_ free to write again.
@@ -5520,7 +5883,10 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
 }
 
 // The CPU's experts of n tokens into the routed experts' sum.
-void Engine::moe_add(int n) { axpy(h_cpu_, 1.f, fo_, n * n_embd_, true, st_); }
+void Engine::moe_add(int n) {
+    pmark(prof::kCopyH2D);   // the kernel reads the CPU's sums from pinned memory
+    axpy(h_cpu_, 1.f, fo_, n * n_embd_, true, st_);
+}
 
 // With every routed expert in VRAM, a few tokens' experts are routed on the card and found there by its picks
 // (moe_card()), so a layer never waits for the host.  The cache's slots go to the card again when they changed.
@@ -5582,6 +5948,7 @@ bool Engine::card_moe(int n) {
 // on the host, or its formats have no kernel for picks on the card.
 bool Engine::moe_card(Layer& L, int il, int n) {
     if (L.card == 0) return false;
+    pmark(prof::kRouting);
     if (!kernels::native_mmvq_ids_supported((int) L.gu_type) || !kernels::native_mmvq_ids_supported((int) L.u_type) ||
         !kernels::native_mmvq_ids_supported((int) L.d_type) || !route_card(il, n, d_ids_, d_wts_)) {
         L.card = 0;
@@ -5598,6 +5965,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
                   h_bell_, d_bell_seq_, st_);
         table = d_zslots_ + (size_t) il * n_expert_;
     } else if (!all_cached()) {   // card_far_: the experts it lacks, from the mirror into the staging buffer first
+        pmark(prof::kWaitUpload);
         far_plan(table, d_far_ + (size_t) il * n_expert_, d_ids_, rr, n_expert_, stage_, ahead_stride_, d_tab_,
                  d_fetch_, d_nfetch_, st_);
         far_pull(d_fetch_, d_nfetch_, rr, (L.gu2() + L.d_bytes + 15) / 16 * 16, st_);
@@ -5606,6 +5974,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     }
 #endif
     const size_t xq_row = kernels::native_q8_1_bytes(n_embd_), ff = (size_t) n_ff_exp_;
+    pmark(prof::kExpertsGpu);
     // a mixed layer's gate and up are each a matrix of n_ff rows of its own type, up's into the second half
     const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, xq_row, n_used_, g_, 2 * ff, lane_slots_};
     kernels::native_mmvq_ids((int) L.gu_type, gate_up, rr, n_embd_, L.mixed() ? n_ff_exp_ : 2 * n_ff_exp_, st_);
@@ -5628,7 +5997,10 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     if (moe_sum_later(n)) moe_left_ = true;
     else moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
 #if !defined(STRATA_GPU_METAL)
-    if (rings) bell_add(h_bell_, d_bell_seq_, h_cpu_, fo_, n_embd_, st_);   // (bells(): no sum later then)
+    if (rings) {   // (bells(): no sum later then)
+        pmark(prof::kWaitCpu);   // the card waits in it for the host's experts, then adds them
+        bell_add(h_bell_, d_bell_seq_, h_cpu_, fo_, n_embd_, st_);
+    }
 #endif
     return true;
 }
@@ -5700,12 +6072,33 @@ void Engine::bell_job() {
 // downs after them.  The two pinned buffers take turns, so the workers fill one while the other uploads.  `alone`:
 // stagers_ fill them, while the workers compute experts.
 void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone) {
+    // the profiler: on st_ the stream waits for these copies (and for the host that stages them); on another stream
+    // they go beside the work
+    const double prof_b = (double) m * (double) (L.gu_step + L.d_bytes);
+    if (stream == st_) {
+        pmark(prof::kWaitUpload);
+        prof_bytes(prof_b);
+    }
     staged_il_ = -1;   // whatever the buffer held
     for (Ahead& g : ahead_) {   // vram_ahead()'s groups go, once the calls that read them are done
         if (g.il < 0) continue;
         ck(cudaStreamWaitEvent(cs(stream), (cudaEvent_t) g.read, 0), "expert staging");
         g.il = -1;
     }
+    // the side copy's span from here, after the waits: the copies and, without the mirror, the host's staging between
+    // its chunks (the span's rate is that of the whole staging, not of the link alone)
+    struct Side {
+        Engine& e;
+        void* s;
+        int id;
+        double b;
+        ~Side() {
+            try {
+                e.pside_end(id, s, b);
+            } catch (...) {
+            }
+        }
+    } prof_side{*this, stream, stream == st_ ? -1 : pside_begin(stream), prof_b};
     const size_t step = L.gu_step, down_at = pad((size_t) m * step);
 #if !defined(STRATA_GPU_METAL)
     if (!mirror_of_.empty()) {
@@ -6319,6 +6712,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     // STRATA_POLY_STAGED_TILES: per size class and round, the staged experts' first rows (tb), and the same counted
     // from the round's first row (tb + n_tile * tile_row)
     int32_t* tb = cb + kClasses * ((size_t) n_expert_ + 1);
+    pmark(prof::kRouting);
     router_scores(L, n);
     // Routed on the card, a batch hands the host its picks: the host took longer to route a batch of 1,024 tokens
     // than the card took for its experts.
@@ -6334,7 +6728,9 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     }
     ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
 
+    pmark(prof::kDense);
     moe_shared(L, il, n);
+    pmark(prof::kRouting);   // the stream idle while the host routes, up to the tables' copy
 
     // read() takes a layer's calls one after the other, so the buffer may hold this layer's experts from the
     // call before (staged_).  The ones copied ahead do not depend on the routing and are this call's too.  A
@@ -6356,7 +6752,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         const Clock::time_point t = Clock::now();
         // the buffer is free once the layer before has read it
         ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) ev_free_, 0), "expert staging");
-        stage(L, L.ahead.data(), n_ahead, up_);
+        stage(L, L.ahead.data(), n_ahead, up_);   // (its time and bytes: the profiler's side copies)
         ck(cudaEventRecord((cudaEvent_t) ev_ahead_, cs(up_)), "expert staging");
         if (!freeze_experts_) {   // the measured times are the machine's, not the request's: keep them out of a freeze
             ahead_ms_ = ms_since(t);
@@ -6537,6 +6933,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     const int n_ex = (es.gate || es.up) && rg > 0 ? rg : 0;
     // A read of several calls copies each layer's experts outside the cache ahead (up_), and a copy of the tables
     // would wait behind them: there a kernel reads them from pinned memory.  A call alone keeps the copy.
+    pmark(prof::kCopyH2D);
     if (kernel_tables_ && opt_.stage_ahead > 0 && shared_ahead_) {
         copy2(h_tab_, tab_, (int) n_tab, h_ex_, d_ex_, n_ex, st_);
     } else {
@@ -6610,6 +7007,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     int holds = -1;   // the round in the buffer when this call is done
     // The card's part.  With the CPU's beside it, the rows of its experts' places are left at nothing.
     const auto card = [&] {
+        pmark(prof::kExpertsGpu);
         if (n_cpu > 0) ck(cudaMemsetAsync(dx_, 0, (size_t) rr * n_embd_ * sizeof(float), cs(st_)), "expert rows");
         if (rg > 0) Mmq::quantize(xn_, tok_of ? nullptr : d_tok, mq_, gt, n_embd_, n_embd_, q_rows, st_);
         if (rg > 0 && L.mixed()) Mmq::quantize(xn_, tok_of ? nullptr : d_tok, mqu_, ut, n_embd_, n_embd_, q_rows, st_);
@@ -6695,11 +7093,13 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             if (r == kept) {
                 // the buffer has it
             } else if (r == 0 && early) {
+                pmark(prof::kWaitUpload);
                 ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_ahead_, 0), "expert staging");
             } else if (rows > 0) {
-                stage(L, group_.data() + g0, m, st_, n_cpu > 0);
+                stage(L, group_.data() + g0, m, st_, n_cpu > 0);   // (a wait_upload of its own)
                 holds = r;
             }
+            pmark(prof::kExpertsGpu);
             if (rows == 0) continue;   // nothing routed to the experts that go ahead
             int most = 0;
             for (int g = g0; g < g0 + m; ++g) most = std::max(most, rows_of(g));
@@ -6740,6 +7140,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             if (guard) scale_rows(dx_, n_embd_, n_embd_, rows, d_place + r0, hf_ + r0, false, st_);
         }
         ck(cudaEventRecord((cudaEvent_t) ev_free_, cs(st_)), "expert staging");
+        if (n_cpu > 0) pmark(prof::kWaitCpu);   // the experts' sum waits for the CPU's
     };
     if (n_cpu == 0) {
         card();
@@ -6767,6 +7168,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             share_[size] = std::clamp(0.5 * share_[size] + 0.5 * g / (c + g), 0.05, 0.95);
         }
     }
+    pmark(prof::kExpertsGpu);
     moe_sum(dx_, d_w, fo_, n_embd_, n_used_, n, st_);
     if (n_cpu > 0) moe_add(n);
     if (ahead && holds >= 0) {
@@ -6811,9 +7213,18 @@ void* Engine::record(F&& work) {
         exec = nullptr;
         made = cudaGraphInstantiateWithFlags(&exec, g, 0);
     }
+#if !defined(STRATA_GPU_METAL)
+    const uint64_t kernels = tl_ ? graph_kernels(g) : 0;
+#endif
     cudaGraphDestroy(g);
     ck(made, "cudaGraphInstantiate");
     graphs_.push_back(exec);
+#if !defined(STRATA_GPU_METAL)
+    if (tl_) {
+        std::lock_guard<std::mutex> l(tl_->mu);
+        tl_->kernels_of[(void*) exec] = kernels;
+    }
+#endif
     return exec;
 }
 
@@ -6835,7 +7246,7 @@ bool Engine::step_replay(std::map<std::vector<int>, void*>& in, const std::vecto
         ++step_unrecorded_;
         return false;
     }
-    ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "layer graph");
+    launch_graph(g, prof::kGraph, "layer graph");
     step_used_[g] = step_no_;
     return true;
 }
@@ -6883,6 +7294,9 @@ void* Engine::record_step(const std::function<void()>& work) {
         exec = nullptr;
         made = forced ? cudaErrorMemoryAllocation : cudaGraphInstantiateWithFlags(&exec, g, 0);
     }
+#if !defined(STRATA_GPU_METAL)
+    const uint64_t kernels = tl_ && made == cudaSuccess ? graph_kernels(g) : 0;
+#endif
     cudaGraphDestroy(g);
     if (made == cudaErrorMemoryAllocation) {
         cudaGetLastError();
@@ -6897,6 +7311,12 @@ void* Engine::record_step(const std::function<void()>& work) {
     graphs_.push_back(exec);
     step_used_[exec] = step_no_;
     ++step_made_;
+#if !defined(STRATA_GPU_METAL)
+    if (tl_) {   // the profiler counts a replay's kernels (launch_graph())
+        std::lock_guard<std::mutex> l(tl_->mu);
+        tl_->kernels_of[(void*) exec] = kernels;
+    }
+#endif
     if (step_used_.size() > step_cap_) trim_step_graphs(step_cap_ / 4 * 3, false);
     if (step_dropped_ == 0 && step_used_.size() >= 2 * std::max<size_t>(step_logged_, 128)) {   // the size, for the cap
         step_logged_ = step_used_.size();
@@ -6931,6 +7351,12 @@ void Engine::trim_step_graphs(size_t keep, bool all) {
     drop(step_passes_);
     graphs_.erase(std::remove_if(graphs_.begin(), graphs_.end(), [&](void* g) { return gone.count(g) > 0; }),
                   graphs_.end());
+#if !defined(STRATA_GPU_METAL)
+    if (tl_) {   // (a later recording may take a dropped one's address)
+        std::lock_guard<std::mutex> l(tl_->mu);
+        for (void* g : gone) tl_->kernels_of.erase(g);
+    }
+#endif
     for (void* g : gone) {
         ck(cudaGraphExecDestroy((cudaGraphExec_t) g), "a step's recording");
         step_used_.erase(g);
@@ -6990,7 +7416,7 @@ void Engine::run(const int32_t* tokens, int n) {
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
-        ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
+        launch_graph(made[key], prof::kGraph, "layer graph");
     };
     if (replay) {   // a pair a token: a window's tokens may go one by one, each from its own
         for (int t = 0; t < n; ++t) {
@@ -7008,16 +7434,19 @@ void Engine::run(const int32_t* tokens, int n) {
         Layer& L = layers_[(size_t) il];
         prefetch_layer(il, m);
         const size_t head = (size_t) head_key(il, m) * recs + rec;
+        pmark(prof::kAttention);
         if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, m); });
         else layer_head(L, il, m);
         if (!L.moe || batched(L, m)) return;
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
+        pmark(prof::kDense);
         if (replay && shared_recorded()) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
         else moe_shared(L, il, m);
     };
     const auto tail = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         dbg("ffn", il, fo_, n_embd_);
+        pmark(prof::kNorms);
         if (replay && L.fixed) replayed(L.tail, (size_t) tail_key(il, m) * recs + rec, [&] { layer_tail(L, il, m); });
         else layer_tail(L, il, m);
     };
@@ -7037,6 +7466,7 @@ void Engine::run(const int32_t* tokens, int n) {
     // A half's launches are the ones its tokens have in a call of their own, at their rows of the buffers
     // (shift_rows()), so each token comes out as it would alone.
     if (n > 1 && windowed_ && !card_routes() && halves_) {
+        prof_unsplit();   // two threads hand the stream the halves' launches: their families interleave
         const int first[3] = {0, (n + 1) / 2, n};   // half k is the tokens [first[k], first[k + 1])
         const unsigned bits = snap_bits_;           // the window's tokens that leave the recurrent state
         int at = 0;
@@ -7130,6 +7560,10 @@ void Engine::run(const int32_t* tokens, int n) {
         const Layer& L = layers_[(size_t) il];
         whole = L.fixed && (!L.moe || L.card == 1);
     }
+    // The profiler's split token (prof_split()): its launches one by one, layer by layer, as the first tokens' are
+    // before anything is recorded, so that its families have events between them (a recording has none).  A block
+    // of guesses is recorded whole or not at all: it stays unsplit.
+    if (prof_split() && !block_pass_) whole = replay = false;
     // A block of guesses is recorded whole or not at all: a layer's own recordings are a window's, of other kernels.
     if (block_pass_ && !whole) replay = false;
     if (whole) {
@@ -7150,10 +7584,13 @@ void Engine::run(const int32_t* tokens, int n) {
                 whole_pdl_scope() = whole_pdl();
                 for (int done = 0; il < hi_ && done < count; il = next_layer(il), ++done) {
                     Layer& L = layers_[(size_t) il];
+                    pmark(prof::kAttention);
                     layer_head(L, il, n);
                     if (!L.moe) continue;
+                    pmark(prof::kDense);
                     moe_shared(L, il, n);
                     moe_card(L, il, n);
+                    pmark(prof::kNorms);
                     layer_tail(L, il, n);
                 }
             };
@@ -7177,7 +7614,7 @@ void Engine::run(const int32_t* tokens, int n) {
             for (int c = 0;; ++c) {
                 const auto it = passes_.find(part(c));
                 if (it == passes_.end()) break;
-                ck(cudaGraphLaunch((cudaGraphExec_t) it->second, cs(st_)), "layer graph");
+                launch_graph(it->second, prof::kGraph, "layer graph");
                 ck(gpu::metal::submit(static_cast<gpu::Stream>(st_)), "layer graph");
             }
             runs_done();
@@ -7192,8 +7629,8 @@ void Engine::run(const int32_t* tokens, int n) {
             pass = record(layers(rest ? first : INT_MAX));
             if (rest) *rest = record(layers(INT_MAX));
         }
-        ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
-        if (rest) ck(cudaGraphLaunch((cudaGraphExec_t) *rest, cs(st_)), "layer graph");
+        launch_graph(pass, prof::kGraph, "layer graph");
+        if (rest) launch_graph(*rest, prof::kGraph, "layer graph");
         runs_done();
         if (bell_) bell_serve();
         return;
@@ -7243,6 +7680,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     if (guesses && !steps_guesses()) throw std::logic_error("step: guesses need --batch-mtp, a draft block and one card");
     if (!step_seqs_.empty()) throw std::logic_error("step: the rows of the step before are not kept yet (keep_step())");
     OnCard here(device_, split_);
+    const ProfCall prof_call(*this, n);   // (rows fed: a step's guesses count as tokens)
     end_read();
     const int home = bound_;
     const auto use = [&](int s) { hold(s); };
@@ -7298,7 +7736,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
-        ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
+        launch_graph(made[key], prof::kGraph, "layer graph");
     };
     // A step of one row rings the doorbell as run() rings it for a token (bell_on(): card_moe() routes such a row on
     // the card for it): its misses go to this thread's workers from inside the launches, which bell_serve() answers
@@ -7396,7 +7834,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         } else {
             void*& pass = step_passes_[wkey];
             if (!pass) pass = record(whole_work);
-            ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
+            launch_graph(pass, prof::kGraph, "layer graph");
         }
         for (int il = lo_; il < hi_; il = next_layer(il))
             stats_.gpu_experts += layers_[(size_t) il].moe ? R * n_used_ : 0;
@@ -7443,7 +7881,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             if (replay && L.fixed) {
                 void*& made = L.rows_heads[hkey];
                 if (!made) made = record([&] { layer_head(L, il, m); });
-                ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
+                launch_graph(made, prof::kGraph, "layer graph");
             } else {
                 layer_head(L, il, m);
             }
@@ -7533,7 +7971,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             } else if (replay && L.fixed) {
                 void*& made = L.rows_heads[key];
                 if (!made) made = record([&] { layer_head(L, il, R); });
-                ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
+                launch_graph(made, prof::kGraph, "layer graph");
             } else {
                 layer_head(L, il, R);
             }
@@ -7838,6 +8276,7 @@ void Engine::carry_in(int64_t from, int n) {
 
 void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
     OnCard here(device_, split_);
+    const ProfCall prof_call(*this, n);
     run(tokens, n);
     if (next_) {
         hand_on(pos_, n, pass_rows(n));
@@ -7859,6 +8298,7 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
             if (!want_logits) return;
             lin(output_, h + (size_t) (m - 1) * n_embd_, logits_, 1);
             finish_logits(logits_, 1);
+            pmark(prof::kCopyD2H);
             if (picks) {   // the lowest id of the largest score, as most_likely() picks it
                 likeliest(logits_, n_vocab_, d_picks_, st_);
                 ck(cudaMemcpyAsync(h_picks_, d_picks_, sizeof(Likeliest), cudaMemcpyDeviceToHost, cs(st_)), "logits");
@@ -7868,10 +8308,11 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
                                cs(st_)),
                "logits");
         };
+        pmark(prof::kDense);
         if (replay) {
             void*& graph = picks ? tail_picks_ : tail_;
             if (!graph) graph = record(tail);
-            ck(cudaGraphLaunch((cudaGraphExec_t) graph, cs(st_)), "logits graph");
+            launch_graph(graph, prof::kDense, "logits graph");
         } else {
             tail();
         }
@@ -7886,15 +8327,18 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
 // A layer for n tokens, as run() hands it to the card when nothing is replayed or printed.
 void Engine::layer(int il, int n) {
     Layer& L = layers_[(size_t) il];
+    pmark(prof::kAttention);
     layer_head(L, il, n);
     if (!L.moe) return;
     if (batched(L, n)) {
         moe_rows(L, il, n);
     } else {
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
+        pmark(prof::kDense);
         moe_shared(L, il, n);
         if (moe(L, il, n)) moe_add(n);
     }
+    pmark(prof::kNorms);
     layer_tail(L, il, n);
 }
 
@@ -7914,6 +8358,7 @@ void Engine::layer_pack(int il, const Pack& p, float* rows) {
         pos_ = call.pos - by;
         shift_rows(by);
         tok_ = call.tok;
+        pmark(prof::kAttention);
         layer_head(L, il, call.m);
         tok_ = nullptr;
         shift_rows(-by);
@@ -7927,9 +8372,11 @@ void Engine::layer_pack(int il, const Pack& p, float* rows) {
             moe_rows(L, il, p.m);
         } else {
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
+            pmark(prof::kDense);
             moe_shared(L, il, p.m);
             if (moe(L, il, p.m)) moe_add(p.m);
         }
+        pmark(prof::kNorms);
         layer_tail(L, il, p.m);
     }
     tok_ = last.tok;
@@ -7964,6 +8411,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         all += co[j].n;
     }
     if (n_co > 0 && !co_reads()) throw std::logic_error("read: co-reads are one card's, where a read is several calls");
+    OnCard prof_card(device_, split_);   // the profiler's events go on this card's stream
+    const ProfCall prof_call(*this, n);
     // (a read of no tokens of its own takes co-reads: a request whose prompt the conversation holds but its last token)
     if (n < (n_co > 0 ? 0 : 1) || all > read_rows_)
         throw std::logic_error("read takes 1 to max_read() tokens, co-reads among them");
@@ -8433,6 +8882,7 @@ unsigned Engine::snap_tokens(int t) const {
 void Engine::window(const int32_t* tokens, int t) {
     if (t < 1 || t > opt_.window) throw std::logic_error("a window takes 1 to max_window() tokens");
     OnCard here(device_, split_);
+    const ProfCall prof_call(*this, t);
     end_read();
     // the two ways are a choice only with experts on the CPU; a call that records launches says nothing of them
     const bool timed = t > 1 && !card_routes();
@@ -8510,6 +8960,8 @@ void Engine::took_way(int t, double ms) {
 void Engine::keep(int n) {
     if (n < 1 || n > win_) throw std::logic_error("keep takes 1 to the window's tokens");
     OnCard here(device_, split_);
+    prof_kept(n);   // the window's call counts the tokens kept, not the guesses fed with them
+    const ProfCall prof_call(*this, 0);
     // The next card reads the window's rows again for the tokens it puts through its layers again: a right token's
     // row is the same, whatever came after it.
     if (n < win_) {

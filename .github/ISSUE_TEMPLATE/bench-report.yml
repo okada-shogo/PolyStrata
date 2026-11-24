@@ -1,0 +1,49 @@
+name: Bench report
+description: Post the report strata-poly --bench-report wrote on your PC, so the maintainers see where speed is left on hardware they do not have
+title: "[Benchmark] bench report: "
+labels: ["benchmark"]
+body:
+  - type: markdown
+    value: |
+      The title must start with **[Benchmark]**. Add your GPU and model after it, for example `[Benchmark] bench report: RTX 3060 12 GB, Inkling 2 Mini IQ4_NL`.
+
+      Make the report with the settings you use every day. With the server stopped (it needs the GPU):
+
+      ```
+      python polystrata.py bench-report --model <name>            # about a minute after the model loads, more on a slow card
+      python polystrata.py bench-report --model <name> --long     # adds one long conversation read up to your context
+      ```
+
+      It writes `bench-report.json` and `bench-report.md` in the folder you run it from. They hold the GPU, CPU, RAM,
+      the engine's version, your settings, the speeds and where the GPU's time went, and no paths, user or host names,
+      serial numbers or prompts (the prompts are a fixed synthetic text). Read them before you post; `python tools/bench_reports.py
+      --check-privacy bench-report.json` checks them again.
+  - type: textarea
+    id: markdown
+    attributes:
+      label: The report (bench-report.md)
+      description: Paste the whole Markdown file.
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: json
+    attributes:
+      label: The JSON (bench-report.json)
+      description: Attach the file (drag it here) or paste it. The tools compare reports from it.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: What else ran on the PC, a laptop on battery, a changed power limit, other settings you tried.
+  - type: dropdown
+    id: reproduction-status
+    attributes:
+      label: Reproduction status
+      options:
+        - Measured locally
+        - Unconfirmed (I did not run it)
+    validations:
+      required: true
