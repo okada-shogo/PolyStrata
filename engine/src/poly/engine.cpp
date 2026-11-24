@@ -1795,6 +1795,7 @@ void Engine::metal_invalidate_graphs() {
     passes_.clear();
     step_passes_.clear();
     step_used_.clear();   // (destroyed with graphs_ above)
+    rec_made_.clear();
     tail_ = tail_picks_ = nullptr;
     for (Seq& q : seqs_) {
         q.heads.clear(); q.passes.clear(); q.tail = q.tail_picks = nullptr;
@@ -3131,7 +3132,9 @@ bool Engine::mind_card_vram() {
         return true;
     }
     if (minds_++ == 0) return false;   // nothing is recorded before the first request
-    const int64_t keep = opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128);
+    // (and what graph_room() took for recordings the card had no VRAM for)
+    const int64_t keep = (opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128)) +
+                         rec_room_mib_;
     if (free < keep / 2) {
         shrink_cache(size_t(keep - free) << 20);
         held_is_budget();
@@ -7430,9 +7433,30 @@ int Engine::room_key(int n) const {
     return key;
 }
 
-// Records what `work` hands to the stream, as a graph that is launched with one call from then on.
+// Records what `work` hands to the stream, as a graph that is launched with one call from then on.  Null when the card
+// has no VRAM for it (instantiate()): `work` has then run unrecorded (run_direct(), unless `run_if_not` is false), and
+// the caller launches nothing.  Its host side runs twice then, as record_step()'s does: recorded, then run.
+// STRATA_POLY_RECORD_FAIL=N (tests) fails every Nth recording that way; STRATA_POLY_RECORD_DROP=N drops the recordings
+// made before this call (drop_recordings()) before every Nth recording, and at the start of every Nth call.
+#if !defined(STRATA_GPU_METAL)
+namespace {
+int env_every(const char* name) {
+    const char* v = std::getenv(name);
+    return v ? std::max(0, std::atoi(v)) : 0;
+}
+}   // namespace
+#endif
+
 template <class F>
-void* Engine::record(F&& work) {
+void* Engine::record(F&& work, bool run_if_not) {
+    if (rec_off_ > 0 || rec_short_) {   // no VRAM: for the rest of this call, or a while (graph_room())
+        if (run_if_not) run_direct(work);
+        return nullptr;
+    }
+#if !defined(STRATA_GPU_METAL)
+    const bool left = moe_left_;
+    const float* const left_scale = moe_left_scale_;
+#endif
     cudaGraph_t g = nullptr;
     ck(cudaStreamBeginCapture(cs(st_), cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
     recording_ = recorded_ = true;
@@ -7446,29 +7470,169 @@ void* Engine::record(F&& work) {
     }
     recording_ = false;
     ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
+    void* exec = nullptr;
+#if defined(STRATA_GPU_METAL)
+    cudaGraphExec_t made = nullptr;
+    const cudaError_t e = cudaGraphInstantiateWithFlags(&made, g, 0);
+    cudaGraphDestroy(g);
+    ck(e, "cudaGraphInstantiate");
+    exec = made;
+#else
+    static const int fail_every = env_every("STRATA_POLY_RECORD_FAIL"), drop_every = env_every("STRATA_POLY_RECORD_DROP");
+    ++rec_tries_;
+    if (drop_every > 0 && rec_tries_ % (uint64_t) drop_every == 0) drop_recordings();
+    if (!(fail_every > 0 && rec_tries_ % (uint64_t) fail_every == 0)) exec = instantiate(g);
+    const uint64_t kernels = tl_ && exec ? graph_kernels(g) : 0;   // the profiler's launch count of the recording
+    cudaGraphDestroy(g);
+    if (!exec) {
+        ++rec_unrecorded_;
+        moe_left_ = left;   // as the recording found them
+        moe_left_scale_ = left_scale;
+        if (run_if_not) run_direct(work);
+        return nullptr;
+    }
+#endif
+    graphs_.push_back(exec);
+    rec_made_[exec] = rec_call_;
+#if !defined(STRATA_GPU_METAL)
+    if (tl_) {
+        std::lock_guard<std::mutex> l(tl_->mu);
+        tl_->kernels_of[exec] = kernels;
+    }
+#endif
+    return exec;
+}
+
+// What a recording of `work` holds, launched one by one: the same launches, reading their positions from at_.
+// (direct_: a whole pass answers the doorbell layer by layer then, as run()'s layer by layer path does: the card waits
+// for each layer's answer, and a pass's launches would fill the queue the host hands them to before it answered)
+template <class F>
+void Engine::run_direct(F&& work) {
+    struct Off {
+        bool& on;
+        bool& direct;
+        ~Off() { on = direct = false; }
+    } off{recording_, direct_};
+    recording_ = direct_ = true;
+    work();
+}
+
+// cudaGraphInstantiate.  A card with no VRAM for it gives the recordings it holds their place: Inkling 2's step
+// recordings (step_replay(): only where tail_by_rows()) but this step's, then record()'s made before this call, which
+// are made again where they are next needed.  Null when it has none still: the next call's graph_room() makes room.
+// The VRAM a recording takes is not in the reserve the expert cache keeps free (fill_expert_cache()) but out of it,
+// and 8 GB cards ran out of it in the middle of an answer: a context grown past a room() size, a window or the
+// drafter's blocks of a length not seen yet.
+void* Engine::instantiate(void* graph) {
+    const cudaGraph_t g = (cudaGraph_t) graph;
     cudaGraphExec_t exec = nullptr;
     cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
     if (made == cudaErrorMemoryAllocation && !step_used_.empty()) {
-        // Inkling 2's step recordings (step_replay(): only where tail_by_rows()) give their place to this one: run()'s
-        // and step()'s other recordings.  Every family else has none, and fails here as before.
         cudaGetLastError();
         trim_step_graphs(0, !in_step_);
         exec = nullptr;
         made = cudaGraphInstantiateWithFlags(&exec, g, 0);
     }
 #if !defined(STRATA_GPU_METAL)
-    const uint64_t kernels = tl_ ? graph_kernels(g) : 0;
-#endif
-    cudaGraphDestroy(g);
-    ck(made, "cudaGraphInstantiate");
-    graphs_.push_back(exec);
-#if !defined(STRATA_GPU_METAL)
-    if (tl_) {
-        std::lock_guard<std::mutex> l(tl_->mu);
-        tl_->kernels_of[(void*) exec] = kernels;
+    if (made == cudaErrorMemoryAllocation && drop_recordings() > 0) {
+        cudaGetLastError();
+        exec = nullptr;
+        made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    }
+    if (made == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        if (!rec_short_)
+            std::fprintf(stderr, "strata-poly: no VRAM for a recording (%lld MiB free): its launches run unrecorded\n",
+                         (long long) vram_free_mib());
+        rec_short_ = true;
+        return nullptr;
     }
 #endif
+    ck(made, "cudaGraphInstantiate");
     return exec;
+}
+
+// record()'s recordings made before this call go, wherever they are held: the layers', the passes', the logits', and
+// the parked sequences'.  The places hold null then (map entries stay: callers hold references to them), which
+// records again.  One still in flight is freed when it is done (cudaGraphExecDestroy()).  The step recordings are
+// trim_step_graphs()'s, and a family's own (Inkling 2's drafter blocks) are not record()'s.
+size_t Engine::drop_recordings() {
+    std::set<void*> gone;
+    for (const auto& [g, call] : rec_made_)
+        if (call != rec_call_) gone.insert(g);
+    if (gone.empty()) return 0;
+    const auto drop = [&](void*& g) {
+        if (g && gone.count(g)) g = nullptr;
+    };
+    const auto drop_all = [&](std::vector<void*>& in) {
+        for (void*& g : in) drop(g);
+    };
+    const auto drop_map = [&](std::map<std::vector<int>, void*>& in) {
+        for (auto& kv : in) drop(kv.second);
+    };
+    for (Layer& L : layers_) {
+        drop_all(L.heads);
+        drop_all(L.shared);
+        drop_all(L.tail);
+        drop_all(L.card_moe);
+        drop_map(L.rows_heads);
+        drop_map(L.rows_tails);
+    }
+    drop_map(passes_);
+    drop_map(step_passes_);
+    drop(tail_);
+    drop(tail_picks_);
+    for (Seq& q : seqs_) {
+        for (std::vector<void*>& h : q.heads) drop_all(h);
+        drop_map(q.passes);
+        drop(q.tail);
+        drop(q.tail_picks);
+    }
+    graphs_.erase(std::remove_if(graphs_.begin(), graphs_.end(), [&](void* g) { return gone.count(g) > 0; }),
+                  graphs_.end());
+#if defined(STRATA_USE_HIP)
+    // (CUDA frees a recording still in flight when it is done; HIP is not documented to: none is, after this.  HIP
+    // has no doorbell, so nothing on the stream waits for this thread.)
+    ck(cudaStreamSynchronize(cs(st_)), "a recording");
+#endif
+    for (void* g : gone) {
+        ck(cudaGraphExecDestroy((cudaGraphExec_t) g), "a recording");
+        rec_made_.erase(g);
+    }
+    rec_dropped_ += gone.size();
+    std::fprintf(stderr, "strata-poly: recordings: dropped %zu made before this call, %zu held; %zu dropped, %zu runs "
+                         "unrecorded in all\n",
+                 gone.size(), rec_made_.size(), rec_dropped_, rec_unrecorded_);
+    return gone.size();
+}
+
+// A call's start (run(), step()).  After a recording the card had no VRAM for, even with the older ones dropped, the
+// expert cache gives up its last piece (kArenaPiece: shrink_cache(), its least used experts), and mind_card_vram()
+// keeps that much more free from then on.  The cache changes there, as cover() changes it when the attention caches
+// grow: which experts the card computes, and so the sums' last bits, are those of a smaller cache.  Where it cannot
+// change (a frozen answer, a cache in one allocation, the pool, none left), the next 256 calls record nothing.
+void Engine::graph_room() {
+    ++rec_call_;
+    if (rec_off_ > 0) --rec_off_;
+#if !defined(STRATA_GPU_METAL)
+    static const int drop_every = env_every("STRATA_POLY_RECORD_DROP");
+    if (drop_every > 0 && rec_call_ % (uint64_t) drop_every == 0) drop_recordings();
+#endif
+    if (!std::exchange(rec_short_, false)) return;
+    const int64_t before = vram_free_mib();
+    const int had = cached_;
+    if (exp_ && vmm_ && !pool_on_ && !freeze_experts_ && cached_ > 0 && rec_room_mib_ < 1024) {
+        shrink_cache(kArenaPiece);
+        held_is_budget();
+        rec_room_mib_ += (int) (kArenaPiece >> 20);
+        std::fprintf(stderr, "strata-poly: VRAM for recordings: the expert cache %d -> %d experts, %lld -> %lld MiB "
+                             "free (%d MiB more kept free from now on)\n",
+                     had, cached_, (long long) before, (long long) vram_free_mib(), rec_room_mib_);
+    } else {
+        rec_off_ = 256;
+        std::fprintf(stderr, "strata-poly: no VRAM for recordings (%lld MiB free): the next %d calls run unrecorded\n",
+                     (long long) before, rec_off_);
+    }
 }
 
 // step()'s recording `in[key]` launched, made first if it is not there; false when `work` ran unrecorded instead.  A
@@ -7618,6 +7782,7 @@ void Engine::run(const int32_t* tokens, int n) {
     if (pos_ + n > opt_.max_context)
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
     cover(pos_ + n);
+    graph_room();
 
     // h_r_ and h_cpu_ may still be the source of the previous call's copies
     ck(cudaStreamSynchronize(cs(st_)), "eval");
@@ -7660,7 +7825,7 @@ void Engine::run(const int32_t* tokens, int n) {
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
-        launch_graph(made[key], prof::kGraph, "layer graph");
+        if (made[key]) launch_graph(made[key], prof::kGraph, "layer graph");   // null: run
     };
     if (replay) {   // a pair a token: a window's tokens may go one by one, each from its own
         for (int t = 0; t < n; ++t) {
@@ -7822,8 +7987,10 @@ void Engine::run(const int32_t* tokens, int n) {
         // still hands it the rest (a launch takes this thread about 0.1 us a kernel).
         const int first = whole_first_layers();
         int il = lo_;
+        // (from the layer il is at when it is made: run again unrecorded, a part starts where it started)
         const auto layers = [&](int count) {
-            return [&, count] {
+            return [&, count, from = il] {
+                il = from;
                 struct Whole {
                     bool& on;
                     bool pdl;
@@ -7840,6 +8007,7 @@ void Engine::run(const int32_t* tokens, int n) {
                     moe_shared(L, il, n);
                     moe_card(L, il, n);
                     pmark(prof::kNorms);
+                    if (direct_ && bell_) bell_serve();   // unrecorded (run_direct())
                     layer_tail(L, il, n);
                 }
             };
@@ -7874,12 +8042,28 @@ void Engine::run(const int32_t* tokens, int n) {
         rest_key.push_back(INT_MIN);
         void*& pass = passes_[key];
         void** rest = first > 0 ? &passes_[rest_key] : nullptr;
+        // A part the card has no VRAM for runs unrecorded (record()): the rest's after the first part is launched.
+        std::function<void()> rest_work;
         if (!pass || (rest && !*rest)) {
+            // the part that is there goes: both are made again (the stream is idle: synchronized above)
+            const auto forget = [&](void*& g) {
+                if (!g) return;
+                graphs_.erase(std::remove(graphs_.begin(), graphs_.end(), g), graphs_.end());
+                rec_made_.erase(g);
+                ck(cudaGraphExecDestroy((cudaGraphExec_t) g), "a recording");
+                g = nullptr;
+            };
+            forget(pass);
+            if (rest) forget(*rest);
             pass = record(layers(rest ? first : INT_MAX));
-            if (rest) *rest = record(layers(INT_MAX));
+            if (rest) {
+                rest_work = layers(INT_MAX);
+                *rest = record(rest_work, false);
+            }
         }
-        launch_graph(pass, prof::kGraph, "layer graph");
-        if (rest) launch_graph(*rest, prof::kGraph, "layer graph");
+        if (pass) launch_graph(pass, prof::kGraph, "layer graph");
+        if (rest && *rest) launch_graph(*rest, prof::kGraph, "layer graph");
+        else if (rest) run_direct(rest_work);
         runs_done();
         if (bell_) bell_serve();
         return;
@@ -7956,6 +8140,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     const int R = (int) rseq.size();
     if (R > rows_) throw std::logic_error("step: more rows than a call takes");
     picks_ = picks;
+    graph_room();
 
     ck(cudaStreamSynchronize(cs(st_)), "step");
     if (n_swap_ > 0) follow(R);
@@ -7985,7 +8170,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
-        launch_graph(made[key], prof::kGraph, "layer graph");
+        if (made[key]) launch_graph(made[key], prof::kGraph, "layer graph");   // null: run
     };
     // A step of one row rings the doorbell as run() rings it for a token (bell_on(): card_moe() routes such a row on
     // the card for it): its misses go to this thread's workers from inside the launches, which bell_serve() answers
@@ -8078,6 +8263,8 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
                     if (!L.moe) continue;
                     moe_shared(L, il, R);
                     moe_card(L, il, R);
+                    // unrecorded (run_direct(), record_step()'s fallback): the doorbell layer by layer, as in run()
+                    if (bell_ && (direct_ || !recording_)) bell_serve();
                     layer_tail(L, il, R);
                     rows_of_ = nullptr;
                 }
@@ -8088,7 +8275,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         } else {
             void*& pass = step_passes_[wkey];
             if (!pass) pass = record(whole_work);
-            launch_graph(pass, prof::kGraph, "layer graph");
+            if (pass) launch_graph(pass, prof::kGraph, "layer graph");
         }
         for (int il = lo_; il < hi_; il = next_layer(il))
             stats_.gpu_experts += layers_[(size_t) il].moe ? R * n_used_ : 0;
@@ -8135,7 +8322,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             if (replay && L.fixed) {
                 void*& made = L.rows_heads[hkey];
                 if (!made) made = record([&] { layer_head(L, il, m); });
-                launch_graph(made, prof::kGraph, "layer graph");
+                if (made) launch_graph(made, prof::kGraph, "layer graph");
             } else {
                 layer_head(L, il, m);
             }
@@ -8225,7 +8412,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             } else if (replay && L.fixed) {
                 void*& made = L.rows_heads[key];
                 if (!made) made = record([&] { layer_head(L, il, R); });
-                launch_graph(made, prof::kGraph, "layer graph");
+                if (made) launch_graph(made, prof::kGraph, "layer graph");
             } else {
                 layer_head(L, il, R);
             }
@@ -8566,7 +8753,7 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         if (replay) {
             void*& graph = picks ? tail_picks_ : tail_;
             if (!graph) graph = record(tail);
-            launch_graph(graph, prof::kDense, "logits graph");
+            if (graph) launch_graph(graph, prof::kDense, "logits graph");
         } else {
             tail();
         }

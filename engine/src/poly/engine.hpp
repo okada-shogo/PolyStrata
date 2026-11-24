@@ -784,8 +784,19 @@ protected:
     /// own block, or kSumRows.  The others keep kSumRows, whose windows past it are routed on the host as before.
     int card_rows() const;
     void moe_add(int n);
+    // record(): null when the card has no VRAM for the recording even after drop_recordings(); `work` has then run
+    // unrecorded (run_direct()), unless `run_if_not` is false, when the caller runs it with run_direct() itself.
     template <class F>
-    void* record(F&& work);
+    void* record(F&& work, bool run_if_not = true);
+    template <class F>
+    void run_direct(F&& work);
+    /// cudaGraphInstantiate, with VRAM given back first when the card has none for it (the step recordings, then
+    /// drop_recordings()); null when it still has none.  Its graph stays the caller's to destroy.
+    void* instantiate(void* graph);
+    /// record()'s recordings made before this call are destroyed, and made again where they are next needed.
+    size_t drop_recordings();
+    /// At a call's start, after a recording the card had no VRAM for: the expert cache gives up a piece for them.
+    void graph_room();
     // step()'s recordings where the tails take the rows (tail_by_rows(): Inkling 2).  They are keyed by the rows'
     // sequences and rooms, so slots that come and go make more of them for as long as the engine runs: at most
     // step_cap_ are held, the least recently launched dropped first (trim_step_graphs()), and a recording the card has
@@ -1022,6 +1033,15 @@ protected:
     size_t step_bytes_ = 0;         ///< what cudaMemGetInfo() lost to them before the first drop (for the log)
     size_t step_made_ = 0, step_dropped_ = 0, step_unrecorded_ = 0, step_logged_ = 0;
     bool in_step_ = false;          ///< inside step(): record() keeps this step's step recordings
+    /// record()'s recordings: the call (rec_call_) that made each one.  drop_recordings() keeps that call's.
+    std::map<void*, uint64_t> rec_made_;
+    uint64_t rec_call_ = 0;         ///< run()s and step()s so far
+    uint64_t rec_tries_ = 0;        ///< record()'s instantiations (STRATA_POLY_RECORD_FAIL, STRATA_POLY_RECORD_DROP)
+    int rec_off_ = 0;               ///< calls left that record nothing: the card had no VRAM, and graph_room() none
+    int rec_room_mib_ = 0;          ///< what graph_room() took from the expert cache; mind_card_vram() keeps it free
+    bool rec_short_ = false;        ///< a recording found no VRAM in this call: graph_room() at the next one
+    bool direct_ = false;           ///< run_direct() is running a recording's launches unrecorded
+    size_t rec_dropped_ = 0, rec_unrecorded_ = 0;
     void* tail_ = nullptr;        ///< one token's launches from the last layer to the logits, recorded
     void* tail_picks_ = nullptr;  ///< the same, the most likely token in place of the logits (eval_picks())
     // A recorded launch cannot be given the position as an argument: it reads it here when it runs.  eval() writes
