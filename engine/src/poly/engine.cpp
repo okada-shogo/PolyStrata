@@ -8300,8 +8300,11 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
     ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
     if (pool_on_) free_b = vpool_bytes();
     const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+    // what an earlier read of the prompt already holds counts too: its rows stay mapped until end_read(), and
+    // without them a later read saw no room and went a call at a time (a 1M-token prompt read in 227-call reads)
     const size_t room = (free_b > quarter ? free_b - quarter : 0) +
-                        (exp_ && arena_.mapped > kArenaPiece ? arena_.mapped - kArenaPiece : 0);
+                        (exp_ && arena_.mapped > kArenaPiece ? arena_.mapped - kArenaPiece : 0) +
+                        (carry_lent_ ? carry_map_.mapped : 0);
     int g = (int) std::min<size_t>((size_t) n_calls, room / (per * sizeof(float)));
     float* base = nullptr;
     const size_t most = (size_t) ((read_rows_ + rows_ - 1) / rows_) * per * sizeof(float);
