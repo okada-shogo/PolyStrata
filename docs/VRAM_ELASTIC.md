@@ -1,4 +1,4 @@
-# POST /v1/vram: what it does and what it answers (opt-in; NVIDIA, across a layer split per card or one device; #533, #1034)
+# POST /v1/vram: what it does and what it answers (opt-in; NVIDIA and AMD, across a layer split per card or one device; #533, #1034)
 
 This page is written from `terminal/serve/server.py` and the engine's `VRAM` command (`engine/src/program/generate.cpp`,
 `engine/src/core/expert_cache.cpp`), and the cases the unit tests in `terminal/serve/test_vram.py` pin. A line marked **(code)** is
@@ -10,18 +10,43 @@ The measurements are in [DETAILS.md](DETAILS.md) (RTX 5070, Q2_0).
 The expert cache is normally one big `cudaMalloc`. With `"vram_elastic": true` in the config (engine flag
 `--vram-elastic`, segment size `"vram_segment_mib"`, default 512, at least 64) it is allocated in segments instead.
 `POST /v1/vram` then keeps a number of MiB of VRAM free for another program by unmapping the last segments, or maps
-them again when more is free. Nothing resizes on its own. Only the expert cache moves: the dense weights, the K/V, the
+them again when more is free. On NVIDIA nothing resizes on its own (on AMD see [below](#on-amd-hip-rocm-6)). Only the expert cache moves: the dense weights, the K/V, the
 MTP head, the CUDA context and the prompt buffers stay, so PolyStrata never gives back "everything".
 
 The engine switches the feature off at start, with one line in its log (`--vram-elastic is off: ...`), when it is not
-a `--serve` engine, with helper caches on other GPUs (`--peer-device`, an expert-profile tier), with a segment below 64 MiB, and on HIP
-(NVIDIA only). If the driver offers no virtual memory management the cache is one block and the engine starts all the same
+a `--serve` engine, with helper caches on other GPUs (`--peer-device`, an expert-profile tier) and with a segment below 64 MiB. If the driver offers no virtual memory management the cache is one block and the engine starts all the same
 (`--vram-elastic is off: the driver or this GPU offers no virtual memory management`) **(code; not run on such a driver)**.
 Without the flag nothing changes: the same answers as without it. Across a `--layer-split` each card keeps its own segmented cache, so by default one call keeps the reserve on every card at once; pass a `"device"` to free just that CUDA device and leave the others with their full expert cache.
 
 This page is about the Strata project's engine (Qwen3.8). strata-poly, the engine of the models PolyStrata adds, has no flag for
 it: its expert cache takes `POST /v1/vram` as it is, and the server does not pass the config's `"vram_elastic"` on to
 it (strata-poly ends at an option it does not know). A reserve of 0 leaves strata-poly its smallest one, 256 MiB.
+
+## On AMD (HIP, ROCm 6+)
+
+The same flag and the same command, with three differences **(code; measured in [DETAILS.md](DETAILS.md) on an RX 9070 XT)**:
+
+- The segments are all one size (at most `"vram_segment_mib"`): under WSL2 the driver refuses a shorter piece mapped after a
+  longer one. Where the driver keeps a released segment's VRAM while its addresses are reserved (amdgpu on native Linux),
+  a shrink frees the cache's address range, reserves it again at the same place and maps the kept segments again
+  (`STRATA_VRAM_ELASTIC_READDRESS=0|1`: never | always); if the driver puts the range elsewhere, the engine stops and
+  the server starts it again. Under WSL2 the VRAM comes back at the release and this step does not run.
+- No segment is created unless the card has its size free plus 256 MiB (`STRATA_VRAM_ELASTIC_MARGIN_MIB`). Under WSL2
+  (and Salad's AMD containers) an allocation past the card's VRAM hangs instead of failing, so the engine never asks for one.
+- **The cache gives way by itself while the engine is idle.** amdgpu does not refuse a desktop's allocation when the card is full; it
+  moves GPU memory to system RAM, and the OOM killer can then end the desktop (#560, #516). So every 2 s between requests
+  (`STRATA_VRAM_WATCH_MS`; 0: off) the engine reads the free VRAM. It keeps what it found free after its first request,
+  read again 6 s after every `POST /v1/vram` (the room that call made is for the program that starts next). When another
+  program took a quarter of that (64 MiB at least) the cache gives back at least as much, in whole segments, and when a
+  segment and 256 MiB more are free again it grows. The log says `(the idle watch: the free VRAM changed)`; `GET /v1/status`
+  keeps the figures of the last `POST /v1/vram`.
+  `STRATA_VRAM_WATCH=0` turns this off (only the command resizes, as on NVIDIA); `STRATA_VRAM_WATCH=1` turns it on for
+  NVIDIA too. It is not on with a layer split. During a request nothing moves.
+
+`STRATA_HIP_VMM=0`, a card without virtual memory management and a build on ROCm before 6 keep the cache in one block (the
+engine says `--vram-elastic is off: ...`). Each segment needs its size plus the margin free when it is mapped, so an
+explicit `--expert-cache` sized to fill the card can fail with the flag where it starts without it (`--expert-cache auto`
+retries with fewer slots).
 
 ## The request
 
@@ -68,7 +93,7 @@ Content-Type: application/json          (anything else: 415)
 
 ## When the engine says no (400, engine stays up)
 
-- `VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)`.
+- `VRAM needs an engine started with --vram-elastic (NVIDIA or AMD GPU, --serve)`.
 - `VRAM: not with the resident low-RAM mode` and `VRAM: not with --peer-device`.
 - `VRAM: not while batch slots are decoding` (with `--parallel`/`--batch`; the server also takes the engine's control
   lock first, so a prompt that is being admitted finishes before the resize).

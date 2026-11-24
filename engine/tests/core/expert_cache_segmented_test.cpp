@@ -1,6 +1,6 @@
 // #533: the segmented expert cache (--vram-elastic).  A shrink gives the last segments' VRAM back to the driver and
 // keeps every slot left exactly as it was (same address, same bytes); a grow maps them again at the same addresses.
-// Uniform and sized slots.  Needs a CUDA device with virtual memory management (exits 77 without one).
+// Uniform and sized slots.  Needs a CUDA or HIP device with virtual memory management (exits 77 without one).
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_cache_refuse.hpp"
 #include "strata/core/residency_trim.hpp"
@@ -61,7 +61,7 @@ int main() {
         const bool ok = sized ? c.open_sized(std::vector<int64_t>(kSlots, kBlob), 4, 64, err)
                               : c.open(kSlots, 4, 64, kBlob, err);
         if (!ok) {
-            // #1475: a HIP build has no segmented cache ("--vram-elastic ... is CUDA-only for now"): a skip, not a failure
+            // #1475: a build or device without a segmented cache (gfx906, Metal: "CUDA-only"; no VMM): a skip, not a failure
             if (err.find("virtual memory management") != std::string::npos ||
                 err.find("CUDA-only") != std::string::npos) {
                 std::printf("%s: skipped\n", err.c_str());
@@ -139,6 +139,27 @@ int main() {
         if (!c.shrink(30ll << 20, err) || c.slots() != 32) return fail("refusal: a later shrink", err);
         c.close();
         if (c.valid()) return fail("refusal: close");
+    }
+    // slots that lie across a segment's end (3 MiB + 4 KiB blobs in segments of about 8 MiB): a copy into or out of such
+    // a slot crosses from one physical segment into the next (on ROCm that fails across two address ranges, so the
+    // arena must stay one).  Copies and a memset across the seams keep their bytes, through a shrink and a grow too.
+    {
+        constexpr int64_t kOdd = (3ll << 20) + 4096, kOddSlots = 20;
+        strata::core::ExpertCache c;
+        c.set_segment_bytes(kSeg);
+        std::string err;
+        if (!c.open(kOddSlots, 4, 64, kOdd, err) || !c.segmented()) return fail("seams: open", err);
+        if (!fill(c, 0, kOddSlots, kOdd) || !check(c, kOddSlots, kOdd)) return fail("seams: the slots across segment ends");
+        if (cudaMemset(c.device_slot(2), 0x5a, (size_t) (2 * kOdd)) != cudaSuccess) return fail("seams: memset");
+        std::vector<uint8_t> b((size_t) (2 * kOdd));
+        if (cudaMemcpy(b.data(), c.device_slot(2), b.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return fail("seams: read");
+        for (const uint8_t x : b)
+            if (x != 0x5a) return fail("seams: the memset across a segment end");
+        if (!fill(c, 2, 4, kOdd)) return fail("seams: fill again");
+        if (!c.shrink(20ll << 20, err) || !check(c, c.slots(), kOdd)) return fail("seams: shrink", err);
+        if (!c.grow(1ll << 40, err) || c.slots() != kOddSlots) return fail("seams: grow", err);
+        if (!check(c, 6, kOdd) || !fill(c, 0, kOddSlots, kOdd) || !check(c, kOddSlots, kOdd)) return fail("seams: after the grow");
+        c.close();
     }
     // the default (no segment size): one allocation, shrink refused
     strata::core::ExpertCache d;

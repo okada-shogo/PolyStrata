@@ -278,6 +278,7 @@ from serve.server_parts.http_api import (  # noqa: F401  (moved unchanged, file 
     check_request_sampling,
     clean_shared_defaults,
     default_model_name,
+    desktop_elastic,
     desktop_vram_note,
     explicit_no_key,
     host_allowed,
@@ -5419,7 +5420,8 @@ class Service:
     def vram(self, reserve_mib: int | None, device: int | None = None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
-        engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
+        engine started with --vram-elastic (the config's "vram_elastic": true) can do it; on NVIDIA it never resizes on its
+        own (on AMD the engine also gives way to other programs while idle, and /v1/status keeps this call's figures).
         An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
         if not hasattr(self.engine, "vram") or (self.loaded() and not self._engine_has_vram_command()):
             raise ValueError("this engine cannot resize its VRAM use")
@@ -9317,7 +9319,7 @@ def apply_vision_defaults(cfg: dict) -> dict:
     picture.  The expert cache is started in segments ("vram_elastic": the engine's --vram-elastic) and makes the reader's room when a picture
     arrives, then takes it back after vision.elastic_idle_s; the reserve setup wrote (700 MiB, or none) stays as it is.  Measured on an RTX A6000
     (UD-Q4_K_XL partly streamed): 13,526 expert slots before any picture, as with the processor reader, against 13,077 with the room held back.
-    A config that says "vram_elastic" itself, and AMD (no shrinking expert cache on HIP), keep the room in the reserve as before: the reserve
+    A config that says "vram_elastic" itself, and AMD (the shrinking cache stays opt-in there: not measured with the reader), keep the room in the reserve as before: the reserve
     setup writes for a GPU reader that stays on the card (700 MiB, or none) becomes VISION_RESERVE_MIB; a reserve the person or the app chose
     (any other number) is kept."""
     if not vision_on_demand_by_default(cfg):
@@ -9576,8 +9578,13 @@ def start_model(cfg: dict, tok, lazy: bool = False):
         engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=offline, batch_telemetry=batch_telemetry)
     engine.silence_s = silence                      # an attribute of its own: restart() keeps it
     warn_tight_ram(engine.info.get("arena_mib"))
+    # the Qwen3.8 engine on one card can take --vram-elastic (the config's "vram_elastic"; its INFO line says vram_elastic=0|1).
+    # None (the reserve note): strata-poly and the Qwen3.6 path (no such option), an engine that turned it off (no virtual
+    # memory management), and a cache that does not give way by itself (STRATA_VRAM_WATCH=0)
+    watch = (cfg.get("env") or {}).get("STRATA_VRAM_WATCH", os.environ.get("STRATA_VRAM_WATCH"))
+    elastic = desktop_elastic(poly_engine(cfg), engine.info, engine.spawn[1], watch)
     note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
-                             linux_desktop()) if not groups and not split else None
+                             linux_desktop(), elastic) if not groups and not split else None
     if note:                                        # #560 #516: before --open starts a browser on that card
         print(note, flush=True)
     return engine, vision, sampling_defaults, effort_end, groups

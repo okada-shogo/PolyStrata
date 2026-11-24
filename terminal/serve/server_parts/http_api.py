@@ -122,12 +122,29 @@ def linux_desktop(env=None) -> bool:
     return os.name != "nt" and sys.platform != "darwin" and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
 
 
-def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool) -> str:
+def desktop_elastic(poly: bool, info: dict, args: list, watch_env) -> "bool | None":
+    """desktop_vram_note's `elastic`: True when the running engine's cache gives way to the desktop by itself (the Qwen3.8
+    engine with --vram-elastic on, INFO vram_elastic=1, the idle watch not turned off), False when that engine could do it
+    with "vram_elastic": true, None when it cannot (strata-poly and the Qwen3.6 path have no such option and no
+    vram_elastic key; a card without virtual memory management says 0 with the flag given; STRATA_VRAM_WATCH=0)."""
+    on = (info or {}).get("vram_elastic")
+    if poly or on is None or str(watch_env) == "0":
+        return None
+    if "--vram-elastic" in (args or []):
+        return True if str(on) not in ("0", "False", "") else None
+    return False
+
+
+def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool, elastic=None) -> str:
     """#560 #516: on Linux, when the desktop needs VRAM the AMD card does not have, amdgpu moves GPU memory (the expert
     cache, ~24 GB) to system RAM, which the experts already fill - the OOM killer then ends the compositor.  The
     default reserve (700 MiB) is sized for a card without a desktop.  A recommendation, nothing changes: "" when it
-    does not apply."""
+    does not apply.  `elastic`: None for an engine without --vram-elastic (strata-poly), else whether the running
+    engine has its expert cache in segments - such a cache gives way to the desktop by itself on AMD, so the note
+    recommends that rather than a fixed reserve."""
     if backend != "hip" or not desktop or not isinstance(vram_free_mib, int) or vram_free_mib >= DESKTOP_FREE_MIB:
+        return ""
+    if elastic is True:
         return ""
     try:
         reserve = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args else 700
@@ -135,11 +152,16 @@ def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool) -> str:
         reserve = 700
     if reserve >= DESKTOP_RESERVE_MIB:
         return ""
-    return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
+    head = (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
             "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
-            "the OOM killer ends the session), keep more VRAM free: ./setup.sh --vram-reserve-mib "
-            f"{DESKTOP_RESERVE_MIB} (remembered; the expert cache gets "
-            f"{(DESKTOP_RESERVE_MIB - reserve) / 1024:.1f} GB less, a few % of speed)")
+            "the OOM killer ends the session), ")
+    if elastic is False:
+        return head + ('add "vram_elastic": true to this model\'s config: the expert cache then gives VRAM back when '
+                       "the desktop takes it and takes it again when it is free (or keep VRAM free with ./setup.sh "
+                       f"--vram-reserve-mib {DESKTOP_RESERVE_MIB})")
+    return head + ("keep more VRAM free: ./setup.sh --vram-reserve-mib "
+                   f"{DESKTOP_RESERVE_MIB} (remembered; the expert cache gets "
+                   f"{(DESKTOP_RESERVE_MIB - reserve) / 1024:.1f} GB less, a few % of speed)")
 
 
 def host_name(value) -> str:

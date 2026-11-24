@@ -961,7 +961,7 @@ struct Options {
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
     bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
-    /// #533 (opt-in): the expert cache in physical segments (CUDA virtual memory management), so the serve loop's
+    /// #533 (opt-in): the expert cache in physical segments (CUDA's or HIP's virtual memory management), so the serve loop's
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
@@ -1311,9 +1311,10 @@ void usage() {
                  "                       if that branch is revisited)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
-                 "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
+                 "  --vram-elastic       --serve (#533, opt-in, NVIDIA and AMD): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
-                 "                       give VRAM back to other programs between requests and take it back later\n"
+                 "                       give VRAM back to other programs between requests and take it back later; on AMD\n"
+                 "                       the cache also gives way to other programs by itself while idle (STRATA_VRAM_WATCH=0: not)\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
@@ -9513,9 +9514,6 @@ int main(int argc, char** argv) {
                         : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
-#if defined(STRATA_USE_HIP)
-        if (why == nullptr) why = "it is NVIDIA-only for now";
-#endif
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: --vram-elastic is off: %s\n", why);
             o.vram_elastic = false;
@@ -16491,7 +16489,15 @@ int main(int argc, char** argv) {
                 p.first_now = -1;   // laid out again at the next loan
             }
         };
-        auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
+        // what the idle watch keeps free on AMD (below): the free VRAM it read at its first look after the load, read
+        // again after the first request and a few seconds after every VRAM command from the server (the room that
+        // command made is for a program that starts next: the encoder, an image job, a game) - -1 until it has looked
+        long long vram_keep_mib = -1;
+        // the first request records launches and buffers after the cache was sized: a look before it is read again after it
+        bool vram_watch_before_req = false, vram_watch_req = false;
+        Clock::time_point vram_watch_look_at{};   // no look before this (a VRAM command's program is still starting)
+        // `quiet`: the engine's own call (the idle watch), which answers nothing on stdout
+        auto vram_command = [&](const std::string& cmd, std::string& e, bool quiet = false) -> bool {
             // Grammar (back-compat kept): `VRAM` = every card to start reserve; `VRAM <reserve_mib>` = every card;
             // `VRAM <reserve_mib> <dev>` = ONE card only (CUDA device id).
             std::vector<std::string> tk;
@@ -16512,7 +16518,7 @@ int main(int argc, char** argv) {
                 dev_sel = (int) std::strtoll(tk[1].c_str(), nullptr, 10);
             } else { e = "expected: VRAM [reserve_mib] [dev]"; return false; }
             if (!xcache.segmented()) {
-                e = "VRAM needs an engine started with --vram-elastic (NVIDIA GPU, --serve)";
+                e = "VRAM needs an engine started with --vram-elastic (NVIDIA or AMD GPU, --serve)";
                 return false;
             }
             if (src.complement_ready()) {
@@ -16625,10 +16631,14 @@ int main(int argc, char** argv) {
                 if (dev_sel >= 0 && cd.dev == dev_sel) dev_free = (long long) (f2 >> 20);
             }
             std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free on each card: the expert caches hold %lld of %lld slots "
-                                 "(%.2f of %.2f GiB over %zu cache(s)), CUDA0 %lld MiB free now, prompt chunk %lld, in %.0f ms%s\n",
+                                 "(%.2f of %.2f GiB over %zu cache(s)), CUDA0 %lld MiB free now, prompt chunk %lld, in %.0f ms%s%s\n",
                          reserve, sum_slots, sum_full, (double) sum_mapped / 1073741824.0, (double) sum_bytes / 1073741824.0,
                          cards.size(), (long long) (free_b >> 20), (long long) o.prefill_chunk,
-                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str(),
+                         quiet ? " (the idle watch: the free VRAM changed)" : "");
+            if (quiet) return true;
+            vram_keep_mib = -1;   // the server's command: the watch looks again once what it made room for has started
+            vram_watch_look_at = Clock::now() + std::chrono::seconds(6);
             std::string extra = " cards=" + card_detail;
             if (dev_sel >= 0) {
                 char d[80];
@@ -18301,6 +18311,83 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // #533 on AMD: amdgpu does not refuse another program's allocation when the card is full, it moves GPU memory
+        // out to system RAM (#560 #516: the expert cache, which the experts' RAM copy leaves no room for, and the OOM
+        // killer then ends the desktop).  So with --vram-elastic on HIP the engine gives way by itself while it waits
+        // for the next line: every STRATA_VRAM_WATCH_MS (default 2000; 0: no watch) it reads the free VRAM and, when
+        // another program took a quarter of what it keeps free (64 MiB at least; vram_keep_mib above), gives back at
+        // least that much - whole segments, so up to a segment more - or, when a segment and 256 MiB more came free
+        // beyond it and the cache is not whole, takes them again.  Never inside a request.  One GPU only (a layer split
+        // keeps the VRAM command).  STRATA_VRAM_WATCH=0 leaves the resizing to the VRAM command alone, as on NVIDIA;
+        // =1 turns the watch on for CUDA too.
+        const int vram_watch_ms = [&] {
+            const char* v = std::getenv("STRATA_VRAM_WATCH");
+#if defined(STRATA_USE_HIP)
+            const bool on = v == nullptr || v[0] != '0';
+#else
+            const bool on = v != nullptr && v[0] == '1';
+#endif
+            if (!on || !xcache.segmented() || !stages.empty()) return 0;
+            const char* m = std::getenv("STRATA_VRAM_WATCH_MS");
+            const int ms = m != nullptr && m[0] != '\0' ? std::atoi(m) : 2000;
+            return ms <= 0 ? 0 : ms >= 100 ? ms : 100;
+        }();
+        if (vram_watch_ms > 0)
+            std::fprintf(stderr, "strata serve: --vram-elastic: while idle the expert cache gives VRAM to other programs and "
+                                 "takes it back (checked every %d ms; STRATA_VRAM_WATCH=0: only the VRAM command resizes)\n",
+                         vram_watch_ms);
+        long long vram_watch_stuck = -1;   // the free MiB at a watch call that changed nothing: not called again near it
+        auto vram_watch_tick = [&]() {
+            if (batch_on() || src.complement_ready() || peer.valid()) return;
+            for (const PfPart& p : pf_parts)
+                if (!p.lent.empty()) return;
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return;
+            }
+            const long long free_mib = (long long) (fb >> 20);
+            if (vram_keep_mib < 0 && Clock::now() < vram_watch_look_at) return;
+            if (vram_keep_mib < 0 || (vram_watch_before_req && vram_watch_req)) {
+                vram_keep_mib = free_mib;
+                vram_watch_before_req = !vram_watch_req;
+                std::fprintf(stderr, "strata serve: the idle VRAM watch keeps %lld MiB free\n", free_mib);
+                return;
+            }
+            const long long keep = vram_keep_mib;
+            const bool low = free_mib + std::max<long long>(64, keep / 4) < keep;
+            const bool high = xcache.mapped_bytes() < xcache.full_bytes() &&
+                              free_mib >= keep + (long long) (xcache.segment_bytes() >> 20) + 256;
+            if (!low && !high) {
+                vram_watch_stuck = -1;
+                return;
+            }
+            if (vram_watch_stuck >= 0 && std::llabs(free_mib - vram_watch_stuck) < 64) return;
+            const int64_t had = xcache.mapped_bytes();
+            std::string e;
+            // a shrink keeps whole segments, rounding what stays UP: asking a segment less than the target (minus 1 MiB)
+            // frees at least the shortfall, so a shortfall smaller than a segment still gives one back
+            const long long ask = low ? keep + (long long) (xcache.segment_bytes() >> 20) - 1 : keep;
+            if (!vram_command("VRAM " + std::to_string(ask), e, true))
+                std::fprintf(stderr, "strata serve: the idle VRAM watch could not resize the expert cache: %s\n", e.c_str());
+            vram_watch_stuck = xcache.mapped_bytes() == had ? free_mib : -1;
+        };
+        auto next_line_watched = [&](std::string& out) -> bool {
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lk(in_mu);
+                    if (in_cv.wait_for(lk, std::chrono::milliseconds(vram_watch_ms),
+                                       [&] { return !in_lines.empty() || in_eof; })) {
+                        if (in_lines.empty()) return false;
+                        out = std::move(in_lines.front());
+                        in_lines.pop_front();
+                        if (out.rfind("GEN", 0) == 0 || out.rfind("BGEN", 0) == 0) vram_watch_req = true;
+                        return true;
+                    }
+                }
+                vram_watch_tick();
+            }
+        };
         for (;;) {
             line_drain_ms = 0.0;
             strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
@@ -18333,7 +18420,7 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
-            } else if (!next_line(line)) {
+            } else if (!(vram_watch_ms > 0 ? next_line_watched(line) : next_line(line))) {
                 break;
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the

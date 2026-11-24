@@ -3391,6 +3391,28 @@ class DesktopVramNote(unittest.TestCase):
         self.assertEqual(desktop_vram_note("hip", 2994, [], True), "")             # room left
         self.assertEqual(desktop_vram_note("hip", None, [], True), "")             # lazy start: no INFO yet
         self.assertEqual(desktop_vram_note("hip", 900, ["--vram-reserve-mib", "4000"], True), "")   # already raised
+        self.assertEqual(desktop_vram_note("hip", 624, ["--vram-elastic"], True, True), "")   # the cache gives way itself
+
+    def test_elastic_recommended_where_the_engine_has_it(self):
+        from serve.server import desktop_vram_note
+        note = desktop_vram_note("hip", 624, ["--kv", "int8"], True, False)       # the Qwen engine without it
+        self.assertIn("624 MiB of VRAM free", note)
+        self.assertIn('"vram_elastic": true', note)
+        self.assertNotIn("GB less", note)
+        # strata-poly (None: no such option) and a card without virtual memory management keep the reserve
+        self.assertNotIn("vram_elastic", desktop_vram_note("hip", 624, [], True, None))
+        self.assertIn("--vram-reserve-mib 3072", desktop_vram_note("hip", 624, [], True, None))
+        self.assertEqual(desktop_vram_note("hip", 624, [], True, False).count("[strata]"), 1)
+        self.assertEqual(desktop_vram_note(None, 624, [], True, False), "")       # NVIDIA: unchanged
+
+    def test_which_engine_can_give_way(self):
+        from serve.server import desktop_elastic
+        self.assertIs(desktop_elastic(False, {"vram_elastic": 0}, ["--kv", "int8"], None), False)   # Qwen3.8, flag not set
+        self.assertIs(desktop_elastic(False, {"vram_elastic": 1}, ["--vram-elastic"], None), True)
+        self.assertIsNone(desktop_elastic(False, {"vram_elastic": 0}, ["--vram-elastic"], None))   # no VMM on this card
+        self.assertIsNone(desktop_elastic(False, {"vram_elastic": 1}, ["--vram-elastic"], "0"))    # the watch turned off
+        self.assertIsNone(desktop_elastic(False, {}, [], None))                                    # Qwen3.6 path: no key
+        self.assertIsNone(desktop_elastic(True, {"vram_elastic": 1}, [], None))                    # strata-poly
 
     def test_desktop_detection(self):
         from serve import server

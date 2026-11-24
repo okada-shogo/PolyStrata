@@ -443,7 +443,7 @@ API without the engine or the vision encoder. The first generation request or `P
 120 s, else 409), and `/v1/unload` with it answers `"not loaded"`. `/api/health` aliases `/health`, and `/v1/status`
 exposes `loaded` and `auto_load`.
 
-**Giving part of the VRAM back while it keeps serving** (opt-in, one NVIDIA GPU, [VRAM_ELASTIC.md](VRAM_ELASTIC.md)). With
+**Giving part of the VRAM back while it keeps serving** (opt-in, NVIDIA or AMD, [VRAM_ELASTIC.md](VRAM_ELASTIC.md); on AMD the cache also gives way to other programs by itself between requests). With
 `"vram_elastic": true` (engine flag `--vram-elastic`) the expert cache is allocated in 512 MiB segments
 (`"vram_segment_mib"`). `POST /v1/vram` with `{"reserve_mib": 8000}` shrinks it between requests until that much VRAM is free;
 `{"reserve_mib": null}` grows it back toward its full size, and `{"reserve_mib": 0}` takes all of it back. The experts of the

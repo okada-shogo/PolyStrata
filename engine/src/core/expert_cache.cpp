@@ -2,17 +2,26 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_cache_refuse.hpp"
 
-// #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
-// the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
+// #533's segmented cache uses CUDA's virtual memory management (cuMem*) through the driver's entry points: not on HIP,
+// neither the RDNA backend nor the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP.
+// The RDNA backend has its own segmented cache on HIP's virtual memory calls (ROCm 6+, STRATA_EC_HIP_VMM below).
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
 #define STRATA_EC_NO_VMM 1
 #endif
 
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <cuda_runtime.h>
 #if !defined(STRATA_EC_NO_VMM)
 #include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
+#endif
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+#include <hip/hip_runtime.h>
+#include <hip/hip_version.h>
+#if defined(HIP_VERSION_MAJOR) && HIP_VERSION_MAJOR >= 6
+#define STRATA_EC_HIP_VMM 1
+#endif
 #endif
 
 #include <algorithm>
@@ -401,6 +410,167 @@ bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned l
 }  // namespace
 #endif
 
+#if defined(STRATA_EC_HIP_VMM)
+// ---- #533 on HIP (ROCm 6+): the same segmented arena through hipMemAddressReserve / hipMemCreate / hipMemMap /
+// hipMemSetAccess: one address range, the tail's segments unmapped and released, mapped again later.  ROCm does five
+// things its own way (the first three were found in strata-poly's Engine::vmm_map / vmm_unmap / vmm_settle; measured
+// again here on a gfx1200 16 GB card under WSL2 / librocdxg, ROCm 7.2.4):
+//  - one range, not one per segment: a copy or memset that crosses from one reservation into the next fails
+//    (hipErrorInvalidValue) while kernels read across them, and slots and the prompt path's loan cross segment ends.
+//  - every segment the same size: under WSL2 hipMemSetAccess refuses a piece mapped after a larger one in the same
+//    range.  The arena is cut into equal segments of at most the asked size, rounded up to the driver's granularity.
+//  - amdgpu (native Linux) gives a released handle's VRAM back only once the addresses it was mapped at are freed,
+//    and frees only a whole range: when a shrink sees no VRAM come back, the kept segments are unmapped, the range is
+//    freed and reserved again at the same place, and they are mapped again (librocdxg gives the VRAM back at the
+//    release: 64 of 64 MiB, so it never takes this path).  If the driver puts the range elsewhere the slots' addresses
+//    are gone and the engine stops (the server starts it again), as strata-poly does.  Which driver this is is decided
+//    once, at the first shrink that released a whole segment, and never under WSL2 (/dev/dxg without /dev/kfd).
+//    STRATA_VRAM_ELASTIC_READDRESS=1 always takes that path, =0 never.
+//  - on Linux a map's page-table update is queued and the call returns: an allocation made and freed after the maps
+//    waits for it before a kernel or copy touches the segments.
+//  - under WSL2 an allocation past the card's VRAM hangs instead of failing (hipMemGetInfo is right there): no segment
+//    is created unless the card has its size free plus a margin (STRATA_VRAM_ELASTIC_MARGIN_MIB, default 256).
+// STRATA_HIP_VMM=0 turns the segmented cache off as it does the elastic K/V (vmm.cpp): the cache is then one block.
+namespace {
+hipMemAllocationProp hip_seg_prop(int dev) {
+    hipMemAllocationProp p{};
+    p.type = hipMemAllocationTypePinned;
+    p.requestedHandleType = hipMemHandleTypeNone;
+    p.location.type = hipMemLocationTypeDevice;
+    p.location.id = dev;
+    return p;
+}
+
+uint64_t hip_seg_margin() {
+    static const uint64_t m = [] {
+        const char* v = std::getenv("STRATA_VRAM_ELASTIC_MARGIN_MIB");
+        const long long n = v != nullptr && v[0] != '\0' ? std::atoll(v) : 256;
+        return (uint64_t) (n > 0 ? n : 0) << 20;
+    }();
+    return m;
+}
+
+size_t hip_free_bytes() {
+    size_t f = 0, t = 0;
+    if (hipMemGetInfo(&f, &t) != hipSuccess) {
+        (void) hipGetLastError();
+        return 0;
+    }
+    return f;
+}
+
+void hip_seg_settle() {
+#if defined(__linux__)
+    void* p = nullptr;
+    if (hipMalloc(&p, size_t(4) << 20) == hipSuccess) {
+        (void) hipFree(p);
+    } else {
+        (void) hipGetLastError();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+#endif
+}
+
+// amdgpu counts given-back VRAM as free a few ms later (2 to 5 measured): waits for 7/8 of `back`, at most `ms`.
+// True when it came.
+bool hip_seg_wait_free(size_t before, uint64_t back, int ms) {
+    const uint64_t want = (uint64_t) before + back / 8 * 7;
+    for (int i = 0;; ++i) {
+        if ((uint64_t) hip_free_bytes() >= want) return true;
+        if (i >= ms) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+hipMemAccessDesc hip_seg_access(int dev) {
+    hipMemAccessDesc a{};
+    a.location.type = hipMemLocationTypeDevice;
+    a.location.id = dev;
+    a.flags = hipMemAccessFlagsProtReadWrite;
+    return a;
+}
+
+// one segment: a physical allocation mapped at `va`, readable and writable by this device
+bool hip_map_segment(int dev, uint8_t* va, size_t bytes, unsigned long long& handle) {
+    if ((uint64_t) hip_free_bytes() < (uint64_t) bytes + hip_seg_margin()) return false;
+    const hipMemAllocationProp prop = hip_seg_prop(dev);
+    hipMemGenericAllocationHandle_t h = nullptr;
+    if (hipMemCreate(&h, bytes, &prop, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        return false;
+    }
+    if (hipMemMap(va, bytes, 0, h, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        (void) hipMemRelease(h);
+        return false;
+    }
+    const hipMemAccessDesc access = hip_seg_access(dev);
+    if (hipMemSetAccess(va, bytes, &access, 1) != hipSuccess) {   // HIP hands out the pages here, not at create
+        (void) hipGetLastError();
+        (void) hipMemUnmap(va, bytes);
+        (void) hipMemRelease(h);
+        return false;
+    }
+    handle = (unsigned long long) (uintptr_t) h;
+    return true;
+}
+
+// -1: not decided yet (the first shrink decides), 1: always, 0: never
+int& hip_readdress_mode() {
+    static int m = [] {
+        const char* v = std::getenv("STRATA_VRAM_ELASTIC_READDRESS");
+        if (v != nullptr && v[0] != '\0') return v[0] == '0' ? 0 : 1;
+#if defined(__linux__)
+        std::error_code ec;
+        if (std::filesystem::exists("/dev/dxg", ec) && !std::filesystem::exists("/dev/kfd", ec)) return 0;   // WSL2
+#endif
+        return -1;
+    }();
+    return m;
+}
+
+// [0, kept) mapped: unmapped, the range freed and reserved again where it was, mapped again.  Stops the engine when a
+// step fails after the first unmap (the slots, the recorded launches and the loan point into these addresses)
+void hip_readdress(int dev, uint8_t* base, uint64_t reserved, const std::vector<unsigned long long>& segs,
+                   int64_t seg, int64_t kept) {
+    const auto must = [](hipError_t r, const char* what) {
+        if (r == hipSuccess) return;
+        std::fprintf(stderr, "ExpertCache: %s while giving VRAM back: %s; the expert cache is no longer mapped, so the "
+                             "engine stops\n", what, hipGetErrorString(r));
+        std::abort();
+    };
+    for (int64_t i = kept - 1; i >= 0; --i) must(hipMemUnmap(base + (uint64_t) i * (uint64_t) seg, (size_t) seg), "unmapping a kept segment");
+    must(hipMemAddressFree(base, (size_t) reserved), "freeing the addresses");
+    void* p = nullptr;
+    must(hipMemAddressReserve(&p, (size_t) reserved, 0, base, 0), "reserving the addresses again");
+    if (p != base) {
+        std::fprintf(stderr, "ExpertCache: the expert cache's addresses could not be reserved again where they were, so "
+                             "the engine stops\n");
+        std::abort();
+    }
+    const hipMemAccessDesc access = hip_seg_access(dev);
+    for (int64_t i = 0; i < kept; ++i) {
+        uint8_t* const va = base + (uint64_t) i * (uint64_t) seg;
+        must(hipMemMap(va, (size_t) seg, 0, (hipMemGenericAllocationHandle_t) (uintptr_t) segs[(size_t) i], 0), "mapping a kept segment again");
+        must(hipMemSetAccess(va, (size_t) seg, &access, 1), "mapping a kept segment again");
+    }
+    hip_seg_settle();
+}
+}  // namespace
+
+static bool segmented_supported() {
+    const char* off = std::getenv("STRATA_HIP_VMM");
+    if (off != nullptr && off[0] == '0') return false;
+    int dev = 0, vmm = 0;
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetAttribute(&vmm, hipDeviceAttributeVirtualMemoryManagementSupported, dev) != hipSuccess) {
+        (void) hipGetLastError();
+        return false;
+    }
+    return vmm != 0;
+}
+#endif
+
 #if !defined(STRATA_EC_NO_VMM)
 // the driver and this GPU offer the virtual memory functions the segmented arena needs (the check open_segmented makes first)
 static bool segmented_supported() {
@@ -413,7 +583,51 @@ static bool segmented_supported() {
 #endif
 
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
-#if defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_EC_HIP_VMM)
+    int dev = 0;
+    if (!segmented_supported() || hipGetDevice(&dev) != hipSuccess) {
+        (void) hipGetLastError();
+        err = "ExpertCache: --vram-elastic needs the driver's virtual memory management, which this GPU or driver "
+              "does not offer";
+        return false;
+    }
+    const hipMemAllocationProp prop = hip_seg_prop(dev);
+    size_t gran = 0;
+    if (hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityMinimum) != hipSuccess || gran == 0) {
+        (void) hipGetLastError();
+        err = "ExpertCache: cannot read the driver's allocation granularity";
+        return false;
+    }
+    // equal segments of at most the asked size (whole granules): the last one no shorter than the others (WSL2)
+    const uint64_t g = (uint64_t) gran;
+    const uint64_t n = std::max<uint64_t>(1, (want + (uint64_t) seg_req_ - 1) / (uint64_t) seg_req_);
+    seg_ = (int64_t) (((want + n - 1) / n + g - 1) / g * g);
+    const uint64_t total = n * (uint64_t) seg_;
+    void* va = nullptr;
+    if (hipMemAddressReserve(&va, (size_t) total, 0, nullptr, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        err = "ExpertCache: cannot reserve the address range of the segmented expert cache";
+        return false;
+    }
+    base_ = static_cast<uint8_t*>(va);
+    reserved_ = total;
+    segs_.assign((size_t) n, 0);
+    seg_size_.assign((size_t) n, seg_);
+    for (size_t i = 0; i < segs_.size(); ++i) {
+        if (!hip_map_segment(dev, base_ + (uint64_t) i * (uint64_t) seg_, (size_t) seg_, segs_[i])) {
+            char buf[240];
+            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc failed: segment %zu of %zu (%.2f GiB) of the "
+                          "segmented cache could not be allocated (HIP keeps %llu MiB of the card free)", i + 1,
+                          segs_.size(), (double) seg_ / 1073741824.0, (unsigned long long) (hip_seg_margin() >> 20));
+            err = buf;   // "cudaMalloc failed": the auto cache's smaller-retry path reads it as an allocation failure
+            release_segmented();
+            return false;
+        }
+        mapped_segs_ = (int64_t) i + 1;
+    }
+    hip_seg_settle();   // the zeroing in open() is the first kernel to touch the segments
+    return true;
+#elif defined(STRATA_EC_NO_VMM)
     (void) want;
     err = "ExpertCache: --vram-elastic (a segmented expert cache) is CUDA-only for now";
     return false;
@@ -466,7 +680,17 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 }
 
 void ExpertCache::release_segmented() {
-#if !defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_EC_HIP_VMM)
+    if (base_ != nullptr) (void) hipDeviceSynchronize();
+    for (size_t i = 0; i < segs_.size(); ++i)
+        if (segs_[i] != 0) {
+            // a handle past mapped_segs_ is one a shrink unmapped and the driver did not take back: released only
+            if (i < (size_t) mapped_segs_) (void) hipMemUnmap(base_ + (uint64_t) i * (uint64_t) seg_, (size_t) seg_size_[i]);
+            (void) hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) segs_[i]);
+        }
+    if (base_ != nullptr && reserved_ > 0) (void) hipMemAddressFree(base_, (size_t) reserved_);
+    (void) hipGetLastError();
+#elif !defined(STRATA_EC_NO_VMM)
     const Vmm& v = vmm();
     if (base_ != nullptr) cudaDeviceSynchronize();
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
@@ -505,7 +729,58 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
-#if defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_EC_HIP_VMM)
+    int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
+    while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
+    if (keep >= mapped_segs_) return true;
+    if (hipDeviceSynchronize() != hipSuccess) {
+        err = std::string("the device failed before the cache shrank: ") + hipGetErrorString(hipGetLastError());
+        return false;
+    }
+    auto refused = [](const char* call, int64_t seg) {
+        return ec_test::refuse_segment_call != nullptr && ec_test::refuse_segment_call(call, seg);
+    };
+    const size_t free_before = hip_free_bytes();
+    uint64_t back = 0;   // the bytes of the segments whose handles the driver took back
+    bool ok = true;
+    for (int64_t i = mapped_segs_ - 1; i >= keep; --i) {
+        uint8_t* const p = base_ + (uint64_t) i * (uint64_t) seg_;
+        if (refused("unmap", i) || hipMemUnmap(p, (size_t) seg_size_[(size_t) i]) != hipSuccess) {
+            (void) hipGetLastError();
+            err = "the driver refused to release an expert-cache segment";
+            ok = false;   // segment i is still mapped: [0, i] stay
+            break;
+        }
+        mapped_segs_ = i;   // unmapped: its slots are gone, whether or not the driver takes the handle back
+        if (refused("release", i) ||
+            hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) segs_[(size_t) i]) != hipSuccess) {
+            (void) hipGetLastError();
+            err = "the driver refused to release an expert-cache segment";
+            ok = false;   // the handle stays in segs_[i]: grow and close release it again
+            break;
+        }
+        segs_[(size_t) i] = 0;
+        back += (uint64_t) seg_size_[(size_t) i];
+    }
+    live_slots_ = slots_within(mapped_bytes());
+    if (back > 0) {
+        int& mode = hip_readdress_mode();
+        const bool came = mode != 1 && hip_seg_wait_free(free_before, back, 100);
+        if (mode < 0) {   // decided once: another program can take freed VRAM at once, so one reading is all it gets
+            mode = came ? 0 : 1;
+            if (mode == 1)
+                std::fprintf(stderr, "ExpertCache: the driver keeps released VRAM while its addresses are reserved: the "
+                                     "cache's range is reserved again for each shrink\n");
+        }
+        if (!came && mode == 1) {   // native amdgpu: the VRAM comes back with the addresses
+            int dev = 0;
+            (void) hipGetDevice(&dev);
+            hip_readdress(dev, base_, reserved_, segs_, seg_, mapped_segs_);
+            (void) hip_seg_wait_free(free_before, back, 100);
+        }
+    }
+    return ok;
+#elif defined(STRATA_EC_NO_VMM)
     (void) keep_bytes;
     return false;
 #else
@@ -546,7 +821,35 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
-#if defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_EC_HIP_VMM)
+    int dev = 0;
+    (void) hipGetDevice(&dev);
+    int64_t at = mapped_bytes();
+    bool ok = true, mapped_any = false;
+    while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
+        const size_t i = (size_t) mapped_segs_;
+        if (segs_[i] != 0) {   // a shrink unmapped this segment and the driver kept its handle then: it goes back first
+            if (hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) segs_[i]) != hipSuccess) {
+                (void) hipGetLastError();
+                err = "the driver refused to release a segment a shrink kept";
+                ok = false;
+                break;
+            }
+            segs_[i] = 0;
+        }
+        if (!hip_map_segment(dev, base_ + (uint64_t) i * (uint64_t) seg_, (size_t) seg_size_[i], segs_[i])) {
+            err = "the driver has no VRAM for another expert-cache segment";
+            ok = false;
+            break;
+        }
+        mapped_any = true;
+        at += seg_size_[i];
+        ++mapped_segs_;
+    }
+    if (mapped_any) hip_seg_settle();   // the refill copies into the new segments come next
+    live_slots_ = slots_within(mapped_bytes());
+    return ok;
+#elif defined(STRATA_EC_NO_VMM)
     (void) want_bytes;
     return false;
 #else
@@ -638,15 +941,22 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-#if !defined(STRATA_EC_NO_VMM)
+#if !defined(STRATA_EC_NO_VMM) || defined(STRATA_EC_HIP_VMM)
     if (seg_req_ > 0 && !segmented_supported()) {   // a driver without them: one block, the engine starts all the same
         std::fprintf(stderr, "ExpertCache: --vram-elastic is off: the driver or this GPU offers no virtual memory management; "
                              "the cache is one block\n");
         seg_req_ = 0;
     }
+#elif defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (seg_req_ > 0) {   // a HIP build on ROCm before 6: one block, as before this backend had segments
+        std::fprintf(stderr, "ExpertCache: --vram-elastic is off: this build's HIP has no virtual memory management (ROCm 6+); "
+                             "the cache is one block\n");
+        seg_req_ = 0;
+    }
 #endif
-    if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
-        if (!open_segmented(want, err)) return false;
+    if (seg_req_ > 0 && !open_segmented(want, err)) return false;   // #533: --vram-elastic: physical segments (zeroed below)
+    if (!segs_.empty()) {
+        // segmented: open_segmented mapped every segment
     } else if (g_cache_vmm && vmm_available()) {
         // the elastic K/V: every chunk mapped now; the K/V may later take some of them (and give them back)
         auto r = std::make_unique<VmmRange>();
