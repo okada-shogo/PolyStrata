@@ -240,9 +240,98 @@ void test_ctrl_down(bool bf16, int count, int n_embd, int rank, int rows) {
     for (int j = 0; j < count; ++j) cudaFree(y0[j]), cudaFree(y1[j]);
 }
 
+// ---- --bench [reps]: the old and the new kernels' time a launch, weights rotating through a pool far larger than the
+// Infinity Cache ("cold": what a decode token sees), the two taken in turn ----
+template <typename L> double time_it(L&& launch, int nsets, int reps) {
+    cudaEvent_t a, b;
+    ck(cudaEventCreate(&a), "ev");
+    ck(cudaEventCreate(&b), "ev");
+    for (int i = 0; i < 20; ++i) launch(i % nsets);
+    std::vector<double> r;
+    for (int k = 0; k < 5; ++k) {
+        ck(cudaEventRecord(a, st), "rec");
+        for (int i = 0; i < reps; ++i) launch((i * 7 + k) % nsets);
+        ck(cudaEventRecord(b, st), "rec");
+        ck(cudaEventSynchronize(b), "sync");
+        float ms = 0;
+        ck(cudaEventElapsedTime(&ms, a, b), "elapsed");
+        r.push_back(1000.0 * ms / reps);
+    }
+    std::sort(r.begin(), r.end());
+    return r[2];
+}
+void bench_slots(int type, int n_in, int n_out, int reps) {
+    const int count = 8, pool = type == 8 ? 64 : 128;
+    std::vector<uint8_t*> w;
+    for (int i = 0; i < pool; ++i) w.push_back(upload(rand_blocks(size_t(n_out) * (n_in / 32), bsize_of(type))));
+    std::vector<void*> x;
+    std::vector<float*> y;
+    for (int j = 0; j < count; ++j) x.push_back(upload(rand_q81(n_in))), y.push_back(fill_ff(n_out));
+    const double bytes = double(count) * n_out * (n_in / 32) * bsize_of(type);
+    auto run = [&](int mode) {
+        kernels::native_gemv_vwarp_force(mode);
+        return time_it([&](int set) {
+            kernels::MmvqSlots sl{};
+            for (int j = 0; j < count; ++j) sl.w[j] = w[(size_t(set) * count + j) % w.size()], sl.x[j] = x[j], sl.y[j] = y[j];
+            kernels::native_mmvq_slots(type, sl, count, n_in, n_out, st);
+        }, pool / count, reps);
+    };
+    const double o1 = run(0), n1 = run(1), o2 = run(0), n2 = run(1);
+    const double o = std::min(o1, o2), nn = std::min(n1, n2);
+    std::printf("BENCH slots type %2d %4d -> %4d x%d: old %6.1f us %6.1f GB/s | new %6.1f us %6.1f GB/s | %+.1f%%\n", type, n_in,
+                n_out, count, o, bytes / o / 1e3, nn, bytes / nn / 1e3, 100.0 * (o / nn - 1));
+    for (auto* p : w) cudaFree(p);
+}
+void bench_many(int reps) {
+    const std::vector<int> outs = {3072, 1024, 1024, 3072, 384, 24};
+    const int n_in = 2304, copies = 16;
+    std::vector<std::vector<uint8_t*>> w(copies);
+    double bytes = 0;
+    for (int c = 0; c < copies; ++c)
+        for (int o : outs) w[c].push_back(upload(rand_blocks(size_t(o) * (n_in / 32), 34)));
+    std::vector<void*> x;
+    std::vector<float*> y;
+    for (int o : outs) x.push_back(upload(rand_q81(n_in))), y.push_back(fill_ff(o)), bytes += double(o) * (n_in / 32) * 34;
+    auto run = [&](int mode) {
+        kernels::native_gemv_vwarp_force(mode);
+        return time_it([&](int set) {
+            kernels::NativeMmvqMany m{};
+            m.count = int(outs.size());
+            for (int j = 0; j < m.count; ++j) m.w[j] = w[set][j], m.x_q8_1[j] = x[j], m.y[j] = y[j], m.n_out[j] = outs[j];
+            kernels::native_mmvq_many(8, m, n_in, st);
+        }, copies, reps);
+    };
+    const double o1 = run(0), n1 = run(1), o2 = run(0), n2 = run(1);
+    const double o = std::min(o1, o2), nn = std::min(n1, n2);
+    std::printf("BENCH many Q8_0 q|k|v|gate|rel|sink: old %6.1f us %6.1f GB/s | new %6.1f us %6.1f GB/s | %+.1f%%\n", o,
+                bytes / o / 1e3, nn, bytes / nn / 1e3, 100.0 * (o / nn - 1));
+}
+void bench_ctrl(int reps) {
+    const int n_embd = 2304, rank = 64, copies = 32;
+    std::vector<std::vector<void*>> dw(copies);
+    for (int c = 0; c < copies; ++c)
+        for (int j = 0; j < 3; ++j) dw[c].push_back(upload(randf(size_t(rank) * 2 * n_embd, 0.02f)));
+    float *cur[3], *msg[3], *ch[3];
+    for (int j = 0; j < 3; ++j) cur[j] = upload(randf(n_embd, 1.0f)), msg[j] = upload(randf(n_embd, 0.7f)), ch[j] = fill_ff(rank);
+    const double bytes = 3.0 * rank * 2 * n_embd * 4;
+    auto run = [&](int mode) {
+        kernels::native_gemv_vwarp_force(mode);
+        return time_it([&](int set) {
+            const float* c[3] = {cur[0], cur[1], cur[2]};
+            const float* m[3] = {msg[0], msg[1], msg[2]};
+            const void* d[3] = {dw[set][0], dw[set][1], dw[set][2]};
+            poly::ink_ctrl_down(c, m, d, ch, 3, n_embd, rank, 1, st, false);
+        }, copies, reps);
+    };
+    const double o1 = run(0), n1 = run(1), o2 = run(0), n2 = run(1);
+    const double o = std::min(o1, o2), nn = std::min(n1, n2);
+    std::printf("BENCH ctrl_down F32 3 x 64 x 4608: old %6.1f us %6.1f GB/s | new %6.1f us %6.1f GB/s | %+.1f%%\n", o,
+                bytes / o / 1e3, nn, bytes / nn / 1e3, 100.0 * (o / nn - 1));
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::printf("no card\n");
@@ -253,6 +342,13 @@ int main() {
     if (!kernels::native_gemv_vwarp_active()) {
         std::printf("not a gfx11 / gfx12 HIP device: the virtual-warp kernels are not built for it, nothing to compare\n");
         return 77;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+        const int reps = argc > 2 ? std::max(10, std::atoi(argv[2])) : 200;
+        for (int type : {20, 8}) bench_slots(type, 2304, 2304, reps), bench_slots(type, 1152, 2304, reps);
+        bench_many(reps);
+        bench_ctrl(reps);
+        return 0;
     }
     for (int type : {20, 8}) {
         for (int count : {1, 5, 8, 32}) {
