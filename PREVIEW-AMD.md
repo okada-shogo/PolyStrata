@@ -16,7 +16,7 @@ by us: RX 9060 XT (gfx1200), Windows, ROCm 10.x.
 | #290 | all experts in pinned RAM when the RAM has room (faster refills) |
 | #291 | prompt kernels loaded at startup, not at the first prompt |
 | #292 + #289 step A (`port/hip-int8-auto`) | prompt products on RDNA3/RDNA4 int8 matrix cores, on by default (see below) |
-| #293 | AMD: a simpler decode graph (faster decode) |
+| #293 | AMD: a simpler decode graph (faster decode under WSL2; no change on native Linux) |
 | #294 | AMD: fewer launches for the attention projections |
 | #295 | AMD: the clip and KV-store kernels fused |
 | #299 | faster expert-cache refill after long prompts |
@@ -28,6 +28,7 @@ by us: RX 9060 XT (gfx1200), Windows, ROCm 10.x.
 | #319 | `--vram-elastic`: the expert cache gives VRAM back to other programs while serving, and takes it back |
 | #320 | `--prompt-batch auto` (the default): the prompt batch sized from free VRAM |
 | #322 | AMD on Linux: the expert staging buffer trimmed to what the cache misses (more experts fit in VRAM) |
+| `port/hip-win-no-lend` | AMD on Windows: no prompt-buffer lending (the crash in amdhip64_7.dll of issue #305) |
 
 ## Build
 
@@ -99,24 +100,24 @@ Add the card, OS, ROCm version, model file and the "N of 3072 routed experts in 
 
 RX 9070 XT 16 GB, native Linux (Fedora, in-tree amdgpu), ROCm 7.2.4, Ryzen 7 7800X3D, `--serve --threads 11
 --vram-reserve-mib 700 --kv fp16 --max-context 32768`, the same flags on both sides, mean of 3 runs with the order
-rotated. main is 36e654b1b with its defaults. Experts in VRAM: IQ4_NL 2,350 (main) and 2,494 (this branch) of 3,072;
+rotated, this exact tree. main is 36e654b1b with its defaults. Experts in VRAM: IQ4_NL 2,350 (main) and 2,494 (this branch) of 3,072;
 UD-Q2_K_XL 3,058 on both.
 
 Prompt tok/s:
 
 | Card | Model | Measure | main | this branch | Change |
 |---|---|---|---:|---:|---:|
-| RX 9070 XT 16 GB | IQ4_NL | prompt 2,048 (tok/s) | 1,117.5 | 1,694.6 | +51.6% |
-| RX 9070 XT 16 GB | UD-Q2_K_XL | prompt 2,048 (tok/s) | 1,404.4 | 2,584.1 | +84.0% |
+| RX 9070 XT 16 GB | IQ4_NL | prompt 2,048 (tok/s) | 1,121.7 | 1,685.8 | +50.3% |
+| RX 9070 XT 16 GB | UD-Q2_K_XL | prompt 2,048 (tok/s) | 1,405.6 | 2,583.8 | +83.8% |
 
 Decode tok/s (256 tokens written):
 
 | Card | Model | Measure | main | this branch | Change |
 |---|---|---|---:|---:|---:|
-| RX 9070 XT 16 GB | IQ4_NL | decode after 302 (tok/s) | 64.1 | 78.1 | +21.8% |
+| RX 9070 XT 16 GB | IQ4_NL | decode after 302 (tok/s) | 63.9 | 78.0 | +22.1% |
 | RX 9070 XT 16 GB | IQ4_NL | decode after 8,192 (tok/s) | 60.8 | 73.2 | +20.4% |
-| RX 9070 XT 16 GB | UD-Q2_K_XL | decode after 302 (tok/s) | 65.6 | 84.1 | +28.2% |
-| RX 9070 XT 16 GB | UD-Q2_K_XL | decode after 8,192 (tok/s) | 62.1 | 77.9 | +25.4% |
+| RX 9070 XT 16 GB | UD-Q2_K_XL | decode after 302 (tok/s) | 65.7 | 84.0 | +27.9% |
+| RX 9070 XT 16 GB | UD-Q2_K_XL | decode after 8,192 (tok/s) | 62.2 | 77.9 | +25.2% |
 
 The RX 9060 XT (gfx1200) has half the compute units: expect lower numbers there.
 
