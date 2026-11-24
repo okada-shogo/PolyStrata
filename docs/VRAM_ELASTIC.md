@@ -19,9 +19,34 @@ a `--serve` engine, with helper caches on other GPUs (`--peer-device`, an expert
 (`--vram-elastic is off: the driver or this GPU offers no virtual memory management`) **(code; not run on such a driver)**.
 Without the flag nothing changes: the same answers as without it. Across a `--layer-split` each card keeps its own segmented cache, so by default one call keeps the reserve on every card at once; pass a `"device"` to free just that CUDA device and leave the others with their full expert cache.
 
-This page is about the Strata project's engine (Qwen3.8). strata-poly, the engine of the models PolyStrata adds, has no flag for
-it: its expert cache takes `POST /v1/vram` as it is, and the server does not pass the config's `"vram_elastic"` on to
-it (strata-poly ends at an option it does not know). A reserve of 0 leaves strata-poly its smallest one, 256 MiB.
+This page is mostly about the Strata project's engine (Qwen3.8). strata-poly, the engine of the models PolyStrata adds
+(Inkling 2 Mini, Qwen3.6 on strata-poly, GLM, ...), is covered in the next section.
+
+## strata-poly (`"vram_elastic": true`, NVIDIA and AMD)
+
+strata-poly's expert cache is already in VMM pieces of 64 MiB under one address range wherever the card has virtual
+memory management (NVIDIA and AMD), and it already resizes at each request's start: it gives back what another program
+took when less than half its reserve is free, and takes free VRAM again (`mind_vram`). `POST /v1/vram` fills it again
+from nothing at the new size. Between requests nothing watches the free VRAM.
+
+With `"vram_elastic": true` the server passes `--vram-elastic` to strata-poly (no segment size: its pieces stay 64 MiB),
+and **(code; measured in the PR)**:
+
+- the cache keeps its **whole** reserve free (`--vram-reserve-mib`, or the engine's default). When another program took a
+  quarter of it (64 MiB at least), the cache gives at least that much back in whole pieces; when a piece and 128 MiB
+  more are free beyond the reserve it takes them again, the experts it gave up first, so the cache after a shrink and a
+  grow holds the experts it held before;
+- this also happens **while the engine is idle**, every 2 s (`STRATA_VRAM_WATCH_MS`; `STRATA_VRAM_WATCH=0`: only at a
+  request's start), never inside a request or while batch slots are writing. A freeze (`STRATA_FREEZE_EXPERTS`) gives
+  way to it as it does to `POST /v1/vram`. The log says `strata-poly: idle: the expert cache A -> B experts ...`;
+- `POST /v1/vram` resizes the same way, a piece at a time, instead of filling the cache again;
+- on AMD under WSL2 (librocdxg) the kept pieces are not unmapped and mapped again for each shrink: there the VRAM of a
+  released piece comes back at the release. On native amdgpu that is checked once, at the first shrink
+  (`STRATA_VRAM_ELASTIC_READDRESS=0|1` sets it). Under WSL2 no piece is asked for unless its bytes and 256 MiB more are free.
+
+It needs VMM and is off with `--vram-pool`; the engine says `--vram-elastic is off: ...` then. Without the flag nothing
+changes. On an AMD card that drives a Linux desktop the server's note recommends this rather than a fixed
+`--vram-reserve-mib 3072`, which costs experts all the time.
 
 ## The request
 

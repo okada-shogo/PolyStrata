@@ -1027,6 +1027,15 @@ static bool vmm_equal_pieces() {
     return on;
 }
 
+// WSL2's GPU (librocdxg): /dev/dxg and no /dev/kfd.  Read once.
+static bool wsl_dxg() {
+    static const bool on = [] {
+        std::error_code ec;
+        return std::filesystem::exists("/dev/dxg", ec) && !std::filesystem::exists("/dev/kfd", ec);
+    }();
+    return on;
+}
+
 // The unit such pieces are made of, 2 MiB like the pool's handles: vmm_reserve() reserves a whole number of them.
 static size_t vmm_unit(size_t grain) { return up_to(size_t(2) << 20, grain); }
 
@@ -1192,7 +1201,17 @@ void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
         } else if (pool_on_ && pool_claimed_) {
             throw std::runtime_error("no VRAM for " + std::string(what) + " (" + std::to_string(n >> 20) +
                                      " MiB more)");
-        } else if (cuMemCreate(&h, n, &prop, 0) != CUDA_SUCCESS) {
+        } else if (
+#if defined(STRATA_USE_HIP)
+                   // --vram-elastic: under WSL2 an allocation past the card's VRAM hangs instead of failing, so a
+                   // piece of the expert cache is asked for only with its bytes and 256 MiB more free (hipMemGetInfo
+                   // is right there).  The other maps keep their own margins (take_prompt(), cover())
+                   (elastic() && &m == &arena_ && wsl_dxg() && [&] {
+                       size_t f = 0, t = 0;
+                       return cudaMemGetInfo(&f, &t) == cudaSuccess && f < n + (size_t(256) << 20);
+                   }()) ||
+#endif
+                   cuMemCreate(&h, n, &prop, 0) != CUDA_SUCCESS) {
             throw std::runtime_error("no VRAM for " + std::string(what) + " (" + std::to_string(n >> 20) +
                                      " MiB more)");
         }
@@ -1228,6 +1247,21 @@ void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
 // Gives back the pieces of m that lie past its first `bytes`.  The card must be done with them.
 void Engine::vmm_unmap(Mapped& m, size_t bytes) {
     const size_t had = m.mapped;
+#ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
+    // --vram-elastic: whether released VRAM comes back without its addresses (below), decided once from an expert-cache
+    // shrink of a whole piece or more.  -1 undecided, 0 it does, 1 it does not
+    static int readdress = [] {
+        const char* v = std::getenv("STRATA_VRAM_ELASTIC_READDRESS");
+        if (v && v[0]) return v[0] == '0' ? 0 : 1;
+        return wsl_dxg() ? 0 : -1;
+    }();
+    size_t free0 = 0;
+    const bool measure = elastic() && readdress < 0 && &m == &arena_ && m.mapped >= bytes + kArenaPiece;
+    if (measure) {
+        size_t t = 0;
+        (void) cudaMemGetInfo(&free0, &t);
+    }
+#endif
     while (!m.pieces.empty() && m.mapped - m.pieces.back().second >= bytes) {
         const auto [h, n] = m.pieces.back();
         m.mapped -= n;
@@ -1244,6 +1278,26 @@ void Engine::vmm_unmap(Mapped& m, size_t bytes) {
     // has left, the slots, the recorded launches and m point at VRAM that is not there: a step that fails from
     // there on ends the engine (the server starts it again for the next request) rather than reading that VRAM.
     if (m.mapped == had || !m.base) return;
+    // --vram-elastic: whether this driver keeps released VRAM while the addresses stay is read once, at the first
+    // expert-cache shrink of a piece or more (undecided until then: the cycle below, as without the flag): librocdxg (WSL2) gives it back at the release (an RX 9060 XT's 64 of 64 MiB, ROCm
+    // 7.2.4), so there the kept pieces are not unmapped and mapped again for every shrink.  Never under WSL2 (/dev/dxg
+    // without /dev/kfd); STRATA_VRAM_ELASTIC_READDRESS=0|1 sets it.
+    if (elastic()) {
+        if (measure) {
+            const size_t want = free0 + (had - m.mapped) / 8 * 7;
+            size_t f = 0, t = 0;
+            for (int i = 0; i < 100; ++i) {
+                (void) cudaMemGetInfo(&f, &t);
+                if (f >= want) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            readdress = f >= want ? 0 : 1;
+            std::fprintf(stderr, "strata-poly: --vram-elastic: released VRAM %s\n",
+                         readdress ? "comes back only with its addresses: the kept pieces are mapped again for each shrink"
+                                   : "comes back at the release");
+        }
+        if (readdress == 0) return;
+    }
     const auto must = [](CUresult r, const char* what) {
         if (r == CUDA_SUCCESS) return;
         const char* s = nullptr;
@@ -1796,10 +1850,12 @@ void Engine::shrink_cache(size_t bytes) {
             ck(cudaMemcpyAsync(to, from, L.slot_bytes, cudaMemcpyDeviceToDevice, cs(st_)), "the expert cache");
             from = to;
             to = nullptr;
+            if (give_back_) gave_back_[(size_t) l[k].il * ne + (size_t) l[k].e] = 1;
             ++k;
         } else {
             mirror_keep(x.il, x.e, from);
             from = nullptr;
+            if (give_back_) gave_back_[(size_t) x.il * ne + (size_t) x.e] = 1;
         }
         --cached_;
     }
@@ -1807,6 +1863,14 @@ void Engine::shrink_cache(size_t bytes) {
     vmm_unmap(arena_, cut);
     if (cut > kTail) zero_vram(exp_ + end, kTail);
     exp_at_ = std::min(exp_at_, end);
+    if (give_back_) {   // --vram-elastic: a slot that crossed `end` left, so the room from the last kept slot is free again
+        size_t top = 0;
+        for (const Layer& L : layers_)
+            if (L.trade >= 0)
+                for (const uint8_t* q : L.slot)
+                    if (q) top = std::max(top, (size_t) (q - exp_) + L.slot_bytes);
+        exp_at_ = std::min(exp_at_, top);
+    }
     staged_il_ = -1;
 }
 
@@ -2611,6 +2675,7 @@ void Engine::resize_card_cache(int mib) {
     std::fill(coming_.begin(), coming_.end(), (uint8_t) 0);
     for (Layer& L : layers_) std::fill(L.slot.begin(), L.slot.end(), nullptr);
     refill_.clear();
+    gave_back_.clear();
     staged_il_ = -1;
     cached_ = 0;
     exp_at_ = 0;
@@ -2644,6 +2709,67 @@ bool Engine::mind_vram() {
     return changed;
 }
 
+// --vram-elastic: the whole reserve stays free.  Between requests (and idle) another program that took a quarter of it
+// (64 MiB at least) gets at least that back, in whole pieces; a piece and 128 MiB more free and the cache takes them
+// again, the experts it gave up first - the two bands never meet, so a cache does not go up and down by itself.  The
+// VRAM command (`exact`) asks for its number: any shortfall is given back, a piece or more free is taken.  An idle grow
+// takes 1 GiB at most a time (it reads the experts from the files), so a line that comes waits that long at most.
+bool Engine::elastic_card(int64_t free, bool exact) {
+    const int64_t keep = reserve_mib_;
+    if (exact ? free < keep : free + std::max<int64_t>(64, keep / 4) < keep) {
+        if (gave_back_.empty()) gave_back_.assign((size_t) layers_.size() * (size_t) n_expert_, 0);
+        give_back_ = true;
+        shrink_cache(size_t(keep - free) << 20);
+        give_back_ = false;
+        held_is_budget();
+        return true;
+    }
+    const int64_t piece = (int64_t) (kArenaPiece >> 20);
+    if (free < keep + piece + (exact ? 0 : 128)) return false;
+    const size_t want = size_t(free - keep) << 20;
+    return grow_cache(exact || !idle_ ? want : std::min(want, size_t(1) << 30)) > 0;
+}
+
+bool Engine::idle_vram(bool served) {
+    // before the first request nothing is recorded (mind_card_vram()'s grace, which a frozen request start leaves at 0)
+    if (!elastic() || !served) return false;
+    for (Engine* e = this; e; e = e->next_.get())
+        if (e->minds_ == 0) e->minds_ = 1;
+    const bool frozen = freeze_experts_asked_ && expert_cap_ < 0;
+    if (frozen) unfreeze_experts();
+    bool changed = false;
+    idle_ = true;
+    try {
+        changed = mind_vram();
+    } catch (...) {
+        idle_ = false;
+        if (frozen) refreeze_experts();
+        throw;
+    }
+    idle_ = false;
+    if (frozen) refreeze_experts();
+    return changed;
+}
+
+void Engine::elastic_resize(int mib) {
+    for (Engine* e = this; e; e = e->next_.get()) {
+        if (!e->exp_ || !e->elastic()) {   // no cache yet (no room at load), or no VMM on this card: filled anew
+            e->resize_card_cache(mib);
+            continue;
+        }
+        OnCard here(e->device_, e->split_);
+        e->opt_.vram_reserve_mib = mib < 0 ? e->asked_reserve_mib_ : mib;
+        // as fill_expert_cache() sizes it (256 at least), without filling the cache again
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        e->reserve_mib_ = e->opt_.vram_reserve_mib >= 0 ? std::max(e->opt_.vram_reserve_mib, 256)
+                                                       : default_reserve_mib(total_b, e->ram_tight_);
+        if (e->minds_ == 0) e->minds_ = 1;   // the operator's call: no first-request grace
+        if (e->freeze_experts_) continue;
+        e->elastic_card((int64_t) (free_b >> 20), true);
+    }
+}
+
 bool Engine::mind_card_vram() {
 #if defined(STRATA_GPU_METAL)
     if (opt_.metal_balanced) return metal_mind_memory();
@@ -2670,6 +2796,7 @@ bool Engine::mind_card_vram() {
         return true;
     }
     if (minds_++ == 0) return false;   // nothing is recorded before the first request
+    if (elastic()) return elastic_card(free, false);
     const int64_t keep = opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128);
     if (free < keep / 2) {
         shrink_cache(size_t(keep - free) << 20);
@@ -2840,6 +2967,7 @@ int Engine::grow_cache(size_t bytes, bool later) {
     struct Cand {
         int il, e;
         double value;
+        bool back = false;   ///< --vram-elastic: an elastic shrink took it out (gave_back_): it comes back first
     };
     std::vector<Cand> cands;
     for (int il = 0; il < (int) layers_.size(); ++il) {
@@ -2849,7 +2977,7 @@ int Engine::grow_cache(size_t bytes, bool later) {
             const size_t i = (size_t) il * n_expert_ + e;
             if (L.slot[(size_t) e] || (!coming_.empty() && coming_[i])) continue;
             const double used = (double) ((prior_.empty() ? 0 : prior_[i]) + use_[i]);
-            cands.push_back({il, e, used / (double) L.slot_bytes});
+            cands.push_back({il, e, used / (double) L.slot_bytes, !gave_back_.empty() && gave_back_[i] != 0});
         }
     }
     if (cands.empty()) return 0;
@@ -2859,8 +2987,9 @@ int Engine::grow_cache(size_t bytes, bool later) {
     }
     if (arena_.mapped < exp_at_ + kTail) return 0;
     zero_vram(exp_ + exp_at_, arena_.mapped - exp_at_);   // the new slots' tails
-    std::stable_sort(cands.begin(), cands.end(),
-                     [](const Cand& a, const Cand& b) { return a.value != b.value ? a.value > b.value : a.e < b.e; });
+    std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        return a.back != b.back ? a.back : a.value != b.value ? a.value > b.value : a.e < b.e;
+    });
     std::vector<Cand> taken;
     size_t room = arena_.mapped - kTail - exp_at_;
     for (const Cand& c : cands) {
@@ -2892,6 +3021,8 @@ int Engine::grow_cache(size_t bytes, bool later) {
         L.slot[e] = s;
         ++cached_;
     }
+    if (!gave_back_.empty())
+        for (const Cand& c : taken) gave_back_[(size_t) c.il * n_expert_ + c.e] = 0;
     staged_il_ = -1;
     held_is_budget();
     return (int) taken.size();
@@ -2913,6 +3044,7 @@ void Engine::fill_now() {
         }
         L.slot[e] = r.slot;
         coming_[(size_t) r.il * n_expert_ + e] = 0;
+        if (!gave_back_.empty()) gave_back_[(size_t) r.il * n_expert_ + e] = 0;
         ++cached_;
     }
     refill_.clear();
@@ -3057,6 +3189,7 @@ void Engine::follow(int written) {
             ck(arrived, "expert upload");
             layers_[(size_t) s.il].slot[(size_t) s.e] = s.slot;
             coming_[(size_t) s.il * ne + (size_t) s.e] = 0;
+            if (!gave_back_.empty()) gave_back_[(size_t) s.il * ne + (size_t) s.e] = 0;
             if (s.mirror && !(s.adds && refills_mirror())) mirror_give(s.il, s.e);
             if (s.spare) mirror_of_[(size_t) s.out] = s.spare;
             s.mirror = nullptr;

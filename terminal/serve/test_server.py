@@ -3391,6 +3391,16 @@ class DesktopVramNote(unittest.TestCase):
         self.assertEqual(desktop_vram_note("hip", 2994, [], True), "")             # room left
         self.assertEqual(desktop_vram_note("hip", None, [], True), "")             # lazy start: no INFO yet
         self.assertEqual(desktop_vram_note("hip", 900, ["--vram-reserve-mib", "4000"], True), "")   # already raised
+        self.assertEqual(desktop_vram_note("hip", 624, ["--vram-elastic"], True, True), "")   # strata-poly gives way itself
+
+    def test_strata_poly_is_pointed_at_elastic(self):
+        from serve.server import desktop_vram_note
+        note = desktop_vram_note("hip", 624, ["--kv", "int8"], True, False)       # strata-poly without --vram-elastic
+        self.assertIn("624 MiB of VRAM free", note)
+        self.assertIn('"vram_elastic": true', note)
+        self.assertNotIn("GB less", note)
+        self.assertIn("--vram-reserve-mib 3072", desktop_vram_note("hip", 624, [], True, None))   # the Qwen engines
+        self.assertEqual(desktop_vram_note(None, 624, [], True, False), "")       # NVIDIA: unchanged
 
     def test_desktop_detection(self):
         from serve import server
