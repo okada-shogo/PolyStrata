@@ -96,6 +96,15 @@ by a kernel, so they no longer wait behind the experts copied over the bus. The 
 added. On an RTX 2070 Super 8 GB a 2,048-token prompt reads 6.5% faster with IQ4_NL (477 against 448 tokens/s) and
 2.7% faster with UD-Q2_K_XL; 32,768 tokens read as fast as before. `STRATA_INK_KERNEL_TABLES=0` turns it off.
 
+A prompt read gives up hundreds of the experts in VRAM for its rows and its wider staging buffer, and the next request
+takes them back. Where the RAM has room, the engine keeps a pinned copy of every expert, the ones in VRAM too
+(NVIDIA, where the engine makes a mirror: Linux by default, Windows with `STRATA_POLY_MIRROR=1`): an expert the cache gives up then needs no copy back from the card, and goes back to it straight
+from pinned memory. The start line says `mirror: all experts (… GiB pinned …)`. It is made when the RAM free to the
+engine (under WSL or in a container, theirs) keeps max(8 GiB, 20% of it) free beside the copy; IQ4_NL takes about
+4.7 GiB more than the copy of the experts outside VRAM alone. The answers are the same. `--no-full-mirror`
+(or `STRATA_POLY_MIRROR=partial`; on Windows, where `STRATA_POLY_MIRROR=1` makes the mirror, `--no-full-mirror`) keeps
+the copy to the experts outside VRAM, as before.
+
 On a laptop with an RTX 4070 Laptop (8 GB), a Core i7-14700HX and 32 GB of RAM, on Windows, UD-Q3_K_XL has 1,216 of
 its 3,072 experts on the card and the rest are computed on the CPU. On a card that does not hold every expert, setup
 gives Inkling 2 Mini three settings that read fewer bytes for each token: `--attn-requant q5_0` (the attention's

@@ -103,6 +103,9 @@ struct Options {
     bool lock_experts = false;    ///< the experts outside VRAM kept in RAM, so the system cannot give it to another
                                   ///< program: copied into the pinned mirror (Engine::build_mirror()), or where there
                                   ///< is none, their pages in the file locked (Linux: up to ulimit -l)
+    bool full_mirror = true;      ///< --no-full-mirror makes it false: where the model's engine asks for it
+                                  ///< (Engine::full_mirror_default()), the pinned mirror holds the cached experts too
+                                  ///< when the RAM keeps enough free beside it (Engine::build_mirror())
     bool stay_near = true;       ///< with several NUMA nodes, keep the CPU threads on the one that holds the experts
     bool graphs = true;           ///< a token's fixed launches are recorded once, a CUDA graph a layer, and replayed
     bool kv_grow = true;          ///< the attention caches get VRAM as the sequence grows, where the card can map it
@@ -556,6 +559,8 @@ protected:
     /// gives, with the group's rows and these on the card (read_groups()).  carry_at() points the architecture's
     /// buffers of them at a call's: carry_rows() blocks of rows_ rows each from `at`, or back at its own with null.
     virtual int carry_rows() const { return 0; }
+    /// The pinned mirror holds every expert, the cached ones too, when the RAM has room (build_mirror()).
+    virtual bool full_mirror_default() const { return false; }
     virtual void carry_at(float* at) { (void) at; }
     /// The architecture's block i of those rows as they are now (carry_at()), rows_ rows.  On a layer split they cross
     /// to the next card beside the rows of r_ (carry_out(), carry_in()).
@@ -776,8 +781,8 @@ protected:
     void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
     void stage_rest(const Layer& L, const int32_t* experts, const std::vector<int>& which, int m, void* stream,
                     bool alone);
-    // The pinned mirror (build_mirror()): the routed experts the card does not hold, in pinned host memory in a
-    // card slot's layout.
+    // The pinned mirror (build_mirror()): the routed experts the card does not hold (with mirror_all_ every routed
+    // expert), in pinned host memory in a card slot's layout.
     void build_mirror();
     const uint8_t* mirror(int il, int e) const {
         return mirror_of_.empty() ? nullptr : mirror_of_[(size_t) il * (size_t) n_expert_ + (size_t) e];
@@ -790,7 +795,12 @@ protected:
     /// experts the next long read takes from the cache again (widen_stage(), take_prompt()), which then go with no copy
     /// back from the card: given back, the copies held every 4,833-token read of Qwen3.6 UD-Q3_K_M on a 4090 2-3%
     /// under the default's.
-    bool refills_mirror() const { return opt_.lock_experts; }
+    ///
+    /// mirror_all_ (build_mirror()): every expert has its copy from the load on, and one that comes onto the card keeps
+    /// it, so an expert the cache gives up needs no copy back and no staging through the pinned buffers.
+    bool refills_mirror() const { return opt_.lock_experts || mirror_all_; }
+    bool mirror_all_ = false;
+    bool mirror_short_ = false;   ///< the whole mirror's memory could not be had: build_mirror() makes the partial one
     void mirror_give(int il, int e);          ///< the expert is on the card: its slot is a spare again
     void mirror_keep(int il, int e, const uint8_t* vram);   ///< the expert leaves the card: its slot copied back
     GatherPiece* gather_slot();
