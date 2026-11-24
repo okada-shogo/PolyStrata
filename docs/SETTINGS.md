@@ -11,7 +11,7 @@ A number or a word is set like any environment variable, for example `STRATA_KVA
 (`terminal/strata-<model>.json`), which the server passes to the engine. The Strata project's Terminal writes it there with
 `strata launch --set NAME=value`.
 
-## Switches you can turn on (350)
+## Switches you can turn on (352)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -127,6 +127,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_I8_MT` | number | Intel Arc | [INTEL_INT8_EXPERTS.md](INTEL_INT8_EXPERTS.md) |
 | `STRATA_I8_WG` | number | Intel Arc | [INTEL_INT8_EXPERTS.md](INTEL_INT8_EXPERTS.md) |
 | `STRATA_INK_FAST_CTRL` | on / off | NVIDIA | - |
+| `STRATA_INK_PRESTAGE` | on / off | NVIDIA | [inkling.md](models/inkling.md) |
 | `STRATA_IO_PF_AHEAD` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_IO_PF_GATE` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [release-notes-0.2.0.md](release-notes-0.2.0.md) |
 | `STRATA_IO_PF_GATE_LO` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
@@ -253,6 +254,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PIPE_BYIELD_NODRAIN` | on / off | NVIDIA and AMD | [BATCHING.md](BATCHING.md) |
 | `STRATA_PLE_COMPACT` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PLE_COPY_STREAM` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
+| `STRATA_POLY_F32_TUNE_CACHE` | text | NVIDIA and AMD | - |
 | `STRATA_POLY_STREAM_STAGE` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_POOL_CORES` | on / off | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
 | `STRATA_POOL_STATIC` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
@@ -368,7 +370,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WDDM_MARGIN_MIB` | number | AMD | [AMD_HIP.md](AMD_HIP.md) |
 
-## Switches that go back to earlier behaviour (121)
+## Switches that go back to earlier behaviour (123)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -407,6 +409,7 @@ version made it the default.
 | `STRATA_IGPU_PROMPT_SET` | on / off | NVIDIA and AMD | v0.2.16 | [AMD_HIP.md](AMD_HIP.md), [RADEON_780M.md](RADEON_780M.md), [release-notes-0.2.1.md](release-notes-0.2.1.md) |
 | `STRATA_IL_PAD` | number | NVIDIA and AMD | v0.2.16 | - |
 | `STRATA_INK_FLASH` | on / off | NVIDIA and AMD | - | - |
+| `STRATA_INK_FLASH_TOKENS` | number | NVIDIA and AMD | - | - |
 | `STRATA_INK_KERNEL_TABLES` | on / off | NVIDIA | - | [inkling.md](models/inkling.md) |
 | `STRATA_INK_MMA75` | on / off | NVIDIA and AMD | - | [inkling.md](models/inkling.md) |
 | `STRATA_INK_PROJECT_MIXED` | on / off | NVIDIA | - | - |
@@ -448,6 +451,7 @@ version made it the default.
 | `STRATA_PLE_AUTO_MMAP` | number | NVIDIA and AMD, Intel Arc | v0.2.16 | [DETAILS.md](DETAILS.md) |
 | `STRATA_POLY_BELL` | on / off | NVIDIA | - | - |
 | `STRATA_POLY_EXPERT_TILES` | on / off | NVIDIA and AMD | - | [inkling.md](models/inkling.md) |
+| `STRATA_POLY_F32_AUTOTUNE` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_POLY_HIP_GROUPED` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_POLY_NV4_TILE` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_POLY_WARMUP` | on / off | AMD | - | [AMD_HIP.md](AMD_HIP.md) |

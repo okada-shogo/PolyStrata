@@ -216,6 +216,14 @@ void Inkling2::load_geometry() {
         const char* v = std::getenv("STRATA_INK_KERNEL_TABLES");
         kernel_tables_ = !(v && std::string(v) == "0");
     }
+    // STRATA_INK_PRESTAGE=1: a prompt's read copies the next layer run's experts that are not cached while a run's
+    // calls go, into a second part of the staging buffer that the expert cache lends for the read (prestage()).
+    // The experts and the launches are the same, so the results are too.  Opt-in: the cache holds fewer experts
+    // during the read.
+    {
+        const char* v = std::getenv("STRATA_INK_PRESTAGE");
+        prestage_ = v && std::string(v) == "1";
+    }
 #endif
     // a prompt batch's F32 products of 33 to 256 outputs (the controllers' down products, the routers) in
     // gemm_f32_tiles(): the same bits as gemm_f32()
