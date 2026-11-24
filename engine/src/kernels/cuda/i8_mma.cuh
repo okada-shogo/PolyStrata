@@ -19,6 +19,9 @@
 // scale times the sum of its codes).  A value's sum is its own, stage after stage, so it does not depend on the
 // launch its row is in.
 //
+// On Turing some types take another shape of the same arithmetic (I8M_CF_* below, i8m_cf75()): stages of 128 values
+// and 256 threads, so that two blocks share a multiprocessor's 64 KB.
+//
 // The activations (gemm_iq_i8_quantize): [rows][K] int8 codes, then [rows][K / 32] float scales, then [rows][K / 32]
 // floats scale * (sum of the block's codes).  A block of 32 values: scale = max|x| / 127, code = round(x / scale).
 constexpr int I8M_NT = 256;
@@ -59,12 +62,42 @@ __host__ __device__ constexpr int i8m_rows(int t, int nj) { return nj == 8 && t 
 // (Q3_K experts 578 -> 642, IQ3_XXS 473 -> 498, Q6_K 345 -> 363 with two).
 __host__ __device__ constexpr int i8m_tiles_a(int t, int nj, int wr = 64) { return wr == 128 || (nj == 8 && (t == 8 || t == 12 || t == 13)) ? 2 : 1; }
 
-template <int T, int NJ, int WR, bool RAW = false>
+// A tile's shape chosen per card by the launcher (CF, bits; 0: the shape above, i8m_threads() / i8m_tiles_a()):
+// I8M_CF_T256 256 threads a block, I8M_CF_NA1 one tile of 16 weight rows a warp,
+// I8M_CF_CVT the MMAs' int32 sums made floats by an add (i8m_float()) in place of the conversion instruction (I8M_CF_CVT2:
+// half of them, so that the conversions and the adds run side by side on their two units),
+// I8M_CF_K128 stages of 128 values in place of 256 (half the shared memory, so that two blocks fit a multiprocessor
+// that has 64 KB: one decodes its stage while the other multiplies), I8M_CF_SWZ shared rows of codes without the 16
+// bytes between them, their 16-byte pieces in an order that changes from row to row (piece c of row r at c ^ (r & 7)),
+// so that 8 rows still lie in 8 banks (3 KB less: the i-quants' tables then leave room for two blocks too).  None of
+// them changes a value's sum: each is the same terms in the same order, so the same bits.
+constexpr int I8M_CF_T256 = 1, I8M_CF_NA1 = 4, I8M_CF_CVT = 16, I8M_CF_CVT2 = 32, I8M_CF_K128 = 64, I8M_CF_SWZ = 128;
+__host__ __device__ constexpr int i8m_nt(int t, int nj, int wr, int cf) { return (cf & I8M_CF_T256) ? 256 : i8m_threads(t, nj, wr); }
+__host__ __device__ constexpr int i8m_na(int t, int nj, int wr, int cf) { return (cf & I8M_CF_NA1) ? 1 : i8m_tiles_a(t, nj, wr); }
+__host__ __device__ constexpr int i8m_ks(int cf) { return (cf & I8M_CF_K128) ? 128 : 256; }
+// the threads cover the tile: warps by RG down the weight rows and CG across the activation rows, whole tiles of 8
+// activation rows each, whole 16-byte pieces of the stage's activations, NB / RT sub-blocks of a weight row a thread
+__host__ __device__ constexpr bool i8m_shape_ok(int t, int nj, int wr, int cf) {
+    const int nt = i8m_nt(t, nj, wr, cf), rg = wr / (16 * i8m_na(t, nj, wr, cf)), cg = rg > 0 ? nt / 32 / rg : 0;
+    const int nb = i8m_ks(cf) / 32, tpr = i8m_ks(cf) / 16;   // sub-blocks of a stage, threads of an activation row's stage
+    // (stages of 128: not the types whose threads decode two sub-blocks that share their reads, i8m_sub())
+    return rg >= 1 && cg >= 1 && (2 * nj) % cg == 0 && 2 * nj >= cg && (16 * nj * tpr) % nt == 0 && 16 * nj * tpr >= nt &&
+           nt <= nb * wr && nt >= wr && nb % (nt / wr) == 0 && nt >= 16 * nj && nt >= 256 &&
+           (nb == 8 || !(t == 11 || t == 14 || t == 23));
+}
+// An MMA's int32 sum as a float, exactly: |c| < 2^22 (32 products of two int8 codes are at most 2^19), so c + 1.5 2^23
+// is a float whose bits are c + 0x4B400000, and less 1.5 2^23 it is c: the same float as (float) c.  An integer add
+// and a float add, where the conversion goes to a unit that takes 16 values a clock on a multiprocessor of compute
+// capability 7.5 (the CUDA guide's throughput table), a quarter of its float adds.
+__device__ __forceinline__ float i8m_float(int c) { return __int_as_float(c + 0x4B400000) - 12582912.0f; }
+
+template <int T, int NJ, int WR, bool RAW = false, int KS = 256, bool SWZ = false>
 struct I8mSmem {
     static constexpr int MT = 16 * NJ;                                           // activation rows of a tile
+    static constexpr int LD = KS / 4 + (SWZ ? 0 : 4);                            // I8M_LD for a stage of KS values
     static constexpr int GW = !i8_gg_type(T) && i8_grid_words(T) > 4 ? (i8_grid_words(T) + 3) / 4 * 4 : 0;
     static constexpr int SG = i8_sign_type(T) ? 512 : 0;
-    static constexpr int NS = i8m_two(T) ? 16 : 8;                               // scales of a weight row a stage
+    static constexpr int NS = i8m_two(T) ? KS / 16 : KS / 32;                    // scales of a weight row a stage
     static constexpr int MN = i8_min_type(T) ? 1 : 0;
     // A type with a minimum per 32 values keeps {scale, minimum} of a sub-block together (PK): those of two sub-blocks
     // are one 16-byte read
@@ -77,9 +110,9 @@ struct I8mSmem {
     static constexpr int XQ = MN ? 4 : 2;
     static constexpr int XSTR = MT / 2 * XQ + 4;                                 // floats a block: +4 spreads the blocks over the banks
     static constexpr int S16 = MT + 4;
-    static constexpr int o_sg = GW, o_w = o_sg + SG, o_x = o_w + WR * I8M_LD, o_ws = o_x + MT * I8M_LD, o_wm = o_ws + WR * LDS,
-                         o_xq = (o_wm + (MN && !PK) * WR * LDB + M16 * WR * LDM + 3) / 4 * 4, o_x16 = o_xq + 8 * XSTR,
-                         o_id = o_x16 + M16 * 16 * S16, o_raw = (o_id + MT + 3) / 4 * 4,
+    static constexpr int o_sg = GW, o_w = o_sg + SG, o_x = o_w + WR * LD, o_ws = o_x + MT * LD, o_wm = o_ws + WR * LDS,
+                         o_xq = (o_wm + (MN && !PK) * WR * LDB + M16 * WR * LDM + 3) / 4 * 4, o_x16 = o_xq + KS / 32 * XSTR,
+                         o_id = o_x16 + M16 * KS / 16 * S16, o_raw = (o_id + MT + 3) / 4 * 4,
                          RW = !RAW ? 0 : i8m_raw_bytes(T) % 16 == 0 ? i8m_raw_bytes(T) / 4 : ((i8m_raw_bytes(T) + 15) / 16 + 1) * 4,
                          total = o_raw + WR * RW;
     static constexpr size_t bytes = (size_t) total * 4;
@@ -338,9 +371,9 @@ template <int T> constexpr int I8M_RAW = T == 11 ? I8M_Q3K_RAW : T == 10 ? I8M_Q
 // what they read (Q3_K's code and high-bit words and scales, Q6_K's high bits and low bits: 0 and 2, 1 and 3, ...;
 // IQ4_XS's scales), which is then read once: on an RTX 5090 their experts' products took 7-28% less time.  (Q4_K, Q5_K,
 // Q8_0 and the i-quants were 2-6% slower so.)
-template <int T, int RT>
+template <int T, int RT, int NB = 8>
 __device__ __forceinline__ int i8m_sub(int r0, int part) {
-    constexpr int PER = 8 / RT;
+    constexpr int PER = NB / RT;
     if constexpr (T == 14 && PER == 2) return (r0 >> 1) * 4 + (r0 & 1) + 2 * part;
     if constexpr (T == 11 || T == 14 || T == 23) return PER * r0 + part;
     return r0 + RT * part;
@@ -410,30 +443,45 @@ __global__ void __launch_bounds__(I8M_NT) i8m_quantize4_kernel(const float* __re
     }
 }
 
-template <int T, int NJ, int WR, bool RAW>
-__global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8_t* __restrict__ W, size_t mat_bytes, size_t row_bytes,
-                                                                  int n_out, int K,
-                                                    const uint8_t* __restrict__ X, const float* __restrict__ XD,
-                                                    const float* __restrict__ XS, const int32_t* __restrict__ bounds, int ch_per_e,
-                                                    const int32_t* __restrict__ ids, const int32_t* __restrict__ from,
-                                                    const long long* __restrict__ at, float* __restrict__ Y, long long ldy) {
+// The kernel's body (i8m_kernel below launches it)
+template <int T, int NJ, int WR, bool RAW, int CF>
+__device__ __forceinline__ void i8m_tile(const uint8_t* __restrict__ W, size_t mat_bytes, size_t row_bytes, int n_out, int K,
+                                         const uint8_t* __restrict__ X, const float* __restrict__ XD,
+                                         const float* __restrict__ XS, const int32_t* __restrict__ bounds, int ch_per_e,
+                                         const int32_t* __restrict__ ids, const int32_t* __restrict__ from,
+                                         const long long* __restrict__ at, float* __restrict__ Y, long long ldy) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750   // (a pass for an older card compiles this empty: the host asks i8m_arch_kernel first)
-    using SM = I8mSmem<T, NJ, WR, RAW>;
+    // KS values a stage: NB sub-blocks of 32, a row of activations TPR 16-byte pieces, LD words a shared row
+    constexpr int KS = i8m_ks(CF), NB = KS / 32, TPR = KS / 16;
+    static_assert(KS == 256 || !RAW, "i8m_kernel: the raw stage copy is of 256 values");
+    constexpr bool SWZ = (CF & I8M_CF_SWZ) != 0;
+    using SM = I8mSmem<T, NJ, WR, RAW, KS, SWZ>;
+    constexpr int LD = SM::LD;
+    // words into a shared row of codes of its 16-byte piece c (row7: the row's index & 7)
+    const auto piece = [](int row7, int c) { return SWZ ? (c ^ row7) * 4 : c * 4; };
     constexpr int MT = SM::MT, LDS = SM::LDS, LDB = SM::LDB, XQ = SM::XQ, XSTR = SM::XSTR;
     // NT threads.  A warp multiplies NA tiles of 16 weight rows (two where the activation rows are many: each piece of
     // them read out of shared memory goes into two products) with NJW tiles of 8 activation rows; RG warps side by
     // side down the weight rows, CG across the activation rows.
-    constexpr int NT = i8m_threads(T, NJ, WR), NA = i8m_tiles_a(T, NJ, WR), RG = WR / (16 * NA), CG = NT / 32 / RG;
-    constexpr int NJW = 2 * NJ / CG, NX = MT * 16 / NT;
-    constexpr int RT = NT / WR;   // threads of a weight row: each decodes 8 / RT of its 8 sub-blocks a stage
+    constexpr int NT = i8m_nt(T, NJ, WR, CF), NA = i8m_na(T, NJ, WR, CF), RG = WR / (16 * NA), CG = NT / 32 / RG;
+    constexpr int NJW = 2 * NJ / CG, NX = MT * TPR / NT;
+    static_assert(i8m_shape_ok(T, NJ, WR, CF), "i8m_kernel: a tile shape the threads do not cover");
+    // the int32 sums as floats: c[0..3] by i8m_float() (I8M_CF_CVT), c[0..1] so and c[2..3] converted (I8M_CF_CVT2), or
+    // all converted
+    const auto fl = [](int c, int l) -> float {
+        if constexpr ((CF & I8M_CF_CVT) != 0) return i8m_float(c);
+        else if constexpr ((CF & I8M_CF_CVT2) != 0) return l < 2 ? i8m_float(c) : (float) c;
+        else return (float) c;
+    };
+    constexpr int RT = NT / WR;   // threads of a weight row: each decodes NB / RT of its NB sub-blocks a stage
     constexpr bool TWO = i8m_two(T), HAS_MIN = i8_min_type(T), MIN16 = i8m_min16(T);
     constexpr int LDM = SM::LDM, S16 = SM::S16;
     extern __shared__ uint4 i8m_dyn[];
     uint32_t* const smem = (uint32_t*) i8m_dyn;
     uint32_t* const s_grid = smem;
     uint32_t* const s_sg = smem + SM::o_sg;
-    uint32_t* const s_w = smem + SM::o_w;                    // [WR][I8M_LD]: a stage of the weight rows' codes
-    uint32_t* const s_x = smem + SM::o_x;                    // [MT][I8M_LD]: a stage of the activation rows' codes
+    uint32_t* const s_w = smem + SM::o_w;                    // [WR][LD]: a stage of the weight rows' codes
+    uint32_t* const s_x = smem + SM::o_x;                    // [MT][LD]: a stage of the activation rows' codes
     float* const s_ws = (float*) (smem + SM::o_ws);          // [WR][LDS]: scale of (weight row, sub-block or half of one)
     float* const s_wm = (float*) (smem + SM::o_wm);          // [WR][LDB]: minimum of (weight row, sub-block)
     float* const s_xq = (float*) (smem + SM::o_xq);          // [8][XSTR]: the activation rows' scales (I8mSmem)
@@ -500,26 +548,26 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
 
     // A stage as it is read: this thread's sub-blocks of its weight row, its 16-byte pieces of the activation rows
     // and its activation scales.
-    constexpr int PER = 8 / RT, NSC = (MT * 8 + NT - 1) / NT;
+    constexpr int PER = NB / RT, NSC = (MT * NB + NT - 1) / NT;
     uint32_t wraw[PER][I8M_RAW<T>];
-    uint4 xr[NX];   // piece n: activation row (NT / 16) n + tid / 16
+    uint4 xr[NX];   // piece n: activation row (NT / TPR) n + tid / TPR
     float xdr[NSC], xsr[NSC];
     float x16[MIN16 ? NX : 1];   // Q2_K: the scale of the 32-value block of this thread's 16 codes of each row
     // the rows of X this thread reads: the launch's row, or the one `from` gives for it
     int xrow[NX], srow[NSC];
 #pragma unroll
     for (int n = 0; n < NX; ++n) {
-        const int tok = NT / 16 * n + (tid >> 4);
+        const int tok = NT / TPR * n + tid / TPR;
         xrow[n] = tok < ntok ? (from ? from[c0 + tok] : c0 + tok) : 0;
     }
 #pragma unroll
     for (int c = 0; c < NSC; ++c) {
-        const int i = tid + c * NT, tok = i >> 3;
-        srow[c] = i < MT * 8 && tok < ntok ? (from ? from[c0 + tok] : c0 + tok) : 0;
+        const int i = tid + c * NT, tok = i / NB;
+        srow[c] = i < MT * NB && tok < ntok ? (from ? from[c0 + tok] : c0 + tok) : 0;
     }
     // A row of 32-value blocks may end inside its last stage (Gemma 4 26B's down: 704 values): the sub-blocks past
     // its end are not read, and go in as zeros, codes and scales, so they add nothing.
-    const auto here = [&](int S, int ib) { return S * 256 + ib * 32 < K; };
+    const auto here = [&](int S, int ib) { return S * KS + ib * 32 < K; };   // (ib: the sub-block of the stage)
     const auto fetch = [&](int S) {
         if constexpr (RAW) {   // the pieces of each row's stage, 16 bytes at a time: consecutive threads, consecutive pieces
             constexpr int RB = i8m_raw_bytes(T), NP = SM::RW / 4;
@@ -543,35 +591,37 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                 i8m_cp_commit();
             }
         } else if (w_in) {
+            // the loaders' stage of 256 values and sub-block in it (a stage of 128 is half of one)
+            const int S2 = S * KS / 256, ib0 = S * NB % 8;
 #pragma unroll
             for (int part = 0; part < PER; ++part) {
-                const int ib = i8m_sub<T, RT>(r0, part);
+                const int ib = i8m_sub<T, RT, NB>(r0, part), ibg = ib0 + ib;
                 if (!here(S, ib)) continue;
-                if constexpr (T == 11) i8m_q3k_load(blob + row_off, S, ib, wraw[part]);
-                else if constexpr (T == 10) i8m_q2k_load(blob + row_off, S, ib, wraw[part]);
-                else if constexpr (T == 8) i8m_q8_load(blob + row_off, S, ib, wraw[part]);
-                else if constexpr (T == 14) i8m_q6k_load(blob + row_off, S, ib, wraw[part]);
-                else if constexpr (T == 23) i8m_iq4xs_load(blob + row_off, S, ib, wraw[part]);
-                else if constexpr (T == 19) i8m_iq1s_load(blob + row_off, S, ib, wraw[part]);
-                else if constexpr (T == 39) i8m_mxfp4_load(blob + row_off, S, ib, wraw[part]);
-                else if constexpr (T == 40) i8m_nvfp4_load(blob + row_off, S, ib, wraw[part]);
-                else i8_load<T>(blob, i8_offs<T>(row_off, ib & 3), 2 * S + (ib >> 2), wraw[part]);
+                if constexpr (T == 11) i8m_q3k_load(blob + row_off, S2, ibg, wraw[part]);
+                else if constexpr (T == 10) i8m_q2k_load(blob + row_off, S2, ibg, wraw[part]);
+                else if constexpr (T == 8) i8m_q8_load(blob + row_off, S2, ibg, wraw[part]);
+                else if constexpr (T == 14) i8m_q6k_load(blob + row_off, S2, ibg, wraw[part]);
+                else if constexpr (T == 23) i8m_iq4xs_load(blob + row_off, S2, ibg, wraw[part]);
+                else if constexpr (T == 19) i8m_iq1s_load(blob + row_off, S2, ibg, wraw[part]);
+                else if constexpr (T == 39) i8m_mxfp4_load(blob + row_off, S2, ibg, wraw[part]);
+                else if constexpr (T == 40) i8m_nvfp4_load(blob + row_off, S2, ibg, wraw[part]);
+                else i8_load<T>(blob, i8_offs<T>(row_off, ibg & 3), 2 * S2 + (ibg >> 2), wraw[part]);
             }
         }
 #pragma unroll
-        for (int n = 0; n < NX; ++n) {   // 16 bytes of activation row (NT / 16) n + tid / 16
-            const int tok = NT / 16 * n + (tid >> 4);
+        for (int n = 0; n < NX; ++n) {   // 16 bytes of activation row (NT / TPR) n + tid / TPR
+            const int tok = NT / TPR * n + tid / TPR;
             xr[n] = make_uint4(0, 0, 0, 0);
-            if (tok < ntok && S * 256 + (tid & 15) * 16 < K)
-                xr[n] = *(const uint4*) (X + (size_t) xrow[n] * K + (size_t) S * 256 + (tid & 15) * 16);
-            if constexpr (MIN16) x16[n] = tok < ntok ? XD[(size_t) xrow[n] * (K / 32) + (size_t) S * 8 + ((tid & 15) >> 1)] : 0.0f;
+            if (tok < ntok && S * KS + tid % TPR * 16 < K)
+                xr[n] = *(const uint4*) (X + (size_t) xrow[n] * K + (size_t) S * KS + tid % TPR * 16);
+            if constexpr (MIN16) x16[n] = tok < ntok ? XD[(size_t) xrow[n] * (K / 32) + (size_t) S * NB + (tid % TPR >> 1)] : 0.0f;
         }
 #pragma unroll
         for (int c = 0; c < NSC; ++c) {
-            const int i = tid + c * NT, tok = i >> 3;
-            const size_t at = (size_t) srow[c] * (K / 32) + (size_t) S * 8 + (i & 7);
+            const int i = tid + c * NT, tok = i / NB;
+            const size_t at = (size_t) srow[c] * (K / 32) + (size_t) S * NB + i % NB;
             xdr[c] = xsr[c] = 0.0f;
-            if (i < MT * 8 && tok < ntok && here(S, i & 7)) {
+            if (i < MT * NB && tok < ntok && here(S, i % NB)) {
                 xdr[c] = XD[at];
                 if constexpr (HAS_MIN) xsr[c] = XS[at];
             }
@@ -593,35 +643,35 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                 else i8_load<T>(rb, i8_offs<T>(0, ib & 3), 2 * S + (ib >> 2), wraw[part]);
             }
         }
+        const int ib0 = S * NB % 8;   // (the sub-block of the loaders' stage of 256 that this stage's first is)
 #pragma unroll
         for (int part = 0; part < PER; ++part) {
-            const int ib = i8m_sub<T, RT>(r0, part);
+            const int ib = i8m_sub<T, RT, NB>(r0, part), ibg = ib0 + ib;
             uint32_t q[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             float f0 = 0.0f, f1 = 0.0f, mn = 0.0f, mn1 = 0.0f;
             if (w_in && here(S, ib)) {
                 if constexpr (T == 11) {
-                    i8m_q3k_convert(wraw[part], ib, q, f0, f1);
+                    i8m_q3k_convert(wraw[part], ibg, q, f0, f1);
                 } else if constexpr (T == 10) {
-                    i8m_q2k_convert(wraw[part], ib, q, f0, f1, mn, mn1);
+                    i8m_q2k_convert(wraw[part], ibg, q, f0, f1, mn, mn1);
                 } else if constexpr (T == 19) {
                     i8m_iq1s_convert(wraw[part], grid_rd, q, f0);
                 } else if constexpr (T == 39) {
                     i8m_mxfp4_convert(wraw[part], kv, q, f0);
                 } else if constexpr (T == 40) {
-                    i8m_nvfp4_convert(wraw[part], ib, kv, q, f0, f1);
+                    i8m_nvfp4_convert(wraw[part], ibg, kv, q, f0, f1);
                 } else {
                     uint32_t w[I8NW<T>];
                     int m0, m1;
                     float base;
-                    i8_pack<T>(wraw[part], ib, w);
-                    i8_convert<T>(w, grid_rd, (const uint2*) s_sg, kv, q, m0, m1, base, ib, &mn);
+                    i8_pack<T>(wraw[part], ibg, w);
+                    i8_convert<T>(w, grid_rd, (const uint2*) s_sg, kv, q, m0, m1, base, ibg, &mn);
                     f0 = base * (float) m0;
                     f1 = base * (float) m1;
                 }
             }
-            uint4* dst = (uint4*) (s_w + wr * I8M_LD + ib * 8);
-            dst[0] = make_uint4(q[0], q[1], q[2], q[3]);
-            dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
+            *(uint4*) (s_w + wr * LD + piece(wr & 7, 2 * ib)) = make_uint4(q[0], q[1], q[2], q[3]);
+            *(uint4*) (s_w + wr * LD + piece(wr & 7, 2 * ib + 1)) = make_uint4(q[4], q[5], q[6], q[7]);
             if constexpr (TWO) {
                 s_ws[wr * LDS + 2 * ib] = f0;
                 s_ws[wr * LDS + 2 * ib + 1] = f1;
@@ -637,19 +687,19 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
         }
 #pragma unroll
         for (int n = 0; n < NX; ++n) {
-            *(uint4*) (s_x + (NT / 16 * n + (tid >> 4)) * I8M_LD + (tid & 15) * 4) = xr[n];
+            *(uint4*) (s_x + (NT / TPR * n + tid / TPR) * LD + piece((NT / TPR * n + tid / TPR) & 7, tid % TPR)) = xr[n];
             if constexpr (MIN16) {   // the sum of the thread's 16 codes, times their block's scale
                 const int sum = __dp4a((int) xr[n].w, 0x01010101, __dp4a((int) xr[n].z, 0x01010101,
                                        __dp4a((int) xr[n].y, 0x01010101, __dp4a((int) xr[n].x, 0x01010101, 0))));
-                s_x16[(tid & 15) * S16 + NT / 16 * n + (tid >> 4)] = x16[n] * (float) sum;
+                s_x16[tid % TPR * S16 + NT / TPR * n + tid / TPR] = x16[n] * (float) sum;
             }
         }
 #pragma unroll
         for (int c = 0; c < NSC; ++c) {
             const int i = tid + c * NT;
-            if (i < MT * 8) {
-                const int tok = i >> 3;
-                float* const p = s_xq + (i & 7) * XSTR + (tok >> 1) * XQ + (tok & 1);
+            if (i < MT * NB) {
+                const int tok = i / NB;
+                float* const p = s_xq + i % NB * XSTR + (tok >> 1) * XQ + (tok & 1);
                 p[0] = xdr[c];
                 if constexpr (HAS_MIN) p[2] = xsr[c];
             }
@@ -662,8 +712,10 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
     // are one 8- or 16-byte read.  Each sum takes its terms in the order of the blocks, so a product does not depend
     // on how its launch is cut.
     const int lane = tid & 31;
-    const uint32_t* const a_row = s_w + (i0 + ((lane >> 3) & 1) * 8 + (lane & 7)) * I8M_LD + (lane >> 4) * 4;
-    const uint32_t* const b_row = s_x + (8 * jp + (lane & 7)) * I8M_LD + (lane >> 4) * 8 + ((lane >> 3) & 1) * 4;
+    // (a lane's rows of A and of B are lane & 7 of their 8, as piece() wants: i0 and the B tiles' rows are multiples of 8)
+    const uint32_t* const a_row = s_w + (i0 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LD;
+    const uint32_t* const b_row = s_x + (8 * jp + (lane & 7)) * LD;
+    const int r7 = lane & 7, a_c = lane >> 4, b_c = (lane >> 3) & 3;   // and the first piece of each it reads
     const auto scales = [&](int kb, int j0, float& x0, float& x1, float& s0, float& s1) {
         const float* const p = s_xq + kb * XSTR + (j0 / 2 + tg) * XQ;
         if constexpr (HAS_MIN) {
@@ -677,13 +729,13 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
     const auto multiply = [&]() {
         if constexpr (TWO) {
 #pragma unroll
-            for (int kq = 0; kq < 16; kq += 4) {
+            for (int kq = 0; kq < KS / 16; kq += 4) {
                 uint32_t A[2][NA][4];   // [kq / 2 pair][tile]: {a0, a1} of kq, kq + 1 (or kq + 2, kq + 3)
                 float w0[4][NA], w1[4][NA], m0[4][NA], m1[4][NA];
 #pragma unroll
                 for (int a = 0; a < NA; ++a) {
-                    i8m_ldsm4(A[0][a], a_row + 16 * a * I8M_LD + kq * 4);
-                    i8m_ldsm4(A[1][a], a_row + 16 * a * I8M_LD + (kq + 2) * 4);
+                    i8m_ldsm4(A[0][a], a_row + 16 * a * LD + piece(r7, a_c + kq));
+                    i8m_ldsm4(A[1][a], a_row + 16 * a * LD + piece(r7, a_c + kq + 2));
 #pragma unroll
                     for (int h = 0; h < 4; ++h) {
                         w0[h][a] = sa[16 * a * LDS + kq + h];
@@ -700,7 +752,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                     const int j0 = 8 * (CG * n + jp);
                     if (j0 >= ntok) break;
                     uint32_t B[4];   // b0 of kq .. kq + 3
-                    i8m_ldsm4(B, b_row + 8 * CG * n * I8M_LD + kq * 4);
+                    i8m_ldsm4(B, b_row + 8 * CG * n * LD + piece(r7, b_c + kq));
                     float x0[2], x1[2], s0, s1;
                     scales(kq >> 1, j0, x0[0], x1[0], s0, s1);
                     scales((kq >> 1) + 1, j0, x0[1], x1[1], s0, s1);
@@ -713,10 +765,10 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                             int c[4] = {0, 0, 0, 0};
                             i8m_mma16(c, A[h >> 1][a][2 * (h & 1)], A[h >> 1][a][2 * (h & 1) + 1], B[h]);
                             const float xa = x0[h >> 1], xb = x1[h >> 1];
-                            acc[a][n][0] = fmaf((float) c[0], w0[h][a] * xa, acc[a][n][0]);
-                            acc[a][n][1] = fmaf((float) c[1], w0[h][a] * xb, acc[a][n][1]);
-                            acc[a][n][2] = fmaf((float) c[2], w1[h][a] * xa, acc[a][n][2]);
-                            acc[a][n][3] = fmaf((float) c[3], w1[h][a] * xb, acc[a][n][3]);
+                            acc[a][n][0] = fmaf(fl(c[0], 0), w0[h][a] * xa, acc[a][n][0]);
+                            acc[a][n][1] = fmaf(fl(c[1], 1), w0[h][a] * xb, acc[a][n][1]);
+                            acc[a][n][2] = fmaf(fl(c[2], 2), w1[h][a] * xa, acc[a][n][2]);
+                            acc[a][n][3] = fmaf(fl(c[3], 3), w1[h][a] * xb, acc[a][n][3]);
                             if constexpr (MIN16) {
                                 acc[a][n][0] = fmaf(m0[h][a], sm16.x, acc[a][n][0]);
                                 acc[a][n][1] = fmaf(m0[h][a], sm16.y, acc[a][n][1]);
@@ -729,7 +781,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
             }
         } else {
 #pragma unroll
-            for (int kb = 0; kb < 8; kb += 2) {
+            for (int kb = 0; kb < NB; kb += 2) {
                 uint32_t A[2][NA][4];   // [block kb + h][tile]: a0 .. a3
                 float w0[2][NA], w1[2][NA], m0[2][NA], m1[2][NA];
                 if constexpr (SM::PK) {
@@ -745,7 +797,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                 for (int h = 0; h < 2; ++h)
 #pragma unroll
                     for (int a = 0; a < NA; ++a) {
-                        i8m_ldsm4(A[h][a], a_row + 16 * a * I8M_LD + (kb + h) * 8);
+                        i8m_ldsm4(A[h][a], a_row + 16 * a * LD + piece(r7, a_c + 2 * (kb + h)));
                         if constexpr (!SM::PK) {
                             m0[h][a] = m1[h][a] = 0.0f;
                             w0[h][a] = sa[16 * a * LDS + kb + h];
@@ -761,7 +813,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                     const int j0 = 8 * (CG * n + jp);
                     if (j0 >= ntok) break;
                     uint32_t B[4];   // b0, b1 of block kb, then of kb + 1
-                    i8m_ldsm4(B, b_row + 8 * CG * n * I8M_LD + kb * 8);
+                    i8m_ldsm4(B, b_row + 8 * CG * n * LD + piece(r7, b_c + 2 * kb));
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         float x0, x1, s0, s1;
@@ -770,10 +822,10 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                         for (int a = 0; a < NA; ++a) {
                             int c[4] = {0, 0, 0, 0};
                             i8m_mma32(c, A[h][a][0], A[h][a][1], A[h][a][2], A[h][a][3], B[2 * h], B[2 * h + 1]);
-                            acc[a][n][0] = fmaf((float) c[0], w0[h][a] * x0, acc[a][n][0]);
-                            acc[a][n][1] = fmaf((float) c[1], w0[h][a] * x1, acc[a][n][1]);
-                            acc[a][n][2] = fmaf((float) c[2], w1[h][a] * x0, acc[a][n][2]);
-                            acc[a][n][3] = fmaf((float) c[3], w1[h][a] * x1, acc[a][n][3]);
+                            acc[a][n][0] = fmaf(fl(c[0], 0), w0[h][a] * x0, acc[a][n][0]);
+                            acc[a][n][1] = fmaf(fl(c[1], 1), w0[h][a] * x1, acc[a][n][1]);
+                            acc[a][n][2] = fmaf(fl(c[2], 2), w1[h][a] * x0, acc[a][n][2]);
+                            acc[a][n][3] = fmaf(fl(c[3], 3), w1[h][a] * x1, acc[a][n][3]);
                             if constexpr (HAS_MIN) {
                                 acc[a][n][0] = fmaf(m0[h][a], s0, acc[a][n][0]);
                                 acc[a][n][1] = fmaf(m0[h][a], s1, acc[a][n][1]);
@@ -787,7 +839,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
         }
     };
 
-    const int stages = (K + 255) / 256;
+    const int stages = (K + KS - 1) / KS;
     fetch(0);
     for (int S = 0; S < stages; ++S) {
         if constexpr (RAW) i8m_cp_wait();   // this thread's pieces of the raw stage (fetch() after put() reads it: one copy)
@@ -816,6 +868,21 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
             }
         }
     }
+#endif
+}
+
+// (stages of 128: two blocks a multiprocessor, so no more than half its registers a block.)  A shape other than the
+// one above (CF != 0) is Turing's only (i8m_cf75()): the passes for Ampere and newer compile it empty.
+template <int T, int NJ, int WR, bool RAW, int CF = 0>
+__global__ void __launch_bounds__(i8m_nt(T, NJ, WR, CF), (CF & I8M_CF_K128) ? 2 : 1) i8m_kernel(const uint8_t* __restrict__ W, size_t mat_bytes, size_t row_bytes,
+                                                                  int n_out, int K,
+                                                    const uint8_t* __restrict__ X, const float* __restrict__ XD,
+                                                    const float* __restrict__ XS, const int32_t* __restrict__ bounds, int ch_per_e,
+                                                    const int32_t* __restrict__ ids, const int32_t* __restrict__ from,
+                                                    const long long* __restrict__ at, float* __restrict__ Y, long long ldy) {
+#if defined(__CUDA_ARCH__)
+    if constexpr (CF == 0 || __CUDA_ARCH__ < 800)
+        i8m_tile<T, NJ, WR, RAW, CF>(W, mat_bytes, row_bytes, n_out, K, X, XD, XS, bounds, ch_per_e, ids, from, at, Y, ldy);
 #endif
 }
 
@@ -866,17 +933,23 @@ I8mCard i8m_card() {
     return c;
 }
 
-template <int T, int NJ, int WR, bool RAW>
+template <int T, int NJ, int WR, bool RAW, int CF = 0>
 bool i8m_launch(int dev, dim3 grid, cudaStream_t s, const uint8_t* W, size_t mat_bytes, size_t row_bytes, int n_out, int K,
                 const uint8_t* X, const float* XD, const float* XS, const int32_t* bounds, int ch, const int32_t* ids,
                 const int32_t* from, const long long* at, float* Y, long long ldy) {
-    constexpr size_t bytes = I8mSmem<T, NJ, WR, RAW>::bytes;
+    constexpr size_t bytes = I8mSmem<T, NJ, WR, RAW, i8m_ks(CF), (CF & I8M_CF_SWZ) != 0>::bytes;
     static bool attr[64];   // the attribute belongs to a card (see gemm_iq_f16_grouped)
     if (!attr[dev]) {
-        cudaFuncSetAttribute(i8m_kernel<T, NJ, WR, RAW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes);
+        cudaFuncSetAttribute(i8m_kernel<T, NJ, WR, RAW, CF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes);
+        // stages of 128: all of the multiprocessor's shared memory, for two blocks
+        // (only a preference: without it the blocks may run one a multiprocessor, the same numbers slower; its error is
+        // not left for the launch's check below)
+        if constexpr ((CF & I8M_CF_K128) != 0)
+            if (cudaFuncSetAttribute(i8m_kernel<T, NJ, WR, RAW, CF>, cudaFuncAttributePreferredSharedMemoryCarveout, 100) != cudaSuccess)
+                (void) cudaGetLastError();
         attr[dev] = true;
     }
-    i8m_kernel<T, NJ, WR, RAW><<<grid, i8m_threads(T, NJ, WR), bytes, s>>>(W, mat_bytes, row_bytes, n_out, K, X, XD, XS, bounds, ch,
+    i8m_kernel<T, NJ, WR, RAW, CF><<<grid, i8m_nt(T, NJ, WR, CF), bytes, s>>>(W, mat_bytes, row_bytes, n_out, K, X, XD, XS, bounds, ch,
                                                                        ids, from, at, Y, ldy);
     return cudaGetLastError() == cudaSuccess;
 }
@@ -892,6 +965,22 @@ size_t i8m_tile_bytes(int nj, int wr, bool raw) {
     STRATA_I8M_TILES(STRATA_I8M_SIZE)
 #undef STRATA_I8M_SIZE
     return (size_t) -1;
+}
+
+// The tile's shape on Turing (the code for sm_75: 64 KB of shared memory a multiprocessor, where a block of the shape
+// above takes 59-63 KB and so runs alone, decoding and multiplying by turns), for Inkling 2 Mini's prompt types in
+// tiles of 32 and 128 activation rows: stages of 128 and 256 threads, two blocks a multiprocessor, the int32 sums half
+// by adds (I8M_CF_CVT2); the i-quants' rows also without padding (I8M_CF_SWZ), for their tables leave no room for two
+// blocks otherwise.  RTX 2070 Super, poly_i8m_shapes_test --time, against the shape above (the experts of 1,024
+// tokens' top-8 of 128, a launch for each class of rows as the engine's): IQ4_NL experts gate|up 5,489 -> 5,002 us,
+// down 3,075 -> 2,551; Q8_0 dense [2304 -> 3072] of 1,024 rows 615 -> 543; IQ2_XXS experts 5,876 -> 5,095, IQ2_XS
+// 7,435 -> 6,778, IQ2_S 7,763 -> 7,140; NVFP4 experts down 3,391 -> 2,681, gate|up 5,964 -> 5,247.
+// STRATA_I8M_TURING=0: the shape above.
+__host__ __device__ constexpr int i8m_cf75(int t, int nj, int wr) {
+    return wr != 64 || (nj != 2 && nj != 8) ? 0
+         : t == 20 || t == 8 || t == 40      ? I8M_CF_K128 | I8M_CF_T256 | I8M_CF_CVT2
+         : t == 16 || t == 17 || t == 22     ? I8M_CF_K128 | I8M_CF_T256 | I8M_CF_SWZ | I8M_CF_CVT2
+                                             : 0;
 }
 
 // the tile as wide in activation rows as the launch's rows need, of what the card has the shared memory for
@@ -916,7 +1005,13 @@ bool i8m_launch_type(const I8mCard& card, int dev, cudaStream_t s, const uint8_t
     const long long ch = (max_rows + 16 * nj - 1) / (16 * nj), gy = (long long) n_mats * ch;
     if (gy > 65535) return false;
     const dim3 grid((unsigned) ((n_out + wr - 1) / wr), (unsigned) gy);
+    static const bool turing_on = [] { const char* v = std::getenv("STRATA_I8M_TURING"); return v == nullptr || v[0] != '0'; }();
+    const bool turing = turing_on && card.arch < 800 && !raw;
 #define STRATA_I8M_GO(NJ_, WR_) \
+    if constexpr (i8m_cf75(T, NJ_, WR_) != 0) \
+        if (nj == NJ_ && wr == WR_ && turing) \
+            return i8m_launch<T, NJ_, WR_, false, i8m_cf75(T, NJ_, WR_)>(dev, grid, s, W, mat_bytes, row_bytes, n_out, K, X, XD, XS, \
+                                                                        bounds, (int) ch, ids, from, at, Y, ldy); \
     if (nj == NJ_ && wr == WR_) \
         return raw ? i8m_launch<T, NJ_, WR_, i8m_raw_type(T)>(dev, grid, s, W, mat_bytes, row_bytes, n_out, K, X, XD, XS, \
                                                                      bounds, (int) ch, ids, from, at, Y, ldy) \
