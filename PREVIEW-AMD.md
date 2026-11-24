@@ -121,13 +121,17 @@ Decode tok/s (256 tokens written):
 
 The RX 9060 XT (gfx1200) has half the compute units: expect lower numbers there.
 
-## ROCm version
+## ROCm version and rocBLAS
 
-We measured with ROCm 7.2.4. On the same RX 9070 XT, one build (main + #285's profiler) read prompts of 302 and
-2,048 tokens 4.1x and 4.6x slower on Windows with setup's TheRock ROCm 10.2 than on native Linux with ROCm 7.2.4
-(165 and 307 against 671 and 1,426 tok/s). That build ran the prompt expert products through the rocBLAS loop. This branch runs them on its own int8 kernels,
-so most of that gap should go, but we have not measured ROCm 10.1 or 10.2 with them. If prompts
-stay far below the table above, try ROCm 7.2.x.
+ROCm 10 itself is not slower: on native Linux, main reads a 2,048-token prompt at 1,372 tok/s on ROCm 10.2 and 1,286
+on 7.2.4 (RX 9070 XT, IQ4_NL). What matters is whether rocBLAS hands its matrix products to hipBLASLt. With
+`ROCBLAS_USE_HIPBLASLT=0` main's prompt drops 57% on both versions, and some distro packages build rocBLAS without
+hipBLASLt (Arch's, which CachyOS uses, has `-DBUILD_WITH_HIPBLASLT=OFF`). This branch runs the prompt expert products
+on its own int8 kernels, not rocBLAS, so it depends much less on that; the dense products still go through rocBLAS.
+
+On Windows, one build of main read 2,048-token prompts at 307 tok/s against 1,426 on native Linux on the same card,
+but 8,192-token prompts at 996: that points at per-call overhead on Windows, which the int8 path mostly avoids. We
+have not measured this branch on Windows.
 
 ## Known limits
 
