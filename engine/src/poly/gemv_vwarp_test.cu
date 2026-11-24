@@ -35,12 +35,14 @@ template <typename T> T* upload(const std::vector<T>& v) {
     T* d = nullptr;
     ck(cudaMalloc(&d, std::max<size_t>(1, v.size() * sizeof(T))), "malloc");
     ck(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice), "upload");
+    ck(cudaDeviceSynchronize(), "sync");   // the null stream's copies are done before a launch on the non-blocking stream
     return d;
 }
 float* fill_ff(size_t n) {
     float* d = nullptr;
     ck(cudaMalloc(&d, n * 4), "malloc");
     ck(cudaMemset(d, 0xff, n * 4), "memset");
+    ck(cudaDeviceSynchronize(), "sync");   // the memset runs on the null stream: done before the launch on st
     return d;
 }
 std::vector<unsigned char> grab(const void* p, size_t n) {
