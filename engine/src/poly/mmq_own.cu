@@ -33,7 +33,7 @@
 // bits against a half's 11), its products straight to dst's rows and its rows read by index as the int8 ones are.
 // NVFP4 takes the int8 kernel only with STRATA_PREFILL_NVFP4=w4a8 (nvfp4_w4a8()), on any card that has it.
 //
-// HIP with STRATA_POLY_HIP_INT8=1 (hip_int8()): the int8 kernel on RDNA3 / RDNA4 too, NVFP4 included, as on Ampere.
+// HIP on RDNA3 / RDNA4: the int8 kernel too where the FP16 tiles do not take a matrix (STRATA_POLY_HIP_INT8, int8_rows()).
 #include "mmq.hpp"
 #if STRATA_POLY_X2
 #include "nvfp4_x2.hpp"
@@ -287,18 +287,25 @@ bool nvfp4_w4a8() {
 }
 
 #ifdef STRATA_MMQ_OWN_HIP
-// STRATA_POLY_HIP_INT8=1 (or true / yes / on): the int8 kernel on RDNA3's and RDNA4's matrix cores (i8_mma.cuh's i8m_wmma), for the types
-// and rows it takes, in place of the FP16 tiles or the BLAS loop.  Opt-in: the activations int8 a 32 values where
-// the halves keep 11 bits, as on CUDA's Ampere and newer by default (the same kernel's numbers, bit for bit).  NVFP4
-// goes with it unless STRATA_PREFILL_NVFP4 names a mode (w4a8: the same; any other: the halves).
-bool hip_int8() {
-    static const bool on = [] {
+// STRATA_POLY_HIP_INT8: the int8 kernel on RDNA3's and RDNA4's matrix cores (i8_mma.cuh's i8m_wmma), for the types and
+// rows it takes.  The activations are int8 a 32 values there where the halves keep 11 bits, as on CUDA's Ampere and
+// newer by default (the same kernel's numbers, bit for bit), and as llama.cpp's MMQ, which the HIP build used before
+// 0.2.20.  NVFP4 goes with it unless STRATA_PREFILL_NVFP4 names a mode (w4a8: the same; any other: the halves).
+//   unset: a matrix the FP16 tiles do not take (grouped(): K-quants on RDNA3, every type on RDNA4, whose tiles
+//          are opt-in), which would go to the per-expert dequantize + rocBLAS loop.  The tiles keep what they take.
+//   1 / true / yes / on: every matrix the int8 kernel takes, the tiles' too.
+//   any other value (0, off, ...): none (the FP16 tiles and the BLAS loop, 0.2.20-poly.4's path).
+// Issue #289: Qwen3.6-35B-A3B UD-Q3_K_M on an RX 7800 XT read 517 tok/s at 4,096 tokens on the BLAS loop where 0.1.45's
+// MMQ build read 1,842.
+int hip_int8_asked() {
+    static const int v = [] {
         const char* e = std::getenv("STRATA_POLY_HIP_INT8");
-        std::string v(e ? e : "");
+        if (!e || !*e) return -1;
+        std::string v(e);
         for (char& ch : v) ch = (char) std::tolower((unsigned char) ch);
-        return v == "1" || v == "true" || v == "yes" || v == "on";
+        return v == "1" || v == "true" || v == "yes" || v == "on" ? 1 : 0;
     }();
-    return on;
+    return v;
 }
 bool nvfp4_default() {
     static const bool unset = [] {
@@ -312,7 +319,8 @@ bool nvfp4_default() {
 // the int8 kernel takes a matrix of this type with rows this long, whatever their number
 bool int8_rows(int t, int64_t cols) {
 #ifdef STRATA_MMQ_OWN_HIP
-    if (!hip_int8()) return false;
+    const int asked = hip_int8_asked();
+    if (asked == 0 || (asked < 0 && grouped(t, kTileRows, cols))) return false;   // (unset: what the tiles take stays there)
     const bool nv4 = nvfp4_w4a8() || nvfp4_default();
 #else
     const bool nv4 = nvfp4_w4a8();
