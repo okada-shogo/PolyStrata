@@ -528,6 +528,11 @@ before it installs a model.
   mapped after a larger one in the same reservation, so every piece of a reservation is made one size there (the
   expert cache had lost its last 64 MiB piece, and an attention cache grown to its end failed).
   `STRATA_VMM_EQUAL_PIECES=1` or `=0` turns that on or off on any Linux HIP build.
+- On NVIDIA the buffers only a prompt uses (about 300 MB of Qwen3.6's at a prompt batch of 2,048) go to the expert
+  cache between prompts. A HIP build keeps them: with them lent, strata-poly crashed inside the HIP runtime's kernel
+  launch under WSL2 (a SIGSEGV in `libamdhip64`, RX 9070 XT, some experts in RAM), and the access violation in
+  `amdhip64_7.dll` on the first long prompt on Windows
+  ([#305](https://github.com/simplexai-labs/PolyStrata/issues/305)) fits the same path.
 - hipBLASLt loads a product type's kernels at its first call. On Windows (RX 9070 XT, ROCm 10.2.0a20260930) the
   first single-precision product of a prompt took 4 s on one CPU thread with the card idle, inside the first prompt
   of every strata-poly process. strata-poly now makes one small product of each kind the prompt uses (halves into

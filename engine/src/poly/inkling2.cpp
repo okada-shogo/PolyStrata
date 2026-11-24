@@ -764,13 +764,13 @@ void Inkling2::load_layer(int il) {
 
 size_t Inkling2::recurrent_floats() const { return slots_.size() * past_floats(); }
 
-// ROCm on Linux gives VRAM back only with its addresses (Engine::vmm_unmap()), and a prompt's lent buffers crashed
-// strata-poly there (an RX 9070 XT, Inkling 2 Mini IQ4_NL with some experts in RAM): the prompt batch's scratch stays
-// out of them, in one layout as before.  With the experts frozen (STRATA_FREEZE_EXPERTS, --check-batch) lend_prompt()
+// A HIP build lends no prompt buffers (STRATA_VMM_NO_PROMPT_LEND): lent, they crashed strata-poly inside the HIP
+// runtime (an RX 9070 XT, Inkling 2 Mini IQ4_NL with some experts in RAM), so the prompt batch's scratch stays out of
+// them, in one layout as before.  With the experts frozen (STRATA_FREEZE_EXPERTS, --check-batch) lend_prompt()
 // lends nothing, and the small layout would only take VRAM from the expert cache for the whole run; but where a read's
 // calls may take more tokens (Options::prompt_batch 0) the layouts follow them, out of the VRAM that is free.
 bool Inkling2::scores_apart() const {
-#ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
+#ifdef STRATA_VMM_NO_PROMPT_LEND
     return false;
 #else
     return (!freeze_experts_asked_ || auto_rows_) && mmq_ && vmm_ && !split_ && rows_ >= kStageRows;

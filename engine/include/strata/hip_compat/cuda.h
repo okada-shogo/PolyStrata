@@ -26,6 +26,14 @@
 #define STRATA_VMM_EQUAL_PIECES 1
 #endif
 
+// A prompt's buffers are not lent to the expert cache between prompts on any HIP build (Engine::alloc()).  With them
+// lent, strata-poly crashed inside the HIP runtime's kernel launch in 15 of 16 runs: a SIGSEGV in libamdhip64 under
+// the dequantize launch of a dense product into the lent work memory (ROCm 7.2.4 with librocdxg, WSL2's way to the
+// Windows driver; an RX 9070 XT with some experts in RAM).  Native Windows has an access violation in amdhip64_7.dll
+// on the first long prompt of every start that fits the same path (issue 305, RX 7600 XT, Qwen3.6 UD-Q3_K_M with
+// some experts in RAM; not yet run with the lending off).  Native Linux (KFD) never showed it: off there to match.
+#define STRATA_VMM_NO_PROMPT_LEND 1
+
 typedef hipError_t CUresult;
 typedef int CUdevice;
 // HIP's own CUdeviceptr/handle equivalents are pointer-typed; CUDA's are integers, and strata-poly's Mapped

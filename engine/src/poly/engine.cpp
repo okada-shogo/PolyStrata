@@ -4887,10 +4887,10 @@ void Engine::alloc() {
     // a prompt's batch is lent with them, and a call of a few tokens has a layout of its own.  At a prompt batch of
     // 2,048 Qwen3.6's scratch is 450 MB, of which the few tokens' layout keeps some 70 (the attention's scores).
     const int most_step = (opt_.batch + 1) * (opt_.batch_mtp ? 2 : 1);
-    // Whether the prompt's buffers are lent (prompt_lends_, below).  Not on ROCm on Linux, which gives VRAM back only
-    // with its addresses (see below): there nothing is lent, so the scratch keeps one layout, and a call of a few
-    // tokens never finds the prompt's layout left in place (which kept graph replay off for every later step).
-#ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
+    // Whether the prompt's buffers are lent (prompt_lends_, below).  Not on HIP (STRATA_VMM_NO_PROMPT_LEND, below):
+    // there nothing is lent, so the scratch keeps one layout, and a call of a few tokens never finds the prompt's
+    // layout left in place (which kept graph replay off for every later step).
+#ifdef STRATA_VMM_NO_PROMPT_LEND
     const bool lends = false;
 #else
     const bool lends = vmm_ && !split_ && std::max(opt_.window, most_step) < kStageRows;
@@ -4941,11 +4941,12 @@ void Engine::alloc() {
                             2 * kMaxStagedTiles * (2 * (size_t) n_expert_ + 2)) * sizeof(int32_t);
         // The buffers only a call of kStageRows rows or more uses (moe_rows(), lin_raw()'s products), side by side:
         // where they can be mapped apart (VMM) and the answer's calls never have that many rows, the expert cache
-        // has their VRAM between prompts (lend_prompt()), 300 MB of Qwen3.6's at a prompt batch of 2,048.  Not on ROCm
-        // on Linux, which gives VRAM back only with its addresses (vmm_unmap()), as the staging buffer's widening is
-        // not: with the buffers lent, strata-poly crashed (SIGSEGV inside hipLaunchKernel, the dequantize launch of a
-        // prompt's dense product into the lent work memory) in 15 of 16 runs of Inkling 2 Mini IQ4_NL on an RX 9070 XT
-        // with 2,443 of its 3,072 experts in VRAM, ROCm 7.2.4.  (Their sizes: prompt_layout().)
+        // has their VRAM between prompts (lend_prompt()), 300 MB of Qwen3.6's at a prompt batch of 2,048.  Not on HIP
+        // (STRATA_VMM_NO_PROMPT_LEND): with the buffers lent, strata-poly crashed inside the HIP runtime (SIGSEGV
+        // inside hipLaunchKernel, the dequantize launch of a prompt's dense product into the lent work memory) in 15
+        // of 16 runs of Inkling 2 Mini IQ4_NL on an RX 9070 XT with 2,443 of its 3,072 experts in VRAM, ROCm 7.2.4
+        // under WSL2 (librocdxg), and issue 305's access violation in amdhip64_7.dll on Windows fits the same path.
+        // (Their sizes: prompt_layout().)
         prompt_lends_ = lends;
         const PromptLayout lay = prompt_layout(rows_);
         uint8_t* base = nullptr;
