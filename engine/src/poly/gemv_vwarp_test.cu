@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -262,6 +263,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     test_many(8, 2304, {3072, 1024, 1024, 3072, 384, 24});   // q|k|v|gate|rel|sink
+    test_many(8, 2304, {3072, 1024, 1024, 3072, 384, 24, 32, 32});   // with k_dyn / v_dyn (taps * n_kv rows): 8 matrices
     test_many(8, 2304, {3072, 1024, 1024});
     test_many(8, 2304, {2304});
     test_many(8, 2304, {7, 1001, 3, 2});   // odd totals and row counts
