@@ -43,6 +43,7 @@ enum Fam : int {
     kWaitUpload,      ///< the stream waits for experts on their way into VRAM (and the host's staging of them)
     kWaitCpu,         ///< the stream waits for the CPU's experts
     kHostGap,         ///< the stream has nothing to do: the host's work between two calls
+    kHostSetup,       ///< the stream idles while the host sets a read up (caches grown, staging taken back, buffers)
     kGraph,           ///< a recording replayed inside a split call (a batch step's, a block of guesses'): not split
     kUnsplit,         ///< an answer's token between its start and end events, not split (see above)
     kFams
@@ -53,7 +54,7 @@ enum Phase : int { kPrompt = 0, kDecode = 1, kPhases };
 inline const char* fam_key(int f) {
     static const char* const k[kFams] = {"attention", "kv_store",    "dense",    "norms",       "routing",
                                          "experts_gpu", "copy_h2d",  "copy_d2h", "wait_upload", "wait_cpu",
-                                         "host_gap",  "graph",       "unsplit"};
+                                         "host_gap",  "host_setup",  "graph",    "unsplit"};
     return f >= 0 && f < kFams ? k[f] : "?";
 }
 
@@ -69,13 +70,14 @@ inline const char* fam_title(int f) {
                                          "GPU waits for expert uploads",
                                          "GPU waits for CPU experts",
                                          "GPU idle, host between calls",
+                                         "GPU idle, host setting up a read",
                                          "recorded launches, not split",
                                          "not split (sampled out)"};
     return f >= 0 && f < kFams ? t[f] : "?";
 }
 
 /// The families that are the card waiting, not working.
-inline bool fam_idle(int f) { return f == kWaitUpload || f == kWaitCpu || f == kHostGap; }
+inline bool fam_idle(int f) { return f == kWaitUpload || f == kWaitCpu || f == kHostGap || f == kHostSetup; }
 
 inline const char* phase_key(int p) { return p == kPrompt ? "prompt" : "decode"; }
 
