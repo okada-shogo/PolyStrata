@@ -226,11 +226,23 @@ def bench_report(a) -> int:
         print("(no tokenizer in the run config: the prompts are random tokens, which route unlike real text)")
     else:
         ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 8192
-        ids = bench_text.tokens(tok, 12000 + (ctx if a.long else 0))
+        need = 12000 + (ctx if a.long else 0)
+        if a.text == "docs":
+            # real prose and code from this checkout's own docs: it routes to the experts the way a chat does (the
+            # synthetic text keeps to fewer of them, so the cache's misses look cheaper than they are)
+            docs = [ROOT.parent / "README.md"] + sorted((ROOT.parent / "docs").glob("*.md"))
+            body = "\n\n".join(p.read_text(encoding="utf-8", errors="replace") for p in docs if p.is_file())
+            ids = tok.encode(body)
+            while ids and len(ids) < need:
+                ids = ids + ids
+            name = "this checkout's README and docs (real text)"
+        else:
+            ids = bench_text.tokens(tok, need)
+            name = f"bench_text v{bench_text.VERSION} (synthetic English, fixed seed)"
         fd, ids_file = tempfile.mkstemp(prefix="bench-text-", suffix=".ids")
         with os.fdopen(fd, "w", encoding="ascii") as f:
             f.write(",".join(map(str, ids)))
-        cmd += ["--bench-text", f"{ids_file}@bench_text v{bench_text.VERSION} (synthetic English, fixed seed)"]
+        cmd += ["--bench-text", f"{ids_file}@{name}"]
     if a.dry_run:
         print(" ".join(cmd))
         if ids_file:
@@ -263,6 +275,9 @@ def main() -> int:
     ap.add_argument("--json", help="benchmark: also write the figures to this file")
     ap.add_argument("--out", help="bench-report: the files' name without .json / .md (default: bench-report here)")
     ap.add_argument("--long", action="store_true", help="bench-report: add one long conversation read in chunks")
+    ap.add_argument("--text", choices=["synthetic", "docs"], default="synthetic",
+                    help="bench-report: the prompts' text: synthetic (the same everywhere; the default) or docs (this "
+                         "checkout's own README and docs: real text, which routes to the experts as a chat does)")
     ap.add_argument("--dry-run", action="store_true", help="bench-report: print the engine's command, run nothing")
     a = ap.parse_args()
     if a.list_models:

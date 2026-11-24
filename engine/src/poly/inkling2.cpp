@@ -1643,6 +1643,21 @@ int Inkling2::next_layer(int il) {
 }
 
 // A layer's recordings: one a pass of the core, and for a full layer one a size of the rows it reads.
+// The profiler's byte model: each visit reads its own slot's keys and values, every row so far on a full layer and the
+// window's on a window layer, for each of the call's tokens (counted at the call's middle row).
+double Inkling2::kv_read_bytes(int64_t pos, int n) {
+    if (prof_full_visits_ < 0) {   // (Engine::prof_prepare(), between calls: next_layer() moves pass_)
+        prof_full_visits_ = 0;
+        for (int il = lo_; il < hi_; il = next_layer(il)) ++(blocks_[(size_t) il].swa ? prof_swa_visits_ : prof_full_visits_);
+    }
+    if (n <= 0) return 0;
+    const double rows = (double) pos + 0.5 * (double) n;
+    const double win = std::min<double>(rows, (double) std::max(window_, 1));
+    // a token alone reads every row; a batch's attention reads the rows once a tile of queries (64), not a query
+    const double reads = n == 1 ? 1.0 : std::ceil((double) n / 64.0);
+    return reads * 2.0 * (double) kv_row() * (prof_full_visits_ * rows + prof_swa_visits_ * win);
+}
+
 int Inkling2::head_key(int il, int n) const {
     return pass_of(il) * 32 + (blocks_[(size_t) il].swa ? 0 : room_key(n));
 }
