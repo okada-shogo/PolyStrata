@@ -220,6 +220,9 @@ struct Stats {
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
     int64_t ahead_sent = 0, ahead_used = 0;   ///< experts uploaded ahead of their layer (vram_ahead()), and run so
     double cpu_ms = 0, route_wait_ms = 0;
+    int64_t route_waits = 0;   ///< the host's waits for a router's scores (a round trip each)
+    /// a prompt batch's experts, each counted once a layer visit: in VRAM already, copied in for the batch, on the CPU
+    int64_t batch_hit_experts = 0, batch_staged_experts = 0, batch_cpu_experts = 0;
 };
 
 /// The most likely token of n logits: the first of the largest.
@@ -1072,6 +1075,24 @@ protected:
     void prof_bytes(double bytes);
     /// keep(): the window just called keeps n of the tokens it was fed.
     void prof_kept(int n);
+    // the byte model (prof_bytes_of())
+    std::vector<double> dense_layer_b_, router_layer_b_;
+    double dense_other_b_ = 0, prof_dense_call_ = 0, prof_router_call_ = 0, prof_expert_b_ = 0;
+    int prof_visits_ = -1, prof_moe_visits_ = 0;
+    void note_dense(const std::string& name, size_t bytes);
+    /// The visits of a call and the bytes of each, once, between calls (enable_profile()): next_layer() moves a
+    /// looped architecture's pass, so it is never walked while a call is under way.
+    void prof_prepare();
+    struct CallBytes {
+        double dense = 0, router = 0, kv = 0, gpu = 0, cpu = 0;
+    };
+    CallBytes prof_bytes_of(int64_t pos, int n, const Stats& s0, const Stats& s1);
+    /// The attention caches' bytes a call of n tokens from pos reads (its keys and values), for the profiler's byte
+    /// model; 0 where the architecture does not say.
+    virtual double kv_read_bytes(int64_t pos, int n) {
+        (void) pos, (void) n;
+        return 0;
+    }
     bool recorded_ = false;       ///< took_record()
 
     // geometry

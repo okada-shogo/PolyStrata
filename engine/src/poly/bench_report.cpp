@@ -155,6 +155,189 @@ double busy_share(const Acc& a) {
 
 }  // namespace
 
+namespace {
+
+// `a` less `b`: the unsplit calls of a phase (every call less the split ones)
+Acc minus(const Acc& a, const Acc& b) {
+    Acc c = a;
+    for (int f = 0; f < prof::kFams; ++f) {
+        c.fam_ms[f] -= b.fam_ms[f], c.fam_launches[f] -= b.fam_launches[f];
+        c.fam_graph_nodes[f] -= b.fam_graph_nodes[f], c.fam_bytes[f] -= b.fam_bytes[f];
+    }
+    c.wall_ms -= b.wall_ms, c.tokens -= b.tokens, c.calls -= b.calls, c.cpu_ms -= b.cpu_ms;
+    c.route_wait_ms -= b.route_wait_ms, c.route_waits -= b.route_waits;
+    c.cpu_experts -= b.cpu_experts, c.gpu_experts -= b.gpu_experts, c.staged_experts -= b.staged_experts;
+    c.upload_bytes -= b.upload_bytes, c.side_ms -= b.side_ms, c.side_bytes -= b.side_bytes;
+    c.cpu_expert_bytes -= b.cpu_expert_bytes;
+    return c;
+}
+
+// One phase's figures into a diagnosis.  The whole token's (or call's) figures come from the calls the profiler left
+// alone (`all` less `split`: replays as in normal use), where there are any; the families' from the split calls,
+// launched kernel by kernel with their families timed.  `per` divides into the unit (tokens, or 1 for a call).
+//
+// Launch cost: a replayed recording's nodes run one after the other, so their probed cost adds to the token's time;
+// a direct launch overlaps the kernels before it, so it only bounds the time where the kernels are no longer than a
+// launch (the family's time a launch near the probed latency).  Launch figures are upper bounds.
+Diagnosis diagnose_one(const Report& r, const std::string& phase, const std::string& unit, const Acc& all_in,
+                       const Acc& split, double split_per, bool prompt) {
+    Diagnosis g;
+    g.phase = phase;
+    g.unit = unit;
+    const Probes& p = r.probes;
+    if (all_in.calls == 0 || split.calls == 0 || split_per <= 0) return g;
+    const Acc rest = minus(all_in, split);
+    const bool use_rest = !prompt && rest.tokens > 0 && rest.calls > 0;
+    const Acc& all = use_rest ? rest : all_in;
+    const double all_per = prompt ? 1.0 : (double) all.tokens;
+    if (all_per <= 0) return g;
+    g.ok = true;
+    g.total_ms = all.wall_ms / all_per;
+    double nodes = 0;
+    for (double v : all.fam_graph_nodes) nodes += v;
+    g.launches = all.launches() / all_per;
+    g.nodes = nodes / all_per;
+    g.direct = g.launches - g.nodes;
+    // a kernel's floor: the probed small dependent kernel (launched, or a replayed node), else the empty one's.  The
+    // kernels of a stream run one after another, so each costs at least its floor: launches x floor is what the
+    // kernel count alone costs, whatever the kernels do
+    const double k_us = p.small_us > 0 ? p.small_us : p.launch_us;
+    // (a token's kernels span the card: the wide kernel's floor where it is the higher)
+    const double n_us = std::max(p.wide_node_us, p.small_node_us > 0 ? p.small_node_us : p.graph_node_us);
+    g.launch_ms = (g.nodes * n_us + g.direct * k_us) / 1000.0;
+    const double gpu_b = (all.fam_bytes[prof::kDense] + all.fam_bytes[prof::kRouting] + all.fam_bytes[prof::kAttention] +
+                          all.fam_bytes[prof::kExpertsGpu]) / all_per;
+    g.gpu_gb = gpu_b / 1e9;
+    g.ideal_ms = p.read_gbs > 0 ? gpu_b / (p.read_gbs * 1e9) * 1000.0 : 0.0;
+    g.wait_cpu_ms = split.fam_ms[prof::kWaitCpu] / split_per;
+    g.wait_upload_ms = split.fam_ms[prof::kWaitUpload] / split_per;
+    g.host_gap_ms = split.fam_ms[prof::kHostGap] / split_per;
+    const double looked = (double) (all.gpu_experts + all.cpu_experts) + all.staged_experts;
+    if (looked > 0) g.hit_rate = (double) all.gpu_experts / looked;
+    g.cpu_gb = all.cpu_expert_bytes / all_per / 1e9;
+    g.warm_cache = !prompt && g.hit_rate > 0.97;
+    g.pcie_gb = (all.upload_bytes + all.side_bytes) / all_per / 1e9;
+    // host round trips (no doorbell: the host routes, from the scores it waits for): the routing family's time beyond
+    // its kernels is the card's idle while the host waits, routes and launches the experts
+    g.round_trips = all.route_waits / all_per;
+    const double split_calls = (double) split.calls;
+    {
+        const double rms = split.fam_ms[prof::kRouting] / split_per;
+        const double rl = split.fam_launches[prof::kRouting] / split_per;
+        const double rkernels = std::min(rms, rl * k_us / 1000.0);
+        g.round_trip_ms = split.route_waits > 0 ? std::max(0.0, rms - rkernels) : 0.0;
+        if (split.route_waits <= 0) g.round_trips = 0;
+    }
+    (void) split_calls;
+    // a split call that replays a recording books its time to "recorded launches": its bytes are then not the
+    // families', and no GB/s is given a family
+    const bool bytes_by_family = split.fam_ms[prof::kGraph] < 0.05 * split.timeline_ms();
+    const auto fam_name = [](int f) { return std::string(prof::fam_title(f)); };
+    std::vector<std::pair<double, std::string>> rec;
+    for (int f = 0; f < prof::kFams; ++f) {
+        const double ms = split.fam_ms[f] / split_per;
+        if (ms <= 0.005 && split.fam_launches[f] <= 0) continue;
+        FamilyVerdict v;
+        v.fam = f;
+        v.ms = ms;
+        v.launches = split.fam_launches[f] / split_per;
+        const double fnodes = split.fam_graph_nodes[f] / split_per;
+        v.avg_kernel_us = v.launches > 0 ? 1000.0 * ms / v.launches : 0.0;
+        v.launch_ms = std::min(ms, (fnodes * n_us + (v.launches - fnodes) * k_us) / 1000.0);
+        const bool fam_direct_bound = k_us > 0 && v.launches > 0 && v.launch_ms >= 0.5 * ms;
+        v.gb = bytes_by_family ? split.fam_bytes[f] / split_per / 1e9 : 0.0;
+        v.gbs = ms > 0 ? v.gb / (ms / 1000.0) : 0.0;
+        v.read_share = p.read_gbs > 0 ? v.gbs / p.read_gbs : 0.0;
+        v.tiny = v.launches > 0 && k_us > 0 && v.avg_kernel_us < 2.0 * k_us;
+        const double kernel_ms = std::max(0.0, ms - v.launch_ms);
+        if (f == prof::kWaitCpu) v.verdict = "waiting on the CPU's experts";
+        else if (f == prof::kRouting && split.route_waits > 0 && g.round_trip_ms > 0.5 * ms)
+            v.verdict = "host round trips (" + fmt("%.0f", g.round_trips) + " " + unit +
+                        "): the card idles while the host routes";
+        else if (f == prof::kWaitUpload) v.verdict = "waiting on expert uploads";
+        else if (f == prof::kHostGap) v.verdict = "idle: the host between calls";
+        else if (v.launches > 0 && fam_direct_bound && r.launches_wrapped)
+            v.verdict = "launch-bound (" + fmt("%.1f", v.avg_kernel_us) + " us a kernel, the probed floor " +
+                        fmt("%.1f", k_us) + " us)";
+        else if (v.gb > 0 && v.read_share >= 0.6)
+            v.verdict = "bandwidth-bound (" + pct(v.read_share) + " of the probed read bandwidth)";
+        else if (v.gb > 0)
+            v.verdict = "under bandwidth (" + pct(v.read_share) + " of the probed read): compute or latency in the kernels";
+        else if (f == prof::kAttention && split.fam_bytes[prof::kAttention] <= 0 && ms > 0)
+            v.verdict = "KV rows not modelled for this architecture: compute or latency";
+        else if (ms > 0)
+            v.verdict = "no byte model: compute or latency";
+        if (!r.launches_wrapped && v.launches <= 0 && ms > 0) v.verdict += " (direct launches not counted in this build)";
+        if (v.tiny) v.verdict += "; small kernels (" + fmt("%.1f", v.avg_kernel_us) + " us on average)";
+        const bool routed_on_host = f == prof::kRouting && split.route_waits > 0;   // (round trips, below)
+        if (v.gb > 0 && p.read_gbs > 0 && !routed_on_host) {
+            const double gap = kernel_ms - v.gb * 1e9 / (p.read_gbs * 1e9) * 1000.0;
+            if (gap > 0) rec.push_back({gap, "a faster " + fam_name(f) + " kernel (now " + pct(v.read_share) + " of the probed read bandwidth)"});
+        }
+        g.families.push_back(v);
+    }
+    if (g.launch_ms > 0)
+        rec.push_back({g.launch_ms, "fewer launches: fused kernels or fewer recorded nodes (" + fmt("%.0f", g.launches) +
+                                        " " + unit + ")"});
+    if (g.wait_cpu_ms > 0.05)
+        rec.push_back({g.wait_cpu_ms, "more experts in VRAM" + (g.hit_rate >= 0 ? " (hit rate " + pct(g.hit_rate) + ")" : std::string())});
+    if (g.wait_upload_ms > 0.05) rec.push_back({g.wait_upload_ms, "faster or fewer expert uploads"});
+    if (g.round_trip_ms > 0.05)
+        rec.push_back({g.round_trip_ms, "fewer host round trips (" + fmt("%.0f", g.round_trips) + " " + unit +
+                                            "): routing on the card, or the host's experts behind a doorbell"});
+    if (g.host_gap_ms > 0.05) rec.push_back({g.host_gap_ms, "less host work between calls"});
+    std::sort(rec.begin(), rec.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    if (rec.size() > 3) rec.resize(3);
+    g.recover = rec;
+    const double T = g.total_ms, waits = g.wait_cpu_ms + g.wait_upload_ms;
+    if (k_us <= 0 || p.read_gbs <= 0)
+        g.verdict = "not judged: the kernel probes did not run or failed";
+    else if (g.launch_ms >= 0.4 * T && g.launch_ms >= g.ideal_ms && g.launch_ms >= waits)
+        g.verdict = "launch-bound: " + fmt("%.0f", g.launches) + " kernels " + unit + " at the probed floor (" +
+                    fmt("%.1f", n_us) + " us a replayed node, " + fmt("%.1f", k_us) + " us launched) cost ~" +
+                    fmt("%.1f", g.launch_ms) + " of " + fmt("%.1f", T) + " ms";
+    else if (g.wait_cpu_ms >= 0.3 * T && g.wait_cpu_ms >= g.ideal_ms)
+        g.verdict = "waiting on CPU experts: " + fmt("%.1f", g.wait_cpu_ms) + " of " + fmt("%.1f", T) + " ms";
+    else if (g.round_trip_ms >= 0.25 * T && g.round_trip_ms >= g.ideal_ms)
+        g.verdict = "host round trips: the host waits for router scores " + fmt("%.0f", g.round_trips) + " times " + unit +
+                    " and the card idles ~" + fmt("%.1f", g.round_trip_ms) + " of " + fmt("%.1f", T) + " ms meanwhile";
+    else if (g.wait_upload_ms >= 0.3 * T)
+        g.verdict = "waiting on expert uploads: " + fmt("%.1f", g.wait_upload_ms) + " of " + fmt("%.1f", T) + " ms";
+    else if (g.ideal_ms >= 0.6 * T)
+        g.verdict = "bandwidth-bound: " + fmt("%.2f", g.gpu_gb) + " GB " + unit + " at the probed read bandwidth take " +
+                    fmt("%.1f", g.ideal_ms) + " of " + fmt("%.1f", T) + " ms";
+    else
+        g.verdict = "compute- or latency-bound: launches up to ~" + fmt("%.1f", g.launch_ms) + " ms, bytes at the probed "
+                    "bandwidth " + fmt("%.1f", g.ideal_ms) + " ms, waits " + fmt("%.1f", waits) + " ms, of " +
+                    fmt("%.1f", T) + " ms";
+    if (!r.launches_wrapped) g.verdict += " (direct launches are not counted in this build: replays only)";
+    return g;
+}
+
+}  // namespace
+
+std::vector<Diagnosis> diagnose(const Report& r) {
+    std::vector<Diagnosis> out;
+    std::vector<Run> singles;
+    for (const Run& run : r.runs)
+        if (run.single) singles.push_back(run);
+    const std::vector<Run>& dec = singles.empty() ? r.runs : singles;
+    const Acc d = sum_of(dec, prof::kDecode, false), ds = sum_of(dec, prof::kDecode, true);
+    Diagnosis dg = diagnose_one(r, singles.empty() ? "decode" : "decode, a token a call", "a token", d, ds,
+                                (double) ds.tokens, false);
+    if (dg.ok) out.push_back(dg);
+    const Run* big = nullptr;
+    for (const Run& run : r.runs)
+        if (!big || run.read > big->read) big = &run;
+    if (big) {
+        const Acc& a = big->profile.all[prof::kPrompt];
+        const Acc& sp = big->profile.split[prof::kPrompt];
+        Diagnosis pg = diagnose_one(r, "prompt " + std::to_string(big->read), "a prompt", a, sp, 1.0, true);
+        if (pg.ok) out.push_back(pg);
+    }
+    return out;
+}
+
 std::vector<Finding> explain(const Report& r) {
     std::vector<Finding> out;
     const Probes& p = r.probes;
@@ -331,6 +514,15 @@ void probes_json(Json& j, const Probes& p) {
     j.num("d2h_pinned_gbs", p.d2h_pinned_gbs, 2);
     j.num("gpu_mem_gbs", p.gpu_mem_gbs, 1);
     j.num("ram_read_gbs", p.ram_read_gbs, 1);
+    j.num("launch_us", p.launch_us, 2);
+    j.num("graph_node_us", p.graph_node_us, 2);
+    j.num("small_kernel_us", p.small_us, 2);
+    j.num("small_kernel_node_us", p.small_node_us, 2);
+    j.num("wide_kernel_node_us", p.wide_node_us, 2);
+    j.num("sync_round_trip_us", p.sync_us, 2);
+    j.num("copy_to_host_sync_us", p.copy_sync_us, 2);
+    j.num("gpu_read_gbs", p.read_gbs, 1);
+    j.num("fp32_fma_gflops", p.fma_gflops, 0);
     j.integer("ram_threads", p.ram_threads);
     j.open_list("cpu_dot");
     for (const DotRate& d : p.dots) {
@@ -429,6 +621,7 @@ std::string to_json(const Report& r) {
     header_json(j, r, "strata-bench-report");
     j.str("tier", r.tier);
     j.str("prompts", r.prompt_source);
+    j.boolean("direct_launches_counted", r.launches_wrapped);
     j.str("measures", "this build and these settings, one request at a time after a warm-up; decode a token a call = "
                       "the same answer with no guesses");
     probes_json(j, r.probes);
@@ -439,6 +632,54 @@ std::string to_json(const Report& r) {
     for (const Run& run : r.long_points) run_json(j, run);
     j.close_list();
     if (!r.long_error.empty()) j.str("long_error", r.long_error);
+    j.open_list("diagnosis");
+    for (const Diagnosis& g : diagnose(r)) {
+        j.open();
+        j.str("phase", g.phase);
+        j.str("verdict", g.verdict);
+        j.num("ms", g.total_ms, 3);
+        j.num("launches", g.launches, 1);
+        j.num("direct_launches", g.direct, 1);
+        j.num("replayed_nodes", g.nodes, 1);
+        j.num("launch_ms_estimate", g.launch_ms, 3);
+        j.num("gpu_gb", g.gpu_gb, 4);
+        j.num("ideal_ms_at_probed_read", g.ideal_ms, 3);
+        j.num("wait_cpu_ms", g.wait_cpu_ms, 3);
+        j.num("wait_upload_ms", g.wait_upload_ms, 3);
+        j.num("host_gap_ms", g.host_gap_ms, 3);
+        j.num("host_round_trips", g.round_trips, 1);
+        j.num("round_trip_idle_ms", g.round_trip_ms, 3);
+        j.boolean("hit_rate_above_real_text", g.warm_cache);
+        if (g.hit_rate >= 0) j.num("expert_hit_rate", g.hit_rate, 4); else j.null("expert_hit_rate");
+        j.num("cpu_expert_gb", g.cpu_gb, 4);
+        j.num("pcie_gb", g.pcie_gb, 4);
+        j.open_list("families");
+        for (const FamilyVerdict& v : g.families) {
+            j.open();
+            j.str("family", prof::fam_key(v.fam));
+            j.num("ms", v.ms, 3);
+            j.num("launches", v.launches, 1);
+            j.num("launch_ms_estimate", v.launch_ms, 3);
+            j.num("gb", v.gb, 4);
+            j.num("gbs", v.gbs, 1);
+            j.num("share_of_probed_read", v.read_share, 3);
+            j.num("avg_kernel_us", v.avg_kernel_us, 2);
+            j.boolean("tiny_kernels", v.tiny);
+            j.str("verdict", v.verdict);
+            j.close();
+        }
+        j.close_list();
+        j.open_list("recover");
+        for (const auto& [ms, what] : g.recover) {
+            j.open();
+            j.num("ms", ms, 3);
+            j.str("by", what);
+            j.close();
+        }
+        j.close_list();
+        j.close();
+    }
+    j.close_list();
     j.open_list("explain");
     for (const Finding& f : explain(r)) {
         j.open();
@@ -557,10 +798,18 @@ std::string to_markdown(const Report& r) {
          // data rate (GDDR6 moves 8 bits a pin per clock), so a peak under the measured copy is left out
          (g.mem_peak_gbs > 0 && g.mem_peak_gbs >= r.probes.gpu_mem_gbs ? " (peak " + num(g.mem_peak_gbs, 0) + ")"
                                                                         : std::string()) + " |\n";
+    if (r.probes.read_gbs > 0) m += "| GPU memory, read-only kernel | " + num(r.probes.read_gbs, 0) + " |\n";
     m += "| RAM read, " + std::to_string(r.probes.ram_threads) + " threads | " + num(r.probes.ram_read_gbs, 1) + " |\n";
     for (const DotRate& d : r.probes.dots)
         m += "| CPU expert dot " + d.type + " (" + d.kernel + ", " + d.isa + "), " + std::to_string(d.threads) +
              " threads / 1 | " + num(d.gbs_all, 1) + " / " + num(d.gbs_one, 1) + " |\n";
+    if (r.probes.launch_us > 0)
+        m += "\nLaunch: " + fmt("%.2f", r.probes.small_us) + " us a small dependent kernel back to back (" +
+             fmt("%.2f", r.probes.small_node_us) + " us replayed, " + fmt("%.2f", r.probes.wide_node_us) + " us replayed across the card): a kernel's floor; " + fmt("%.2f", r.probes.launch_us) +
+             " us an empty kernel back to back, " +
+             fmt("%.2f", r.probes.graph_node_us) + " us a node of a replayed recording, " + fmt("%.1f", r.probes.sync_us) + " us a host round trip (kernel, "
+             "event, wait), " + fmt("%.1f", r.probes.copy_sync_us) + " us a small copy to the host waited for; fp32 FMA " +
+             num(r.probes.fma_gflops, 0) + " GFLOP/s.\n";
     m += "\n## Model and settings\n\n";
     m += md_escape(r.model.name) + " (" + md_escape(r.model.arch) + ", experts " + md_escape(r.model.file_type) + ", " +
          num(r.model.size_gib, 1) + " GiB); " + std::to_string(r.cached_experts) + " of " +
@@ -600,6 +849,48 @@ std::string to_markdown(const Report& r) {
             m += "| " + std::to_string(run.context_end) + " | " + std::to_string(run.read) + " | " +
                  num(run.prompt_tok_s(), 0) + " | " + num(run.decode_tok_s(), 1) + " |\n";
     }
+    m += "\n## Diagnosis\n\n";
+    const auto diags = diagnose(r);
+    if (diags.empty()) m += "Not enough split calls to diagnose.\n";
+    for (const Diagnosis& g : diags) {
+        m += "**" + md_escape(g.phase) + ": " + md_escape(g.verdict) + ".**\n\n";
+        m += "- Roofline: " + fmt("%.2f", g.gpu_gb) + " GB " + g.unit + " (dense weights, KV rows, experts on the GPU) at the "
+             "probed read bandwidth would take " + fmt("%.2f", g.ideal_ms) + " ms; it takes " + fmt("%.2f", g.total_ms) +
+             " ms. Launches: " + fmt("%.0f", g.launches) + " " + g.unit + " (" + fmt("%.0f", g.direct) + " direct, " +
+             fmt("%.0f", g.nodes) + " replayed), ~" + fmt("%.2f", g.launch_ms) + " ms at the probed floor of a small kernel.\n";
+        if (g.hit_rate >= 0)
+            m += "- Cache: " + pct(g.hit_rate) + " of the routed experts from VRAM (" + std::to_string(r.cached_experts) + " of " +
+                 std::to_string(r.total_experts) + " held); " + fmt("%.3f", g.cpu_gb) + " GB " + g.unit +
+                 " read by the CPU experts from RAM, " + fmt("%.3f", g.pcie_gb) + " GB over PCIe." +
+                 (g.warm_cache ? " **Above 97%: this text keeps to the cached experts more than a real chat does (~87% "
+                                 "on real text on an 8-16 GB card), so the misses' cost is understated here; "
+                                 "`STRATA_PROFILE=1` on real chats, or `--text docs`, shows it.**"
+                               : std::string()) +
+                 "\n";
+        if (g.round_trips > 0)
+            m += "- Host round trips: " + fmt("%.0f", g.round_trips) + " " + g.unit + " (the host waits for a router's "
+                 "scores, routes and hands the card its experts), the card idle ~" + fmt("%.2f", g.round_trip_ms) +
+                 " ms meanwhile" + (r.probes.copy_sync_us > 0 ? " (the probed copy-and-wait alone: ~" +
+             fmt("%.2f", g.round_trips * r.probes.copy_sync_us / 1000.0) + " ms)" : std::string()) + ".\n";
+        if (!g.recover.empty()) {
+            m += "- Most to recover:";
+            for (size_t i = 0; i < g.recover.size(); ++i)
+                m += std::string(i ? ";" : "") + " " + fmt("%.2f", g.recover[i].first) + " ms by " + md_escape(g.recover[i].second);
+            m += " (estimates: launches at the probed latency, kernels at the probed read bandwidth).\n";
+        }
+        m += "\n| Family | ms | Launches | Launch ms (est.) | GB | GB/s | % of read | Verdict |\n"
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n";
+        for (const FamilyVerdict& v : g.families)
+            m += "| " + std::string(prof::fam_title(v.fam)) + " | " + num(v.ms, 2) + " | " + num(v.launches, 0) + " | " +
+                 num(v.launch_ms, 2) + " | " + (v.gb > 0 ? fmt("%.3f", v.gb) : std::string("-")) + " | " +
+                 (v.gb > 0 ? num(v.gbs, 0) : std::string("-")) + " | " + (v.gb > 0 ? pct(v.read_share) : std::string("-")) +
+                 " | " + md_escape(v.verdict) + " |\n";
+        m += "\n";
+    }
+    m += "Family rows are from the split calls (launched kernel by kernel); the verdict, roofline and launch lines from "
+         "every call. Bytes are the engine's model: each dense matrix once a visit, the KV rows attention reads, an "
+         "expert's weights each time a token routes to one on the card. Kernel time per launch is not measured, so "
+         "\"tiny kernels\" is a family's average.\n";
     m += "\n## Explain\n\n";
     for (const Finding& f : explain(r)) m += std::string("- ") + (f.flag ? "**far off:** " : "") + f.phase + ": " + f.text + "\n";
     m += "\n<details><summary>Profile tables</summary>\n\nLaunches: the kernels the engine hands the card, " +

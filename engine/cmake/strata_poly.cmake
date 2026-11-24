@@ -242,7 +242,7 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
                             src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                             src/poly/spill.cpp src/core/conversation_memory.cpp src/core/conversation_file.cpp
-                            src/poly/bench_report.cpp src/poly/bench_probe.cpp)
+                            src/poly/bench_report.cpp src/poly/bench_probe.cpp src/poly/bench_kernels.cu)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   strata_poly_commit(src/poly/bench_report.cpp)
   # the profiler's launch counter (src/poly/launch_count.cpp): the runtime's launch call wrapped at link time, Linux
