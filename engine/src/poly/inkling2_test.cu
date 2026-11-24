@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -672,6 +673,161 @@ void case_moe_conv_add() {
         compare(fmt("ink_moe_conv_add %s: the state", scaled ? "scaled" : "plain"), dst.get(), dbl(s), 0.0);
     }
 }
+
+#if !defined(__HIPCC__)
+// Wait ms milliseconds on the host (spinning: <thread> would bring unistd.h's sync() beside the test's).
+void wait_ms(int ms) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (std::chrono::steady_clock::now() < end) {
+    }
+}
+
+// Pinned host memory of n T's, as the doorbell's bell and the token's input on the host are.
+template <typename T>
+struct Pinned {
+    T* p = nullptr;
+    size_t n = 0;
+    explicit Pinned(size_t count) : n(count) {
+        ck(cudaMallocHost((void**) &p, n * sizeof(T)), "cudaMallocHost");
+        std::memset((void*) p, 0, n * sizeof(T));
+    }
+    Pinned(const Pinned&) = delete;
+    Pinned& operator=(const Pinned&) = delete;
+    ~Pinned() { (void) cudaFreeHost(p); }
+    std::vector<uint8_t> bytes() const {
+        sync();
+        return std::vector<uint8_t>((const uint8_t*) p, (const uint8_t*) (p + n));
+    }
+};
+
+// route_ring() against route_rows(), count_picks() and bell_ring() in turn: the same picks, weights, counts, bell
+// and input on the host, for tokens with experts outside VRAM (some past --tail-skip's place) and without
+void case_route_ring() {
+    const float w_scale = 2.5f;
+    const auto x = randv(kEmbd, 1.0f);
+    auto bias = randv(kExperts, 0.05f);
+    // experts 5 and 9: the largest bias, the same for both, so that with equal scores (below) their picks tie
+    // exactly at the top, and the lower expert goes first
+    bias[5] = bias[9] = *std::max_element(bias.begin(), bias.end()) + 0.1f;
+    std::vector<void*> slots(kExperts);
+    Dev<float> dx(x), dbias(bias);
+    for (const int skip_from : {kUsed, 6}) {
+        for (const bool misses : {true, false}) {
+            for (int e = 0; e < kExperts; ++e)   // a fake slot address: the kernels only test it for null
+                slots[(size_t) e] = misses && e % 3 == 0 ? nullptr : (void*) (uintptr_t) (4096 * (e + 1));
+            Dev<void*> dslots(slots);
+            std::vector<int32_t> uses0(kExperts);
+            for (int e = 0; e < kExperts; ++e) uses0[(size_t) e] = (e * 7) % 5;
+            Dev<int32_t> uses_a(uses0), uses_b(uses0), ids_a(kUsed), ids_b(kUsed);
+            Dev<float> w_a(kUsed), w_b(kUsed);
+            Dev<uint32_t> seq_a(2), seq_b(2);
+            Pinned<ExpertBell> bell_a(1), bell_b(1);
+            Pinned<float> hx_a(kEmbd), hx_b(kEmbd);
+            bool same = true, ties_ok = true;
+            int rings = 0;
+            for (int t = 0; t < 64 && same; ++t) {
+                auto lg = randv(kExperts, 2.0f);
+                if (t % 7 == 0) lg[5] = lg[9] = 9.f;   // a tie at the top: the lower expert first
+                Dev<float> dlg(lg);
+                route_rows(dlg, kExperts, kUsed, 1, 1, 1.f, dbias, nullptr, true, w_scale, ids_a, w_a, stream());
+                count_picks(ids_a, kUsed, kExperts, uses_a, stream());
+                bell_ring(dslots, ids_a, w_a, kUsed, skip_from, t, dx, hx_a.p, kEmbd, bell_a.p, seq_a, stream());
+                const BellRing r{dslots, uses_b, skip_from, t, dx, hx_b.p, kEmbd, bell_b.p, seq_b};
+                route_ring(dlg, kExperts, kUsed, 1, 1.f, dbias, nullptr, true, w_scale, ids_b, w_b, r, stream());
+                const auto w1 = w_a.get(), w2 = w_b.get();
+                same = ids_a.get() == ids_b.get() && std::memcmp(w1.data(), w2.data(), kUsed * sizeof(float)) == 0 &&
+                       uses_a.get() == uses_b.get() && seq_a.get() == seq_b.get() && bell_a.bytes() == bell_b.bytes() &&
+                       hx_a.bytes() == hx_b.bytes();
+                rings += seq_b.get()[1] != 0;
+                if (t % 7 == 0) {   // 5 and 9 tie at the top: both picked, 5 first
+                    const auto id = ids_b.get();
+                    ties_ok = ties_ok && id[0] == 5 && id[1] == 9;
+                }
+            }
+            const std::string what = fmt("route_ring = route_rows + count_picks + bell_ring (skip from %d, %s)",
+                                         skip_from, misses ? "misses" : "all in VRAM");
+            same_bits(what + ": picks", ids_a.get(), ids_b.get());
+            same_bits(what + ": weights", w_a.get(), w_b.get());
+            same_bits(what + ": counts", uses_a.get(), uses_b.get());
+            same_bits(what + ": the bell", bell_a.bytes(), bell_b.bytes());
+            same_bits(what + ": the input on the host", hx_a.bytes(), hx_b.bytes());
+            same_bits(what + ": every token the same", std::vector<int>{1}, std::vector<int>{same ? 1 : 0});
+            same_bits(what + ": a tie, the lower expert first", std::vector<int>{1},
+                      std::vector<int>{ties_ok ? 1 : 0});
+            same_bits(what + ": rang where it should", std::vector<int>{misses ? 1 : 0},
+                      std::vector<int>{rings > 0 ? 1 : 0});
+        }
+    }
+}
+
+// ink_moe_bell_conv_add() against moe_shared()'s zeros, expert_weights(), moe_sum(), bell_add() and ink_conv_add()
+// in turn (moe_card() and layer_tail() with the doorbell, one launch at a time): the same experts' sum, stream and
+// state.  Bells: no ring; a ring answered before the launch; one the host answers while the launch waits (hy is NaN
+// until then, so a read before the answer shows); one the host aborts (the launch must end; its sums are spoiled).
+// Widths of a whole number of blocks and not (the last block's threads past the width wait at the barrier too).
+void case_moe_bell_conv_add() {
+    enum Bell { kNone, kBefore, kWhile, kAbort };
+    const char* bell_name[] = {"no ring", "answered before", "answered while it waits", "aborted"};
+    for (const int n : {kEmbd, 2200}) {
+        for (const bool scaled : {false, true}) {
+            for (const Bell how : {kNone, kBefore, kWhile, kAbort}) {
+                const auto x = randv((size_t) kUsed * n, 1.0f), w = randv(kUsed, 0.3f, 0.5f);
+                const auto escale = randv(kExperts, 0.2f, 1.0f), acc = randv(n, 1.0f), hy0 = randv(n, 0.5f);
+                const auto st = randv((size_t) (kTaps - 1) * n, 1.0f), cw = randv((size_t) n * kTaps, 0.5f);
+                std::vector<int> ids(kUsed);
+                for (int k = 0; k < kUsed; ++k) ids[k] = (k * 37 + 5) % kExperts;
+                Pinned<ExpertBell> bell(1);
+                Pinned<float> hy(n);
+                const bool late = how == kWhile || how == kAbort;
+                for (int i = 0; i < n; ++i) hy.p[i] = late ? NAN : hy0[(size_t) i];
+                bell.p->ring = 41u;
+                bell.p->ack = late ? 40u : 41u;
+                Dev<uint32_t> seq(std::vector<uint32_t>{41u, how == kNone ? 0u : 41u});
+                Dev<float> dx(x), dw_a(w), dw_b(w), des(escale), acc_a(acc), acc_b(acc), st_a(st), st_b(st), dcw(cw);
+                Dev<float> fo_a(std::vector<float>(n, 1.0f)), fo_b(n), out_a(n), out_b(n);
+                Dev<int> dids(ids);
+                const std::string what = fmt("ink_moe_bell_conv_add %d wide, %s, %s", n, scaled ? "scaled" : "plain",
+                                             bell_name[how]);
+                ink_moe_bell_conv_add(dx, dw_b, scaled ? des.p : nullptr, dids, kUsed, fo_b, bell.p, seq, hy.p, st_b,
+                                      dcw, out_b, acc_b, 1.f, n, kTaps, stream());
+                if (late) {   // the launch waits for the host: give it time, then answer (or give up) from here
+                    wait_ms(50);
+                    const bool waiting = cudaStreamQuery((cudaStream_t) stream()) == cudaErrorNotReady;
+                    same_bits(what + ": waits for the host", std::vector<int>{1}, std::vector<int>{waiting ? 1 : 0});
+                    if (how == kWhile) {
+                        for (int i = 0; i < n; ++i) hy.p[i] = hy0[(size_t) i];
+                        __atomic_thread_fence(__ATOMIC_RELEASE);   // the sums before the answer
+                        bell.p->ack = 41u;
+                    } else {
+                        bell.p->abort = 1u;
+                    }
+                    bool done = false;
+                    for (int i = 0; i < 5000 && !done; ++i) {
+                        done = cudaStreamQuery((cudaStream_t) stream()) != cudaErrorNotReady;
+                        if (!done) wait_ms(1);
+                    }
+                    same_bits(what + ": ends after the answer", std::vector<int>{1}, std::vector<int>{done ? 1 : 0});
+                    if (!done) {   // a launch that never ends: nothing after it can run
+                        std::printf("ink_moe_bell_conv_add did not end  FAIL\n");
+                        std::exit(1);
+                    }
+                    if (how == kAbort) continue;   // the sums of an abort are spoiled, as the engine's call throws
+                }
+                bell.p->ack = 41u;   // the five launches' bell_add: answered by now
+                ck(cudaMemsetAsync(fo_a, 0, n * sizeof(float), (cudaStream_t) stream()), "memset");
+                if (scaled) expert_weights(dw_a, des, dids, kUsed, stream());
+                moe_sum(dx, dw_a, fo_a, n, kUsed, 1, stream());
+                bell_add(bell.p, seq, hy.p, fo_a, n, stream());
+                ink_conv_add(fo_a, st_a, dcw, out_a, acc_a, nullptr, 1.f, 0, n, kTaps, stream());
+                same_bits(what + " = the five launches: the experts' sum", fo_a.get(), fo_b.get());
+                same_bits(what + " = the five launches: out", out_a.get(), out_b.get());
+                same_bits(what + " = the five launches: the stream", acc_a.get(), acc_b.get());
+                same_bits(what + " = the five launches: the state", st_a.get(), st_b.get());
+            }
+        }
+    }
+}
+#endif
 
 // ink_qkv(): a token's convolutions, clips, V's norm and the stores in one launch, against ink_conv_few() and
 // ink_clips() (the engine's path for a few tokens: the same bits) and against the reference; fp16 and FP8, a ring
@@ -1453,6 +1609,10 @@ const Case kCases[] = {
     {"conv", case_conv},
     {"conv_acc", case_conv_acc},
     {"moe_conv_add", case_moe_conv_add},
+#if !defined(__HIPCC__)
+    {"route_ring", case_route_ring},
+    {"moe_bell_conv_add", case_moe_bell_conv_add},
+#endif
     {"qkv", case_qkv},
     {"mix", case_mix},
     {"norms", case_norms},

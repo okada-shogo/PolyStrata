@@ -302,6 +302,22 @@ struct ExpertBell {
 /// this one, or 0 when there is none).  One block.  CUDA only.
 void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_used, int skip_from, int layer,
                const float* x, float* hx, int n, ExpertBell* bell, uint32_t* seq, void* stream);
+/// bell_ring()'s arguments besides the picks, for route_ring(); uses: count_picks()'s counts (null: none).
+struct BellRing {
+    const void* const* slots;
+    int32_t* uses;
+    int skip_from, layer;
+    const float* x;
+    float* hx;
+    int n;
+    ExpertBell* bell;
+    uint32_t* seq;
+};
+/// route_rows() of one token into ids and w, count_picks() of its picks into r.uses and bell_ring() of them with
+/// r's arguments, in one launch: the same bits as the three.  CUDA only.
+void route_ring(const float* logits, int n_expert, int n_used, int gate, float in_scale, const float* bias,
+                const float* escale, bool norm, float w_scale, int32_t* ids, float* w, const BellRing& r,
+                void* stream);
 /// Where seq[1] is a ring: wait until the bell's ack is that ring (or abort is set), then acc += hy (n floats).
 void bell_add(const ExpertBell* bell, const uint32_t* seq, const float* hy, float* acc, int n, void* stream);
 /// copy2() with a third run.  CUDA and HIP only.

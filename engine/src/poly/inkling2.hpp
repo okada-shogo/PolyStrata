@@ -77,6 +77,9 @@ protected:
                       float* tmp) override;
     void slots_moved() override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;
+#if !defined(STRATA_GPU_METAL)
+    bool route_card_ring(int il, const BellRing& ring) override;
+#endif
     void moe_shared(const Layer& L, int il, int n) override;
 
 private:
@@ -140,9 +143,9 @@ private:
     bool control_ffn(const float* msg, const Ctrl& c, const Block& B, int row = 0);
     void guess_block(int32_t token) override;
     bool own_blocks() const override { return ds_file_ != nullptr; }
-    // only where moe_card() and layer_tail() are recorded together (whole_rec_), and not with the doorbell, whose
-    // experts' sum comes in after the card's
-    bool moe_sum_later(int n) const override { return n == 1 && whole_rec_ && !bell_; }
+    // only where moe_card() and layer_tail() are recorded together (whole_rec_); with the doorbell, layer_tail()
+    // adds the host's sum too
+    bool moe_sum_later(int n) const override { return n == 1 && whole_rec_; }
     bool bells() const override { return true; }
 #if defined(STRATA_USE_HIP)
     // the shared expert is one memset (moe_shared()), and a graph launch a layer for it cost an RX 9070 XT's host
@@ -186,6 +189,8 @@ private:
     float w_scale_ = 0;
     float* cache_b_ = nullptr;   ///< --cache-bias: each layer's pick bias for the card (slots_moved())
     void route_by(const float* logits, const float* bias, int* ids, float* w, float* probs) const;
+    /// route_card()'s bias for layer il: the router's own, or for a few tokens with --cache-bias slots_moved()'s.
+    const float* card_bias(int il, int n) const;
     void cached_bias(const Layer& L, int il, float* b) const;
     uint32_t attn_type_ = 0;   ///< --attn-requant's type for the attention's matrices; 0: the file's
     bool unsloth_ = false;     ///< an "inkling2" file: block_count counts applications, the loop's names are Unsloth's

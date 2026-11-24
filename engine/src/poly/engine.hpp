@@ -590,6 +590,14 @@ protected:
         (void) il, (void) n, (void) ids, (void) w;
         return false;
     }
+#if !defined(STRATA_GPU_METAL)
+    /// route_card() of one token into d_ids_ and d_wts_ with the doorbell's count_picks() and bell_ring() of its
+    /// picks (route_ring()), in one launch.  False, with nothing launched: the three launches instead.
+    virtual bool route_card_ring(int il, const BellRing& ring) {
+        (void) il, (void) ring;
+        return false;
+    }
+#endif
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
     /// False: run() launches moe_shared() as it is where it replays a layer's other launches (Layer::shared stays
@@ -597,7 +605,8 @@ protected:
     virtual bool shared_recorded() const { return true; }
     /// True: moe_card() leaves the routed experts' sum (d_ weighted by d_wts_, onto fo_) of a call of n tokens to the
     /// family, which folds it into what follows (Inkling 2's layer_tail()), and sets moe_left_.  The weights are then
-    /// still to be multiplied by moe_left_scale_[id] where that is set (expert_weights()'s product).
+    /// still to be multiplied by moe_left_scale_[id] where that is set (expert_weights()'s product), and with the
+    /// doorbell (bell_ and one token) the host's sum is then the family's to add too, as bell_add() adds it.
     virtual bool moe_sum_later(int n) const {
         (void) n;
         return false;

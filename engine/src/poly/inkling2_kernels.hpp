@@ -99,6 +99,12 @@ void ink_conv_add_rows(const float* x, const InkStateRows& state, const float* w
 void ink_moe_conv_add(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
                       float* state, const float* cw, float* out, float* acc, float a, int channels, int taps,
                       void* stream);
+/// ink_moe_conv_add() with the doorbell's sum between the two: where seq[1] is a ring, the experts' sum waits for
+/// the bell's answer and gets hy added (bell_add()'s), then the convolution.  The same bits as moe_sum(), bell_add()
+/// and ink_conv_add() in turn.  CUDA only.
+void ink_moe_bell_conv_add(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
+                           const ExpertBell* bell, const uint32_t* seq, const float* hy, float* state, const float* cw,
+                           float* out, float* acc, float a, int channels, int taps, void* stream);
 
 /// Each head's `dim` values, times scale (null: none; [dim] a head), brought down to an L2 norm of at most `thr`
 /// (the norm has 1e-6 added), then times tau = 1 + alpha * log(max(1, (pos + row + 1) / floor)) when alpha > 0.

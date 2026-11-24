@@ -1354,13 +1354,13 @@ __global__ void geglu_rows_kernel(const float* __restrict__ gate_up, float* __re
 constexpr int ROUTE_PER = 16;   // experts a lane: up to 512
 // The kernel takes PER experts a lane, the fewest that hold the model's: a slot past them is a -inf that changes no
 // pick and no sum, and walking all sixteen made a token's routing 3.5 us on an RTX 5090.
+// route_kernel's routing of token `row` by a whole warp: false for a lane past n_used, else the lane's pick (the
+// lane-th) in id and its weight in wt.
 template<int PER>
-
-__global__ void route_kernel(const float* __restrict__ logits, int n_expert, int n_used, int rows, int gate,
-                             float in_scale, const float* __restrict__ bias, const float* __restrict__ escale,
-                             bool norm, float w_scale, int32_t* __restrict__ ids, float* __restrict__ w) {
-    const int row = (blockIdx.x * blockDim.x + threadIdx.x) / WARP, lane = threadIdx.x % WARP;
-    if (row >= rows) return;
+__device__ __forceinline__ bool route_pick(const float* __restrict__ logits, int n_expert, int n_used, int row,
+                                           int gate, float in_scale, const float* __restrict__ bias,
+                                           const float* __restrict__ escale, bool norm, float w_scale, int lane,
+                                           int& id, float& wt) {
     const float* lg = logits + size_t(row) * n_expert;
     float p[PER], pick[PER];
     float mx = -INFINITY;
@@ -1426,12 +1426,27 @@ __global__ void route_kernel(const float* __restrict__ logits, int n_expert, int
         sum += pw;
         if (lane == j) mine = pw, my_id = at;
     }
-    if (lane >= n_used) return;
+    if (lane >= n_used) return false;
     float v = mine;
     if (norm) v /= fmaxf(sum, 6.103515625e-5f);   // the floor ggml's MoE graph puts under the gate sum
     if (escale) v *= escale[my_id];
     if (w_scale != 0.0f) v *= w_scale;
-    ids[size_t(row) * n_used + lane] = my_id;
+    id = my_id;
+    wt = v;
+    return true;
+}
+
+template<int PER>
+__global__ void route_kernel(const float* __restrict__ logits, int n_expert, int n_used, int rows, int gate,
+                             float in_scale, const float* __restrict__ bias, const float* __restrict__ escale,
+                             bool norm, float w_scale, int32_t* __restrict__ ids, float* __restrict__ w) {
+    const int row = (blockIdx.x * blockDim.x + threadIdx.x) / WARP, lane = threadIdx.x % WARP;
+    if (row >= rows) return;
+    int id;
+    float v;
+    if (!route_pick<PER>(logits, n_expert, n_used, row, gate, in_scale, bias, escale, norm, w_scale, lane, id, v))
+        return;
+    ids[size_t(row) * n_used + lane] = id;
     w[size_t(row) * n_used + lane] = v;
 }
 
@@ -3977,9 +3992,11 @@ void far_pull(const FarFetch* fetch, const int* count, int most, size_t bytes, v
         throw std::runtime_error(std::string("far_pull: ") + cudaGetErrorString(e));
 }
 
-__global__ void bell_ring_kernel(const void* const* __restrict__ slots, const int32_t* __restrict__ ids,
-                                 const float* __restrict__ w, int n_used, int skip_from, int layer,
-                                 const float* __restrict__ x, float* hx, int n, ExpertBell* bell, uint32_t* seq) {
+// bell_ring_kernel's work, for a block of the launch's threads
+__device__ __forceinline__ void bell_ring_block(const void* const* __restrict__ slots, const int32_t* ids,
+                                                const float* w, int n_used, int skip_from, int layer,
+                                                const float* __restrict__ x, float* hx, int n, ExpertBell* bell,
+                                                uint32_t* seq) {
     __shared__ int jobs;
     if (threadIdx.x == 0) {
         int j = 0;
@@ -4010,6 +4027,31 @@ __global__ void bell_ring_kernel(const void* const* __restrict__ slots, const in
     }
 }
 
+__global__ void bell_ring_kernel(const void* const* __restrict__ slots, const int32_t* __restrict__ ids,
+                                 const float* __restrict__ w, int n_used, int skip_from, int layer,
+                                 const float* __restrict__ x, float* hx, int n, ExpertBell* bell, uint32_t* seq) {
+    bell_ring_block(slots, ids, w, n_used, skip_from, layer, x, hx, n, bell, seq);
+}
+
+// route_ring(): the first warp routes the token, its lanes count their picks, then the block rings the bell with them
+template<int PER>
+__global__ void route_ring_kernel(const float* __restrict__ logits, int n_expert, int n_used, int gate,
+                                  float in_scale, const float* __restrict__ bias, const float* __restrict__ escale,
+                                  bool norm, float w_scale, int32_t* ids, float* w, BellRing r) {
+    if (threadIdx.x < WARP) {
+        int id;
+        float v;
+        if (route_pick<PER>(logits, n_expert, n_used, 0, gate, in_scale, bias, escale, norm, w_scale, threadIdx.x, id,
+                            v)) {
+            ids[threadIdx.x] = id;
+            w[threadIdx.x] = v;
+            if (r.uses && id >= 0 && id < n_expert) atomicAdd(&r.uses[id], 1);
+        }
+    }
+    __syncthreads();   // the picks are the block's
+    bell_ring_block(r.slots, ids, w, n_used, r.skip_from, r.layer, r.x, r.hx, r.n, r.bell, r.seq);
+}
+
 // One block: one thread asks the bell every half microsecond or so, the others sleep at the barrier (a spinning card
 // draws power that a laptop's CPU, computing the experts meanwhile, would rather have).
 __global__ void bell_add_kernel(const ExpertBell* bell, const uint32_t* __restrict__ seq, const float* hy,
@@ -4032,6 +4074,23 @@ void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int
     bell_ring_kernel<<<1, 256, 0, cs(stream)>>>(slots, ids, w, n_used, skip_from, layer, x, hx, n, bell, seq);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("bell_ring: ") + cudaGetErrorString(e));
+}
+
+void route_ring(const float* logits, int n_expert, int n_used, int gate, float in_scale, const float* bias,
+                const float* escale, bool norm, float w_scale, int32_t* ids, float* w, const BellRing& r,
+                void* stream) {
+    if (n_expert > ROUTE_PER * WARP || n_used > WARP)
+        throw std::invalid_argument("route_ring: more than 512 experts, or more than 32 a token");
+    const auto launch = [&](auto kernel) {
+        kernel<<<1, 256, 0, cs(stream)>>>(logits, n_expert, n_used, gate, in_scale, bias, escale, norm, w_scale, ids,
+                                          w, r);
+    };
+    if (n_expert <= 2 * WARP) launch(route_ring_kernel<2>);
+    else if (n_expert <= 4 * WARP) launch(route_ring_kernel<4>);
+    else if (n_expert <= 8 * WARP) launch(route_ring_kernel<8>);
+    else launch(route_ring_kernel<ROUTE_PER>);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("route_ring: ") + cudaGetErrorString(e));
 }
 
 void bell_add(const ExpertBell* bell, const uint32_t* seq, const float* hy, float* acc, int n, void* stream) {
