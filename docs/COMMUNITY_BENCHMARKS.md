@@ -250,6 +250,28 @@ fast.
   [Q2_0](bench-results/2026-11-17-community-rx-7600-xt-qwen3-8-flash-next-q2-0/README.md), `--kv int8 --kv-resident 32768`, `tools/strata_bench.py`: chat 22.1 / 11.3 tok/s
   (8.3 to 30.9 and 4.6 to 42.9 over the runs), prompt 169 / 114 tok/s at 4K and 187 / 111 at 16K. The same PC's strata-poly models are in the table above.
 
+## Post a bench report (strata-poly)
+
+The engine of the models PolyStrata adds can write a report of its own: what your card, link, RAM and CPU measure,
+the speeds with your settings, and where the GPU's time went. It shows the maintainers where speed is left on hardware
+they do not have. Stop the server first (the report needs the GPU), then:
+
+```
+python polystrata.py bench-report --model <name>          # quick: about a minute after the model loads (RTX 2070 Super), more on a slow card
+python polystrata.py bench-report --model <name> --long   # and one conversation read in chunks up to your context (about 6 minutes more at 128K)
+```
+
+It writes `bench-report.json` and `bench-report.md`: probes (H2D pinned and pageable, D2H, GPU memory, RAM read on
+all threads, the CPU experts' dot kernel), then prompts of 302, 2,048 and 8,192 tokens of a fixed synthetic English text (the same on every PC) with 128 tokens answered
+after each (greedy), each with its event profile and an "Explain" section that holds every phase against the probes.
+The files have no paths, user or host names, serial numbers or prompts. With `--layer-split` the profile is the first card's stream alone. Post them with the **Bench report** issue form;
+`python tools/bench_reports.py --check-privacy bench-report.json` checks a file, and `python tools/bench_reports.py
+*.json` puts several reports in one table per card and flags the ones far from the same card's others.
+
+`STRATA_PROFILE=1` in the server's environment profiles normal use the same way, at no extra wait: after every request
+the engine writes the session's profile, by phase and by context length, to `strata-profile.json` in its working
+folder (`STRATA_PROFILE_OUT` names another file), and a line to the log.
+
 ## Run the standard benchmark
 
 ```sh
