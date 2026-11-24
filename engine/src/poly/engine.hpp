@@ -835,7 +835,9 @@ protected:
     int room(int n) const;
     int room_key(int n) const;
     void* dmalloc(size_t bytes, const char* what);
-    void* hmalloc(size_t bytes, const char* what);
+    /// `live`: memory that the card and the host read and write while a kernel runs (the doorbell): on HIP
+    /// coherent (hipHostMallocCoherent), so the card never reads it from a cache; on CUDA all pinned memory is.
+    void* hmalloc(size_t bytes, const char* what, bool live = false);
     void hfree(void* p);
     std::vector<uint8_t> ram_keep(const std::vector<float>* lately = nullptr) const;
     bool read_file(uint8_t* dst, const uint8_t* src, size_t n, bool copy = false) const;
@@ -1302,6 +1304,7 @@ protected:
     bool bell_on(int n) const;
     void bell_serve();
     void bell_job();
+    void bell_unwind();
     uint8_t* stage_ = nullptr;                    ///< experts that are not cached, on their way through VRAM
     uint8_t* h_stage_[2] = {};                    ///< pinned; filled in turn
     void* ev_stage_[2] = {};                      ///< marks the upload out of each
