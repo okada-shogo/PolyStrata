@@ -3984,8 +3984,9 @@ void Engine::alloc() {
         d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
         h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
-        // the weights of step()'s rows, back from the card where a token alone routes there (the doorbell)
-        if (bells() && opt_.batch > 0) h_wts_ = (float*) hmalloc(rr * sizeof(float), "pinned memory");
+        // the weights of step()'s rows and a window's, back from the card where a token alone routes there (doorbell)
+        if (bells() && (opt_.batch > 0 || opt_.window > 1))
+            h_wts_ = (float*) hmalloc(rr * sizeof(float), "pinned memory");
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
 #if !defined(STRATA_GPU_METAL)
         d_far_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
@@ -5224,7 +5225,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         const auto route_row = [&](int t) {
             int* ids = ids_of[t];
             float* w = w_of[t];
-            if (step_ids_) {   // step()'s rows: the card's picks and weights (step_ids_)
+            if (step_ids_) {   // step()'s rows or a window's: the card's picks and weights (step_ids_)
                 const size_t from = (size_t) (at + t) * n_used_;
                 std::copy(step_ids_ + from, step_ids_ + from + n_used_, ids);
                 std::copy(h_wts_ + from, h_wts_ + from + n_used_, w);
@@ -5640,6 +5641,24 @@ bool Engine::bell_on(int n) const {
 #else
     return n == 1 && h_bell_ && !all_cached() && !card_far_ && !pool_ && !split_ && !block_pass_ && !opt_.dump;
 #endif
+}
+
+// card_moe(1)'s test without its side effects: the doorbell, the card's slot table, no --expert-gpu.  Not with
+// --cache-bias, whose host route() biases the picks.
+bool Engine::picks_like_alone() const {
+    bool on = h_wts_ && bell_on(1) && d_slots_ && n_used_ <= card_rows() && !opt_.dump && opt_.cache_bias <= 0.f;
+#if !defined(STRATA_GPU_METAL)
+    on = on && !ecard_;
+#endif
+    return on;
+}
+
+// A layer that card_moe() found it cannot route (L.card == 0) is routed on the host alone too.  One it has not tried
+// yet (L.card == -1) counts as the card's only where its types have the card's pick kernels, as moe_card() would find.
+bool Engine::picks_like_alone(const Layer& L) const {
+    return L.card == 1 || (L.card == -1 && kernels::native_mmvq_ids_supported((int) L.gu_type) &&
+                           kernels::native_mmvq_ids_supported((int) L.u_type) &&
+                           kernels::native_mmvq_ids_supported((int) L.d_type));
 }
 
 // The doorbell's host side, after a token's launches: each ring is a layer's experts that the card lacks, computed by
@@ -7004,13 +7023,24 @@ void Engine::run(const int32_t* tokens, int n) {
     // call's tokens together are [0, window) by their number, and a half of a window comes after those, by the
     // window's tokens and which half it is.  Which tokens leave their state is the window's, so its halves' too.
     const size_t wn = (size_t) opt_.window, recs = 3 * wn + (size_t) opt_.batch + 1;   // step()'s rows after
+    // A window's tokens together, where a token alone is routed on the card (the doorbell): moe() takes the card's
+    // picks for them, as step() does for its rows, so each token gets the weights and experts it gets alone.
+    // (picks_like_alone() implies the window is not on the card: card_moe(n) has neither the doorbell nor
+    // card_routes() for it.  Not in halves, whose two halves would share h_ids_: they need reads_by_layer(), which
+    // no family with the doorbell has.)
+    const bool halves = n > 1 && windowed_ && !card_routes() && halves_;
+    const bool like_alone = n > 1 && windowed_ && !halves && picks_like_alone();
+    bool card_picks = false;   // the layer up() took last is routed on the card for moe()
     const auto up = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         prefetch_layer(il, m);
         const size_t head = (size_t) head_key(il, m) * recs + rec;
         if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, m); });
         else layer_head(L, il, m);
+        card_picks = false;
         if (!L.moe || batched(L, m)) return;
+        // the picks straight into the pinned memory moe() reads: a launch less than d_ids_ and copy2()
+        card_picks = like_alone && picks_like_alone(L) && route_card(il, m, h_ids_, h_wts_);
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
         if (replay && shared_recorded()) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
         else moe_shared(L, il, m);
@@ -7036,7 +7066,7 @@ void Engine::run(const int32_t* tokens, int n) {
     //
     // A half's launches are the ones its tokens have in a call of their own, at their rows of the buffers
     // (shift_rows()), so each token comes out as it would alone.
-    if (n > 1 && windowed_ && !card_routes() && halves_) {
+    if (halves) {
         const int first[3] = {0, (n + 1) / 2, n};   // half k is the tokens [first[k], first[k + 1])
         const unsigned bits = snap_bits_;           // the window's tokens that leave the recurrent state
         int at = 0;
@@ -7205,6 +7235,11 @@ void Engine::run(const int32_t* tokens, int n) {
         if (batched(L, n)) {
             moe_rows(L, il, n);
         } else if (!on_card(il, n, (size_t) n - 1)) {
+            struct Picks {
+                const int32_t*& ids;
+                ~Picks() { ids = nullptr; }
+            } picks_off{step_ids_};
+            step_ids_ = card_picks ? h_ids_ : nullptr;
             if (moe(L, il, n)) moe_add(n);
         } else if (bell_) {
             // Layer by layer (the first tokens, before the whole pass is recorded): the ring is answered here, since
@@ -7312,13 +7347,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     } bell_off{bell_};
     const bool card = R < kStageRows && card_moe(R);
     // a token alone is routed on the card (the doorbell, bell_on()), so the rows the host takes are too (below)
-    // (card_moe(1)'s test without its side effects: the doorbell, the card's slot table, no --expert-gpu; a layer that
-    // card_moe() found it cannot route, L.card == 0, is routed on the host alone too: below)
-    bool picks_like_alone = h_wts_ && bell_on(1) && d_slots_ && n_used_ <= card_rows() && !opt_.dump && R > 1 &&
-                            !guesses && opt_.cache_bias <= 0.f;
-#if !defined(STRATA_GPU_METAL)
-    picks_like_alone = picks_like_alone && !ecard_;
-#endif
+    const bool like_alone = R > 1 && !guesses && picks_like_alone();
     // an architecture that takes the rows in one head: their sequences and positions while it does
     std::vector<Row> rows;
     if (batch_heads())
@@ -7558,12 +7587,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             // the card's picks too (moe(), step_ids_).  The host's route() computes the gates' sigmoid with its own
             // exp, which can differ from the card's in the last bit, and a row would not get the weights, or now
             // and then the experts, it gets alone.
-            // (a layer card_moe() has not tried yet, L.card == -1, counts as the card's only where its types have the
-            // card's pick kernels, as moe_card() would find: else a token alone would be routed on the host)
-            const bool layer_card = L.card == 1 || (L.card == -1 && kernels::native_mmvq_ids_supported((int) L.gu_type) &&
-                                                    kernels::native_mmvq_ids_supported((int) L.u_type) &&
-                                                    kernels::native_mmvq_ids_supported((int) L.d_type));
-            const bool card_picks = !card && picks_like_alone && layer_card && route_card(il, R, d_ids_, d_wts_);
+            const bool card_picks = !card && like_alone && picks_like_alone(L) && route_card(il, R, d_ids_, d_wts_);
             if (card_picks) copy2(d_ids_, h_ids_, R * n_used_, d_wts_, h_wts_, R * n_used_, st_);
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
             if (replay && shared_recorded()) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
