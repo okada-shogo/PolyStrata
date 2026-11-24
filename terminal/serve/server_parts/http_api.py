@@ -135,12 +135,15 @@ def linux_desktop(env=None, release=None) -> bool:
             and not under_wsl(env, release))
 
 
-def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool) -> str:
+def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool, elastic=None) -> str:
     """#560 #516: on Linux, when the desktop needs VRAM the AMD card does not have, amdgpu moves GPU memory (the expert
     cache, ~24 GB) to system RAM, which the experts already fill - the OOM killer then ends the compositor.  The
     default reserve (700 MiB) is sized for a card without a desktop.  A recommendation, nothing changes: "" when it
-    does not apply."""
+    does not apply.  `elastic`: None for an engine without strata-poly's --vram-elastic, else whether it runs with it
+    (then its cache gives the desktop VRAM back by itself, so the note recommends that, not a fixed reserve)."""
     if backend != "hip" or not desktop or not isinstance(vram_free_mib, int) or vram_free_mib >= DESKTOP_FREE_MIB:
+        return ""
+    if elastic is True:
         return ""
     try:
         reserve = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args else 700
@@ -148,6 +151,12 @@ def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool) -> str:
         reserve = 700
     if reserve >= DESKTOP_RESERVE_MIB:
         return ""
+    if elastic is False:
+        return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
+                "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
+                'the OOM killer ends the session), add "vram_elastic": true to this model\'s config: the expert cache '
+                "then keeps its reserve free, gives VRAM back when the desktop takes some and takes it again later "
+                f"(rather than a fixed ./setup.sh --vram-reserve-mib {DESKTOP_RESERVE_MIB}, which costs experts)")
     return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
             "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
             "the OOM killer ends the session), keep more VRAM free: ./setup.sh --vram-reserve-mib "

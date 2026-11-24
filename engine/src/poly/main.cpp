@@ -1231,10 +1231,44 @@ int serve(Session& ss) {
         piece_t0 = Clock::now();
         return true;
     };
+    // --vram-elastic: while the engine waits for a line with no batch slot writing, every STRATA_VRAM_WATCH_MS (default
+    // 2000) the expert cache gives VRAM back to a program that took some, or takes it again (Engine::idle_vram()).
+    // Never inside a request.  STRATA_VRAM_WATCH=0: only at a request's start, as without the watch.
+    const int watch_ms = [&] {
+        const char* v = std::getenv("STRATA_VRAM_WATCH");
+        if (!engine.elastic() || (v && v[0] == '0')) return 0;
+        const char* m = std::getenv("STRATA_VRAM_WATCH_MS");
+        const int ms = m && m[0] ? std::atoi(m) : 2000;
+        return ms <= 0 ? 0 : std::max(ms, 100);
+    }();
+    if (watch_ms > 0)
+        std::fprintf(stderr, "strata-poly: --vram-elastic: while idle the expert cache gives VRAM to other programs and "
+                             "takes it back (checked every %d ms)\n", watch_ms);
+    else if (engine.elastic_asked() && !engine.elastic())
+        std::fprintf(stderr, "strata-poly: --vram-elastic is off: it needs VMM on this card and no --vram-pool\n");
+    bool served = false;   // a request has run (the idle watch starts after the first)
     for (;;) {
         std::string line;
         if (!writing()) {
-            line = lines.pop();
+            if (watch_ms > 0) {
+                while (!lines.pop_for(line, watch_ms)) {
+                    const int had = engine.cached_experts();
+                    const Clock::time_point t0 = Clock::now();
+                    bool changed = false;
+                    try {
+                        changed = engine.idle_vram(served);
+                    } catch (const std::exception& e) {   // as a failed resize at a request's start: the engine ends
+                        std::fprintf(stderr, "strata-poly: the idle VRAM watch failed: %s; the engine ends\n", e.what());
+                        return 1;
+                    }
+                    if (changed)
+                        std::fprintf(stderr, "strata-poly: idle: the expert cache %d -> %d experts (%.2f GiB) for the VRAM "
+                                             "free now, %lld MiB left, in %.0f ms\n", had, engine.cached_experts(),
+                                     engine.cached_gib(), (long long) engine.vram_free_mib(), ms_since(t0));
+                }
+            } else {
+                line = lines.pop();
+            }
         } else if (!lines.try_pop(line) && !(co_due > 0 && lines.pop_for(line, kCoWaitMs))) {
             co_due = 0;   // (they stopped coming: the slots go on)
             if (!step()) return 1;
@@ -1242,6 +1276,7 @@ int serve(Session& ss) {
         }
         if (line == "QUIT") break;
         if (line.empty()) continue;
+        served = served || line.rfind("GEN", 0) == 0 || line.rfind("BGEN", 0) == 0;
         // BSTOP <slot>: the slot ends with its next token.  BYIELD: a long read gives way to a shorter one in the
         // other engine only; this one reads it to its end.
         if (line.rfind("BSTOP ", 0) == 0) {
@@ -1321,7 +1356,8 @@ int serve(Session& ss) {
                 // The operator's resize is the one thing a freeze gives way to (STRATA_FREEZE_EXPERTS):
                 // the cache it leaves is what every request after reads, and stays frozen again.
                 engine.unfreeze_experts();
-                engine.resize_cache((int) reserve);
+                if (engine.elastic()) engine.elastic_resize((int) reserve);   // a piece at a time, not filled again
+                else engine.resize_cache((int) reserve);
                 engine.refreeze_experts();
                 const long long free_mib = (long long) engine.vram_free_mib();
                 std::fprintf(stderr, "strata-poly: VRAM %d MiB kept free: the expert cache %d -> %d of %d experts "
@@ -1924,6 +1960,10 @@ void usage() {
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
                  "                         when the PC's free RAM is within 4 GiB of the model's files, and then\n"
                  "                         kept whole; else half of it after the first request)\n"
+                 "  --vram-elastic         keep the whole reserve free while serving: the expert cache gives VRAM back\n"
+                 "                         when another program takes some (also while idle, every 2 s) and takes it\n"
+                 "                         again when it is free, the experts it gave up first (needs VMM; not with\n"
+                 "                         --vram-pool; STRATA_VRAM_WATCH=0: only at a request's start)\n"
                  "  --vram-pool            claim the card's VRAM once at load (what is free but for the reserve above,\n"
                  "                         which is then the margin left outside), keep it for the whole run and move\n"
                  "                         it between the expert cache and the attention caches as the context grows\n"
@@ -2148,6 +2188,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads") o.threads = std::atoi(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--vram-pool") o.vram_pool = true;
+        else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--expert-profile") o.profile = val();
         else if (a == "--pinned-session") pinned = val();
         else if (a == "--pin-dir") pin_dir = val();

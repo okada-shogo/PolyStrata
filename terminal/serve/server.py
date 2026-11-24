@@ -3894,13 +3894,13 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     if layer_split_of(cfg) and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
         args.append("--split-skip-if-fits")
     # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
-    # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512).  strata-poly
-    # has neither option and ends at one it does not know: its cache is resized by VRAM as it is (vram_elastic=1 in
-    # its INFO line)
-    if cfg.get("vram_elastic") is True and "--vram-elastic" not in args and not poly:
+    # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512).  strata-poly's
+    # cache is in VMM pieces already (64 MiB): its --vram-elastic keeps the whole reserve free while it serves, idle
+    # too, and it has no segment size (it ends at an option it does not know)
+    if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:
         args.append("--vram-elastic")
         seg = cfg.get("vram_segment_mib")
-        if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
+        if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args and not poly:
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
@@ -9704,6 +9704,8 @@ def apply_vision_defaults(cfg: dict) -> dict:
         return cfg
     cfg["vision"] = {**cfg["vision"], "elastic": True}
     if VISION_NO_RESERVE_BY_DEFAULT and cfg.get("backend") != "hip" and "vram_elastic" not in cfg:
+        if poly_engine(cfg):
+            return cfg                                 # strata-poly: its args as before (its "vram_elastic" is the person's choice)
         cfg["vram_elastic"] = True                     # the cache gives the reader its room when a picture comes; nothing is held back before
         return cfg
     args = list(cfg.get("args") or [])
@@ -9962,8 +9964,11 @@ def start_model(cfg: dict, tok, lazy: bool = False):
         engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=offline, batch_telemetry=batch_telemetry)
     engine.silence_s = silence                      # an attribute of its own: restart() keeps it
     warn_tight_ram(engine.info.get("arena_mib"))
+    # strata-poly can keep its whole reserve free while it serves (--vram-elastic, the config's "vram_elastic")
+    poly = poly_engine(cfg)
     note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
-                             linux_desktop()) if not groups and not split else None
+                             linux_desktop(), ("--vram-elastic" in engine.spawn[1]) if poly else None
+                             ) if not groups and not split else None
     if note:                                        # #560 #516: before --open starts a browser on that card
         print(note, flush=True)
     return engine, vision, sampling_defaults, effort_end, groups
