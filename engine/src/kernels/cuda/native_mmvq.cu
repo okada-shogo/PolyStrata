@@ -2087,30 +2087,18 @@ __global__ void native_mmvq_slots_warp_kernel(S slots, int n_in, int n_out) {
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 // ======================= HIP gfx11 / gfx12: decode GEMVs as virtual warps (gemv_vwarp_test) =======================
 //
-// The block kernels above (native_mmvq_slots_kernel, native_small_mmvq_many_kernel) run 4 warps a block, each lane
+// The block kernel above (native_small_mmvq_many_kernel) runs 4 warps a block, each lane
 // adding its terms in order, then the 3 other warps' sums are added through shared memory and a barrier, then one
 // warp_sum.  Here one wave does the four warps in turn: virtual warp v keeps its own sum t[v] (the lane's terms of the
 // block kernel's warp v, in the same order), and the sums are added v = 1, 2, 3 onto v = 0 and warp_summed: the same
 // floats in the same order, so every output is the same bits, with no shared memory and no barrier, and RW row groups
-// a wave.  On an RX 9070 XT (E3 of rx9070xt-e123.md) the expert gate|up read 355 -> 520 GB/s and the down 270 -> 422.
+// a wave.  Inkling 2 Mini's grouped q|k|v|gate|rel|sink Q8_0 launch: 40.6 -> 39.0 us on an RX 9070 XT (the expert
+// products' variants did not gain on this host and are not here).
 //
 // The term is written as d and sumi and accumulated explicitly: the traits' apply() gives the same bits, but its
 // codegen was up to 1.6x slower.  C = 1: an fma of d and sumi onto the sum; C = 2: a rounded product and then the add
 // (the compiler contracts both to the one fma the block kernels use; they differ in scheduling).
 template <typename F> struct VwSplit;
-template <> struct VwSplit<SmallTraits<IQ4NLBlock, 4>> {
-    using F = SmallTraits<IQ4NLBlock, 4>;
-    __device__ static void go(const F::W& r, const Q81Block* __restrict__ x, int iqs, float& d, int& sumi) {
-        const int* q8 = reinterpret_cast<const int*>(x->qs) + iqs;
-        sumi = 0;
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            sumi = STRATA_DP4A(r.v[i].x, q8[i], sumi);
-            sumi = STRATA_DP4A(r.v[i].y, q8[i + 4], sumi);
-        }
-        d = r.dw * __low2float(x->ds);
-    }
-};
 template <> struct VwSplit<SmallTraits<Q80Block, 8>> {
     using F = SmallTraits<Q80Block, 8>;
     __device__ static void go(const F::W& r, const Q81Block* __restrict__ x, int iqs, float& d, int& sumi) {
@@ -2130,65 +2118,6 @@ __device__ __forceinline__ float vw_term(float t, const typename F::Block* w, co
     VwSplit<F>::go(F::load(w, kqs), x, kqs, d, sumi);
     if constexpr (C == 1) return __fmaf_rn(d, float(sumi), t);
     else return __fadd_rn(t, __fmul_rn(d, float(sumi)));
-}
-
-// native_mmvq_slots_kernel's launch of several matrices: blockIdx.y the matrix; a wave takes RW groups of ROWS rows,
-// WPB waves a block.
-template <typename F, int ROWS, int RW, int WPB, int C, typename S>
-__launch_bounds__(WPB * WARP) __global__ void native_mmvq_slots_vw_kernel(S slots, int n_in, int n_out) {
-    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
-    const auto* w = static_cast<const typename F::Block*>(at.w);
-    const auto* x = static_cast<const Q81Block*>(at.x);
-    float* y = at.y;
-    const int lane = int(threadIdx.x);
-    const int g0 = (int(blockIdx.x) * WPB + int(threadIdx.y)) * RW;   // first row group of this wave
-    if (g0 * ROWS >= n_out) return;
-    const int bpr = n_in / F::DIV;
-    float t[RW][WARPS][ROWS];
-#pragma unroll
-    for (int r = 0; r < RW; ++r)
-#pragma unroll
-        for (int v = 0; v < WARPS; ++v)
-#pragma unroll
-            for (int i = 0; i < ROWS; ++i) t[r][v][i] = 0.0f;
-    for (int base = 0; base < bpr; base += F::BPI) {
-#pragma unroll
-        for (int v = 0; v < WARPS; ++v) {
-            const int tid = WARP * v + lane;
-            const int kbx = tid / F::T + base;
-            if (kbx >= bpr) continue;
-            const int kby = kbx * F::KBY;
-            const int kqs = F::kqs(tid);
-#pragma unroll
-            for (int r = 0; r < RW; ++r)
-#pragma unroll
-                for (int i = 0; i < ROWS; ++i) {
-                    const int row = (g0 + r) * ROWS + i;
-                    if (row < n_out) {
-                        const std::size_t block = std::size_t(row) * bpr + kbx;
-                        t[r][v][i] = vw_term<F, C>(t[r][v][i], w + block, x + kby, kqs);
-                    }
-                }
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < RW; ++r)
-#pragma unroll
-        for (int i = 0; i < ROWS; ++i) {
-            float s = t[r][0][i];
-#pragma unroll
-            for (int v = 1; v < WARPS; ++v) s += t[r][v][i];
-            s = warp_sum(s);
-            const int row = (g0 + r) * ROWS + i;
-            if (lane == i && row < n_out) y[row] = s;
-        }
-}
-
-template <typename F, int ROWS, int RW, int WPB, int C, typename S>
-void launch_slots_vw(const S& slots, int count, int n_in, int n_out, cudaStream_t s) {
-    const int groups = (n_out + ROWS - 1) / ROWS;
-    const dim3 blocks(unsigned((groups + RW * WPB - 1) / (RW * WPB)), unsigned(count));
-    native_mmvq_slots_vw_kernel<F, ROWS, RW, WPB, C, S><<<blocks, dim3(WARP, WPB), 0, s>>>(slots, n_in, n_out);
 }
 
 // native_small_mmvq_many_kernel<Q80Block, 8> of up to 8 matrices: a wave takes RW rows
@@ -2257,27 +2186,10 @@ bool vwarp_device_on() {
     return g_vwarp_force == 1 || !env_off;
 }
 
-// Inkling 2 Mini's expert shapes only (n_in 2304 gate|up, 1152 down; the two formats E3 measured): the variant per shape.
-template <typename F, typename S>
-bool launch_slots_vwarp(const S& slots, int count, int n_in, int n_out, cudaStream_t s) {
-    using IQ4 = SmallTraits<IQ4NLBlock, 4>;
-    using Q8 = SmallTraits<Q80Block, 8>;
-    if constexpr (std::is_same_v<F, IQ4>) {
-        if (n_in == 2304) { launch_slots_vw<F, 1, 1, 1, 1>(slots, count, n_in, n_out, s); return true; }
-        if (n_in == 1152) { launch_slots_vw<F, 2, 1, 8, 2>(slots, count, n_in, n_out, s); return true; }
-    } else if constexpr (std::is_same_v<F, Q8>) {
-        if (n_in == 2304) { launch_slots_vw<F, 1, 1, 1, 1>(slots, count, n_in, n_out, s); return true; }
-        if (n_in == 1152) { launch_slots_vw<F, 1, 2, 2, 1>(slots, count, n_in, n_out, s); return true; }
-    }
-    return false;
-}
 #endif
 
 template<typename F, typename S>
 void launch_slots(const S& slots, int count, int n_in, int n_out, cudaStream_t s) {
-#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-    if (vwarp_device_on() && n_in % 32 == 0 && launch_slots_vwarp<F>(slots, count, n_in, n_out, s)) return;
-#endif
     const dim3 threads(WARP, WARPS);
     if (native_mmvq_slots_wide() && n_in / F::DIV * F::T <= WARP && n_in % F::DIV == 0) {
         constexpr int ROWS = 2;
