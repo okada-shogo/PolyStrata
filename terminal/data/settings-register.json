@@ -34355,13 +34355,13 @@
    "reads": [
     {
      "file": "engine/src/poly/mmq_own.cu",
-     "line": 296,
+     "line": 302,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
    ],
    "parse": "flag",
-   "default_state": "off",
+   "default_state": "on",
    "code_default": null,
    "engine_sets": [],
    "engine_defaults": [],
@@ -34369,9 +34369,9 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [],
-   "status": "experimental",
+   "status": "default",
    "owner": "poly",
-   "note": "1: strata-poly's prompt products on the int8 kernel (i8_mma.cuh) on RDNA3/RDNA4 matrix cores (WMMA iu8), NVFP4 included unless STRATA_PREFILL_NVFP4 names a mode; unset: the FP16 tiles / BLAS loop as before (engine/src/poly/mmq_own.cu)",
+   "note": "strata-poly's prompt products on the int8 kernel (i8_mma.cuh) on AMD. Unset: the matrices the FP16 tiles do not take (K-quants on RDNA3, every type on RDNA4), which went to the per-expert dequantize + rocBLAS loop; 1/true/yes/on: every matrix the kernel takes; any other value (0, off, ...): none, the FP16 tiles and the BLAS loop as in 0.2.20-poly.4. NVFP4 goes with it unless STRATA_PREFILL_NVFP4 names a mode (engine/src/poly/mmq_own.cu)",
    "retire_after": "",
    "retired_in": "",
    "first_date": "2026-11-24",
