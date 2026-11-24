@@ -6,6 +6,7 @@
 // q81_div(): a block's scale divided as native_mmvq.cu's --use_fast_math division does it (q8_1_finite.hpp)
 #define STRATA_Q81_FASTMATH_DIV 1
 #include "inkling2_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/pdl.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 
@@ -685,6 +686,68 @@ bool fast_ctrl_on() {
     return g_fast_ctrl == 1;
 #endif
 }
+#if defined(__HIPCC__)
+// ink_ctrl_down_kernel for HIP gfx11 / gfx12 (kernels::native_gemv_vwarp_active): O outputs of one controller a block,
+// each its own product, with one norm shared.  The kernel above's thread t has the sums of its threads t and
+// t + kDownThreads (V = 2 here: virtual thread v of the block's 1024 sums i = v * kDownThreads + tid + 1024 k, as acc0
+// and acc1 do), the 32 warps' sums are added in their order: the same bits, with half the blocks' norm work and each
+// block streaming O rows (E3: 21.5 -> 15.8 us on an RX 9070 XT).
+template <typename W, int O>
+__global__ void __launch_bounds__(kDownThreads) ink_ctrl_down_vw_kernel(CtrlDown d, int n_embd, int rank) {
+    constexpr int V = 2;
+    __shared__ float pa[kCatThreads / WARP], pb[kCatThreads / WARP], part[O][32];
+    const int per = rank / O;   // blocks a controller
+    const int j = blockIdx.x / per, o0 = (blockIdx.x % per) * O, tid = threadIdx.x;
+    const size_t row = size_t(blockIdx.y) * n_embd;
+    const float* cur = d.cur[j] + row;
+    const float* msg = d.msg[j] + row;
+    if (tid < kCatThreads) {
+        float a, b;
+        cat_squares(cur, msg, n_embd, tid, a, b);
+        a = warp_sum(a);
+        b = warp_sum(b);
+        if ((tid & 31) == 0) pa[tid >> 5] = a, pb[tid >> 5] = b;
+    }
+    __syncthreads();
+    float sa = 0.0f, sb = 0.0f;
+    for (int k = 0; k < kCatThreads / WARP; ++k) sa += pa[k];
+    for (int k = 0; k < kCatThreads / WARP; ++k) sb += pb[k];
+    const float ia = cat_scale(sa, n_embd), ib = cat_scale(sb, n_embd);
+    const int n_in = 2 * n_embd;
+    float acc[O][V];
+#pragma unroll
+    for (int q = 0; q < O; ++q)
+#pragma unroll
+        for (int v = 0; v < V; ++v) acc[q][v] = 0.0f;
+    for (int b0 = 0; b0 < n_in; b0 += V * kDownThreads) {
+#pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const int i = b0 + v * kDownThreads + tid;
+            if (i < n_in) {
+                const float xi = i < n_embd ? cur[i] * ia : msg[i - n_embd] * ib;
+#pragma unroll
+                for (int q = 0; q < O; ++q) {
+                    const W* __restrict__ wr = static_cast<const W*>(d.w[j]) + size_t(o0 + q) * n_in;
+                    acc[q][v] += wval(wr, i) * xi;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < O; ++q)
+#pragma unroll
+        for (int v = 0; v < V; ++v) {
+            const float sv = warp_sum(acc[q][v]);
+            if ((tid & 31) == 0) part[q][(v * kDownThreads + tid) >> 5] = sv;
+        }
+    __syncthreads();
+    if (tid < O) {
+        float sum = 0.0f;
+        for (int k = 0; k < 2 * kDownThreads / WARP; ++k) sum += part[tid][k];
+        d.y[j][size_t(blockIdx.y) * rank + o0 + tid] = sum;
+    }
+}
+#endif
 
 struct GateSet {
     const float* cur[kSet];
@@ -2914,6 +2977,16 @@ bool ink_ctrl_down(const float* const* cur, const float* const* msg, const void*
         launched("ink_ctrl_down_fast");
         return true;
     }
+#if defined(__HIPCC__)
+    if (rank % 2 == 0 && strata::kernels::native_gemv_vwarp_active()) {
+        if (bf16)
+            ink_ctrl_down_vw_kernel<uint16_t, 2><<<dim3(count * rank / 2, rows), dim3(kDownThreads), 0, cs(stream)>>>(d, n_embd, rank);
+        else
+            ink_ctrl_down_vw_kernel<float, 2><<<dim3(count * rank / 2, rows), dim3(kDownThreads), 0, cs(stream)>>>(d, n_embd, rank);
+        launched("ink_ctrl_down");
+        return true;
+    }
+#endif
     if (bf16)
         launch_pdl(ink_ctrl_down_kernel<uint16_t>, dim3(count * rank, rows), dim3(kDownThreads), 0, cs(stream), d,
                    n_embd, rank);

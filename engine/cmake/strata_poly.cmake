@@ -272,6 +272,11 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
                                                       ${_strata_gpu_include_directories})
   target_link_libraries(poly_norm_q8_test PRIVATE strata_kernels ${_strata_gpu_blas_target}
                                                   ${_strata_gpu_runtime_target})
+  # the HIP gfx11 / gfx12 virtual-warp decode GEMVs against the block kernels, byte for byte; needs a card, run by hand
+  add_executable(poly_gemv_vwarp_test src/poly/gemv_vwarp_test.cu src/poly/inkling2.cu src/poly/kernels.cu)
+  target_include_directories(poly_gemv_vwarp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                         ${_strata_gpu_include_directories})
+  target_link_libraries(poly_gemv_vwarp_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # a prompt batch's products with few outputs against the same sums on the host; needs a card, run by hand
   add_executable(poly_gemm_small_test src/poly/gemm_small_test.cu src/poly/kernels.cu)
   target_include_directories(poly_gemm_small_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
