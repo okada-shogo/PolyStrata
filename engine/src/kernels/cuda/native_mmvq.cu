@@ -2119,6 +2119,79 @@ template<> constexpr bool kSlotsLanesFaster<Q5KTraits> = false;
 template<> constexpr bool kSlotsLanesFaster<Q6KTraits> = false;
 #endif
 
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+// ======================= HIP gfx11 / gfx12: decode GEMVs as virtual warps (gemv_vwarp_test) =======================
+//
+// The block kernel above (native_small_mmvq_many_kernel) runs 4 warps a block, each lane
+// adding its terms in order, then the 3 other warps' sums are added through shared memory and a barrier, then one
+// warp_sum.  Here one wave does the four warps in turn: virtual warp v keeps its own sum t[v] (the lane's terms of the
+// block kernel's warp v, in the same order), and the sums are added v = 1, 2, 3 onto v = 0 and warp_summed: the same
+// floats in the same order, so every output is the same bits, with no shared memory and no barrier, and RW row groups
+// a wave.  Inkling 2 Mini's grouped q|k|v|gate|rel|sink Q8_0 launch: 40.6 -> 39.0 us on an RX 9070 XT (the expert
+// products' variants did not gain on this host and are not here).
+//
+// The term is written as d and sumi and accumulated with an explicit fma onto the sum: the traits' apply() gives the same
+// bits, but its codegen was up to 1.6x slower.  The block kernels' `tmp += apply()` is the same one fma (d = d0 * d1
+// first, then fma(d, sumi, tmp)), which the byte compare in gemv_vwarp_test checks.
+__device__ __forceinline__ float vw_q8_0_term(float t, const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, int kqs) {
+    const auto r = SmallTraits<Q80Block, 8>::load(w, kqs);
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) sumi = STRATA_DP4A(r.v[i], reinterpret_cast<const int*>(x->qs)[kqs + i], sumi);
+    return __fmaf_rn(r.d0 * __low2float(x->ds), float(sumi), t);
+}
+
+// native_small_mmvq_many_kernel<Q80Block, 8> of up to 8 matrices: a wave (WPB = 4 a block) takes one row
+__launch_bounds__(4 * WARP) __global__ void native_q8_0_many_vw_kernel(MmvqMany a, int n_in, int total) {
+    using F = SmallTraits<Q80Block, 8>;
+    const int lane = int(threadIdx.x);
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    if (row >= total) return;
+    int m = 0;
+    while (row >= a.first[m + 1]) ++m;
+    const int mrow = row - a.first[m];
+    const int bpr = n_in / 32;
+    const Q80Block* wr = static_cast<const Q80Block*>(a.w[m]) + std::size_t(mrow) * bpr;
+    const Q81Block* xr = a.x[m];
+    float t[WARPS] = {};
+    for (int base = 0; base < bpr; base += F::BPI) {
+#pragma unroll
+        for (int v = 0; v < WARPS; ++v) {
+            const int tid = WARP * v + lane;
+            const int kbx = tid / F::T + base;
+            if (kbx >= bpr) continue;
+            t[v] = vw_q8_0_term(t[v], wr + kbx, xr + kbx, F::kqs(tid));
+        }
+    }
+    float s = t[0];
+#pragma unroll
+    for (int v = 1; v < WARPS; ++v) s += t[v];
+    s = warp_sum(s);
+    if (lane == 0) a.y[m][mrow] = s;
+}
+
+// Whether the current device takes the virtual-warp kernels (this block is HIP-only: __HIPCC__ and not STRATA_HIP_GFX906): gfx11xx / gfx12xx, and not STRATA_GEMV_VWARP=0.
+int g_vwarp_force = -1;
+bool vwarp_device_on() {
+    static signed char arch_ok[16];   // per device: 0 unknown, 1 not gfx11xx / gfx12xx, 2 it is
+    if (g_vwarp_force == 0) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
+    if (arch_ok[dev] == 0) {
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;   // not cached; the error stays for the caller
+        arch_ok[dev] = strata::kernels::gfx_arch_is_rdna34(p.gcnArchName) ? 2 : 1;
+    }
+    if (arch_ok[dev] != 2) return false;
+    static const bool env_off = [] {
+        const char* v = std::getenv("STRATA_GEMV_VWARP");
+        return v != nullptr && v[0] == '0';
+    }();
+    return g_vwarp_force == 1 || !env_off;
+}
+
+#endif
+
 template<typename F, typename S>
 void launch_slots(const S& slots, int count, int n_in, int n_out, cudaStream_t s) {
     const dim3 threads(WARP, WARPS);
@@ -4434,6 +4507,14 @@ void native_mmvq_many(int ggml_type, const NativeMmvqMany& m, int n_in, void* st
     for (int j = m.count; j < 8; ++j) a.first[j + 1] = a.first[m.count];
     const dim3 grid(unsigned(a.first[m.count])), threads(WARP, WARPS);
     const auto s = static_cast<cudaStream_t>(stream);
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (ggml_type == 8 && n_in == 2304 && vwarp_device_on()) {   // Inkling 2 Mini's q|k|v|gate|rel|sink launch
+        const int total = a.first[m.count];
+        native_q8_0_many_vw_kernel<<<unsigned((total + 3) / 4), dim3(WARP, 4), 0, s>>>(a, n_in, total);
+        launch_check();
+        return;
+    }
+#endif
     switch (ggml_type) {
     case 2: native_small_mmvq_many_kernel<Q40Block, 4><<<grid, threads, 0, s>>>(a, n_in); break;
     case 6: native_small_mmvq_many_kernel<Q50Block, 4><<<grid, threads, 0, s>>>(a, n_in); break;
@@ -4723,6 +4804,22 @@ void launch_slots_of(int ggml_type, const S& slots, int count, int n_in, int n_o
 }
 
 }  // namespace
+
+bool native_gemv_vwarp_active() {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    return vwarp_device_on();
+#else
+    return false;
+#endif
+}
+
+void native_gemv_vwarp_force(int mode) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    g_vwarp_force = mode;
+#else
+    (void) mode;
+#endif
+}
 
 bool native_mmvq_slots_wide() {
     static const bool on = [] {
