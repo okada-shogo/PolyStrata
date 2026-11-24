@@ -34255,6 +34255,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_POLY_F32_AUTOTUNE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 4506,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "rollback",
+   "owner": "poly",
+   "note": "[reviewed] 0, off, no or false (any case): Inkling 2's prompt F32 products of 33 to 256 outputs take the cost model's tile instead of the ways timed at load and cached (gemm_f32_tiles_autotune()); the same bits either way; unset or any other value: on",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_POLY_F32_TUNE_CACHE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 4517,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "opt-in",
+   "owner": "poly",
+   "note": "[reviewed] a file path: where the F32 tile picks timed at load are cached; unset: PolyStrata-data/cache/f32-tiles.txt beside the model, else the user's cache folder",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_POLY_HIP_GROUPED",
    "backends": [
     "cuda-hip"
