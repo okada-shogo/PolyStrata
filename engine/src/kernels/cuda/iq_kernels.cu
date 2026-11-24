@@ -8461,7 +8461,7 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
 }
 
 }  // namespace strata::kernels
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)   // (i8_mma.cu is empty there; the other HIP builds have it on RDNA3 / RDNA4)
 namespace strata::kernels {
 bool gemm_iq_i8_takes(int, int) { return false; }
 void gemm_iq_i8_turing(bool) {}

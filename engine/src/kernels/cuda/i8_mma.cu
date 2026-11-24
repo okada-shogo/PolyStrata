@@ -2,10 +2,14 @@
 // include/strata/kernels/iq_kernels.hpp; the kernel is i8_mma.cuh).  A file of their own so that a change to them
 // builds without iq_kernels.cu.  The weight sub-blocks are decoded by i8_expert.cuh, which this file includes as
 // iq_kernels.cu does, in an anonymous namespace (only what i8_mma.cuh instantiates of it is compiled here).
-// CUDA only: a HIP build compiles this file empty and takes iq_kernels.cu's stubs.
-#if !defined(__HIPCC__)
+// HIP: RDNA3 and RDNA4 (i8_mma.cuh's i8m_wmma); a gfx906 build (wave64) compiles this file empty and takes
+// iq_kernels.cu's stubs.
+#if !defined(STRATA_HIP_GFX906)
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
+#if defined(__HIPCC__)
+#include "strata/kernels/gfx_arch.hpp"
+#endif
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

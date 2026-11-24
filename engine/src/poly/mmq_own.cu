@@ -32,6 +32,8 @@
 // block-scaled FP4 tensor cores instead, the activations two FP4 terms under a float a row (nvfp4_x2.hpp, about 8
 // bits against a half's 11), its products straight to dst's rows and its rows read by index as the int8 ones are.
 // NVFP4 takes the int8 kernel only with STRATA_PREFILL_NVFP4=w4a8 (nvfp4_w4a8()), on any card that has it.
+//
+// HIP with STRATA_POLY_HIP_INT8=1 (hip_int8()): the int8 kernel on RDNA3 / RDNA4 too, NVFP4 included, as on Ampere.
 #include "mmq.hpp"
 #if STRATA_POLY_X2
 #include "nvfp4_x2.hpp"
@@ -284,9 +286,38 @@ bool nvfp4_w4a8() {
     return asked;
 }
 
+#ifdef STRATA_MMQ_OWN_HIP
+// STRATA_POLY_HIP_INT8=1 (or true / yes / on): the int8 kernel on RDNA3's and RDNA4's matrix cores (i8_mma.cuh's i8m_wmma), for the types
+// and rows it takes, in place of the FP16 tiles or the BLAS loop.  Opt-in: the activations int8 a 32 values where
+// the halves keep 11 bits, as on CUDA's Ampere and newer by default (the same kernel's numbers, bit for bit).  NVFP4
+// goes with it unless STRATA_PREFILL_NVFP4 names a mode (w4a8: the same; any other: the halves).
+bool hip_int8() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_POLY_HIP_INT8");
+        std::string v(e ? e : "");
+        for (char& ch : v) ch = (char) std::tolower((unsigned char) ch);
+        return v == "1" || v == "true" || v == "yes" || v == "on";
+    }();
+    return on;
+}
+bool nvfp4_default() {
+    static const bool unset = [] {
+        const char* v = std::getenv("STRATA_PREFILL_NVFP4");
+        return !v || !*v;
+    }();
+    return unset;
+}
+#endif
+
 // the int8 kernel takes a matrix of this type with rows this long, whatever their number
 bool int8_rows(int t, int64_t cols) {
-    return !blas_only() && cols <= 0x7fffffff && (t != 40 || nvfp4_w4a8()) && kernels::gemm_iq_i8_takes(t, (int) cols);
+#ifdef STRATA_MMQ_OWN_HIP
+    if (!hip_int8()) return false;
+    const bool nv4 = nvfp4_w4a8() || nvfp4_default();
+#else
+    const bool nv4 = nvfp4_w4a8();
+#endif
+    return !blas_only() && cols <= 0x7fffffff && (t != 40 || nv4) && kernels::gemm_iq_i8_takes(t, (int) cols);
 }
 
 // the rows' halves, then a float a row (back)

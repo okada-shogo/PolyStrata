@@ -23817,6 +23817,66 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_MMQ_TEST_DUMP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/mmq_paths_test.cu",
+     "line": 83,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "poly",
+   "note": "test only: poly_mmq_paths_test writes each int8 product's floats to DIR/<type>_<K>_<case>.bin and the inputs' hashes to DIR/inputs.txt, to compare CUDA's and HIP's int8 tiles bit for bit (engine/src/poly/mmq_paths_test.cu)",
+   "retire_after": "",
+   "retired_in": "",
+   "first_date": "2026-11-24",
+   "last_date": "2026-11-24"
+  },
+  {
+   "name": "STRATA_MMQ_TEST_REF",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/mmq_paths_test.cu",
+     "line": 87,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "poly",
+   "note": "test only: poly_mmq_paths_test compares each int8 product's bytes with DIR's file of the same name (another card's STRATA_MMQ_TEST_DUMP) and fails where one is missing or differs (engine/src/poly/mmq_paths_test.cu)",
+   "retire_after": "",
+   "retired_in": "",
+   "first_date": "2026-11-24",
+   "last_date": "2026-11-24"
+  },
+  {
    "name": "STRATA_MMQ_TIER_SORT",
    "backends": [
     "cuda-hip"
@@ -34286,6 +34346,36 @@
    "note": "[reviewed] strata-poly's prompt expert products on AMD's matrix cores (gemm_iq_f16_grouped). Unset: on for gfx11 (RDNA3), off for gfx12 (RDNA4); 1/true/yes/on: on for both (gfx12's opt-in); any other value (0, off, ...): off for both (the per-expert rocBLAS loop) (engine/src/poly/mmq_own.cu:133)",
    "retire_after": "",
    "retired_in": ""
+  },
+  {
+   "name": "STRATA_POLY_HIP_INT8",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/mmq_own.cu",
+     "line": 296,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "experimental",
+   "owner": "poly",
+   "note": "1: strata-poly's prompt products on the int8 kernel (i8_mma.cuh) on RDNA3/RDNA4 matrix cores (WMMA iu8), NVFP4 included unless STRATA_PREFILL_NVFP4 names a mode; unset: the FP16 tiles / BLAS loop as before (engine/src/poly/mmq_own.cu)",
+   "retire_after": "",
+   "retired_in": "",
+   "first_date": "2026-11-24",
+   "last_date": "2026-11-24"
   },
   {
    "name": "STRATA_POLY_MIRROR",
