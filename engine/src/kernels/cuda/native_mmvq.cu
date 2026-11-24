@@ -2095,77 +2095,47 @@ __global__ void native_mmvq_slots_warp_kernel(S slots, int n_in, int n_out) {
 // a wave.  Inkling 2 Mini's grouped q|k|v|gate|rel|sink Q8_0 launch: 40.6 -> 39.0 us on an RX 9070 XT (the expert
 // products' variants did not gain on this host and are not here).
 //
-// The term is written as d and sumi and accumulated explicitly: the traits' apply() gives the same bits, but its
-// codegen was up to 1.6x slower.  C = 1: an fma of d and sumi onto the sum; C = 2: a rounded product and then the add
-// (the compiler contracts both to the one fma the block kernels use; they differ in scheduling).
-template <typename F> struct VwSplit;
-template <> struct VwSplit<SmallTraits<Q80Block, 8>> {
-    using F = SmallTraits<Q80Block, 8>;
-    __device__ static void go(const F::W& r, const Q81Block* __restrict__ x, int iqs, float& d, int& sumi) {
-        sumi = 0;
+// The term is written as d and sumi and accumulated with an explicit fma onto the sum: the traits' apply() gives the same
+// bits, but its codegen was up to 1.6x slower.  The block kernels' `tmp += apply()` is the same one fma (d = d0 * d1
+// first, then fma(d, sumi, tmp)), which the byte compare in gemv_vwarp_test checks.
+__device__ __forceinline__ float vw_q8_0_term(float t, const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, int kqs) {
+    const auto r = SmallTraits<Q80Block, 8>::load(w, kqs);
+    int sumi = 0;
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const int u = reinterpret_cast<const int*>(x->qs)[iqs + i];
-            sumi = STRATA_DP4A(r.v[i], u, sumi);
-        }
-        d = r.d0 * __low2float(x->ds);
-    }
-};
-template <typename F, int C>
-__device__ __forceinline__ float vw_term(float t, const typename F::Block* w, const Q81Block* x, int kqs) {
-    float d;
-    int sumi;
-    VwSplit<F>::go(F::load(w, kqs), x, kqs, d, sumi);
-    if constexpr (C == 1) return __fmaf_rn(d, float(sumi), t);
-    else return __fadd_rn(t, __fmul_rn(d, float(sumi)));
+    for (int i = 0; i < 2; ++i) sumi = STRATA_DP4A(r.v[i], reinterpret_cast<const int*>(x->qs)[kqs + i], sumi);
+    return __fmaf_rn(r.d0 * __low2float(x->ds), float(sumi), t);
 }
 
-// native_small_mmvq_many_kernel<Q80Block, 8> of up to 8 matrices: a wave takes RW rows
-template <int RW, int WPB, int C>
-__launch_bounds__(WPB * WARP) __global__ void native_q8_0_many_vw_kernel(MmvqMany a, int n_in, int total) {
+// native_small_mmvq_many_kernel<Q80Block, 8> of up to 8 matrices: a wave (WPB = 4 a block) takes one row
+__launch_bounds__(4 * WARP) __global__ void native_q8_0_many_vw_kernel(MmvqMany a, int n_in, int total) {
     using F = SmallTraits<Q80Block, 8>;
     const int lane = int(threadIdx.x);
-    const int r0 = (int(blockIdx.x) * WPB + int(threadIdx.y)) * RW;
-    if (r0 >= total) return;
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    if (row >= total) return;
+    int m = 0;
+    while (row >= a.first[m + 1]) ++m;
+    const int mrow = row - a.first[m];
     const int bpr = n_in / 32;
-    float t[RW][WARPS];
-    const Q80Block* wr[RW];
-    const Q81Block* xr[RW];
-    int mrow[RW], mm[RW];
-#pragma unroll
-    for (int r = 0; r < RW; ++r) {
-        const int g = min(r0 + r, total - 1);
-        int m = 0;
-        while (g >= a.first[m + 1]) ++m;
-        mm[r] = m;
-        mrow[r] = g - a.first[m];
-        wr[r] = static_cast<const Q80Block*>(a.w[m]) + std::size_t(mrow[r]) * bpr;
-        xr[r] = a.x[m];
-#pragma unroll
-        for (int v = 0; v < WARPS; ++v) t[r][v] = 0.0f;
-    }
+    const Q80Block* wr = static_cast<const Q80Block*>(a.w[m]) + std::size_t(mrow) * bpr;
+    const Q81Block* xr = a.x[m];
+    float t[WARPS] = {};
     for (int base = 0; base < bpr; base += F::BPI) {
 #pragma unroll
         for (int v = 0; v < WARPS; ++v) {
             const int tid = WARP * v + lane;
             const int kbx = tid / F::T + base;
             if (kbx >= bpr) continue;
-            const int kqs = F::kqs(tid);
-#pragma unroll
-            for (int r = 0; r < RW; ++r) t[r][v] = vw_term<F, C>(t[r][v], wr[r] + kbx, xr[r] + kbx, kqs);
+            t[v] = vw_q8_0_term(t[v], wr + kbx, xr + kbx, F::kqs(tid));
         }
     }
+    float s = t[0];
 #pragma unroll
-    for (int r = 0; r < RW; ++r) {
-        float s = t[r][0];
-#pragma unroll
-        for (int v = 1; v < WARPS; ++v) s += t[r][v];
-        s = warp_sum(s);
-        if (lane == 0 && r0 + r < total) a.y[mm[r]][mrow[r]] = s;
-    }
+    for (int v = 1; v < WARPS; ++v) s += t[v];
+    s = warp_sum(s);
+    if (lane == 0) a.y[m][mrow] = s;
 }
 
-// Whether the current device takes the virtual-warp kernels: gfx11xx / gfx12xx, and not STRATA_GEMV_VWARP=0.
+// Whether the current device takes the virtual-warp kernels (this block is HIP-only: __HIPCC__ and not STRATA_HIP_GFX906): gfx11xx / gfx12xx, and not STRATA_GEMV_VWARP=0.
 int g_vwarp_force = -1;
 bool vwarp_device_on() {
     static signed char arch_ok[16];   // per device: 0 unknown, 1 not gfx11xx / gfx12xx, 2 it is
@@ -2174,9 +2144,8 @@ bool vwarp_device_on() {
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
     if (arch_ok[dev] == 0) {
         cudaDeviceProp p;
-        const bool arch = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_rdna34(p.gcnArchName);
-        (void) cudaGetLastError();
-        arch_ok[dev] = arch ? 2 : 1;
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;   // not cached; the error stays for the caller
+        arch_ok[dev] = strata::kernels::gfx_arch_is_rdna34(p.gcnArchName) ? 2 : 1;
     }
     if (arch_ok[dev] != 2) return false;
     static const bool env_off = [] {
@@ -4484,7 +4453,7 @@ void native_mmvq_many(int ggml_type, const NativeMmvqMany& m, int n_in, void* st
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     if (ggml_type == 8 && n_in == 2304 && vwarp_device_on()) {   // Inkling 2 Mini's q|k|v|gate|rel|sink launch
         const int total = a.first[m.count];
-        native_q8_0_many_vw_kernel<1, 4, 2><<<unsigned((total + 3) / 4), dim3(WARP, 4), 0, s>>>(a, n_in, total);
+        native_q8_0_many_vw_kernel<<<unsigned((total + 3) / 4), dim3(WARP, 4), 0, s>>>(a, n_in, total);
         launch_check();
         return;
     }
