@@ -16649,13 +16649,13 @@
   {
    "name": "STRATA_INK_KERNEL_TABLES",
    "backends": [
-    "cuda"
+    "cuda-hip"
    ],
    "reads": [
     {
      "file": "engine/src/poly/inkling2.cpp",
      "line": 102,
-     "backend": "cuda",
+     "backend": "cuda-hip",
      "fn": "getenv"
     }
    ],

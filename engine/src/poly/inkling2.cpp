@@ -208,10 +208,10 @@ void Inkling2::load_geometry() {
     // the cached experts' IQ3_S / IQ3_XXS and IQ1_S / IQ2_* products through the kernels that keep all lanes busy (CUDA;
     // the same bits)
     lane_slots_ = true;
-#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+#if !defined(STRATA_GPU_METAL)
     // In a prompt's read of several calls, a call's row tables go to the card by a kernel, not behind the experts'
     // copies (kernel_tables_).  The same tables reach the same buffers, so the results are the same.  Measured on
-    // CUDA only; STRATA_INK_KERNEL_TABLES=0 turns it off.
+    // CUDA and on AMD (RX 7900 XT, RX 9070 XT); STRATA_INK_KERNEL_TABLES=0 turns it off.
     {
         const char* v = std::getenv("STRATA_INK_KERNEL_TABLES");
         kernel_tables_ = !(v && std::string(v) == "0");
