@@ -39,6 +39,17 @@ bool native_mmvq_multi_exact();
 void native_mmvq_set_b6_rows(int mode);
 int native_mmvq_b6_rows();
 
+/// HIP gfx11 / gfx12 (RDNA3, RDNA4) only: decode GEMVs written as "virtual warps" (a wave does the block kernel's four
+/// warps in turn, each into its own sum, added in the block's warp order; no shared memory, no barrier, one or two
+/// rows a wave) for Inkling 2 Mini's shapes: the expert gate|up and down (IQ4_NL, Q8_0; n_in 2304 or 1152) through
+/// native_mmvq_slots(), the grouped dense Q8_0 launch (native_mmvq_many, n_in 2304) and the loop controllers' down
+/// product (ink_ctrl_down).  Every output is bitwise the block kernels' (gemv_vwarp_test).  True where the current
+/// device takes them: a HIP build, a gfx11xx / gfx12xx card, STRATA_GEMV_VWARP not "0".  Always false on CUDA, on
+/// other HIP cards and on the gfx906 build.
+bool native_gemv_vwarp_active();
+/// Tests: -1 (default) the rule above, 0 off, 1 on where the device and the build allow it.
+void native_gemv_vwarp_force(int mode);
+
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does
 // not reconstruct that sum from the quantized integers.

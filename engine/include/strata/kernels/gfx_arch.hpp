@@ -48,4 +48,11 @@ inline bool gfx_arch_is_gfx1151(const char* gcn) { return gfx_arch_is(gcn, "gfx1
 /// RDNA4 (Radeon AI PRO R9700 = gfx1201, RX 9070 / 9070 XT = gfx1201, RX 9060 = gfx1200).
 inline bool gfx_arch_is_gfx12(const char* gcn) { return gfx_arch_is(gcn, "gfx1200") || gfx_arch_is(gcn, "gfx1201"); }
 
+/// RDNA3 / RDNA3.5 / RDNA4 (every gfx11xx and gfx12xx part): wave32, no matrix-core requirement.  The decode GEMV
+/// kernels without shared memory or barriers (native_gemv_vwarp_active) are chosen for these.
+inline bool gfx_arch_is_rdna34(const char* gcn) {
+    return gcn != nullptr && gcn[0] == 'g' && gcn[1] == 'f' && gcn[2] == 'x' &&
+           ((gcn[3] == '1' && gcn[4] == '1') || (gcn[3] == '1' && gcn[4] == '2')) && gcn[5] >= '0' && gcn[5] <= '9';
+}
+
 }  // namespace strata::kernels
