@@ -11471,6 +11471,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_GEMV_VWARP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cuda/native_mmvq.cu",
+     "line": 2147,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "a1c75b5123",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "61c6809c3a",
+   "last_date": "2026-11-24",
+   "status": "rollback",
+   "owner": "",
+   "note": "HIP on gfx11xx and gfx12xx (not the gfx906 build): 0 goes back to the earlier kernels for the grouped Q8_0 decode GEMV and ink_ctrl_down instead of the virtual-warp ones (same bits).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_GFX1030_EXP8",
    "backends": [
     "hip"
