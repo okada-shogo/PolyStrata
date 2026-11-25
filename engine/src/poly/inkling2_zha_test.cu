@@ -1,10 +1,12 @@
 // src/poly/inkling2_zha_test.cu - the ZHA index's prompt kernels (inkling2_zha.cu) against a CPU reference: the chunk
-// scores (zha_score_kernel on NVIDIA, zha_score_scalar_kernel on AMD), the exact keys (zha_exact_kernel /
-// zha_exact_scalar_kernel) and the tail (zha_tail_mma_kernel / zha_tail_scalar_kernel), on one KV group of Inkling 2
-// Mini's shape with random inputs.  The reference rounds where the kernels do (the queries, keys, values and weights
-// in fp16) and sums in double, so what is left is the order of the kernels' fp32 sums.
-// inkling2_zha_test [--dump FILE]: FILE gets every output (score, rstar, top, the exact and the tail parts) raw, to
-// compare two builds.  Exit 0 all within the tolerances, 1 not, 77 no GPU.
+// scores (zha_score_kernel on NVIDIA, zha_score_scalar_kernel and zha_score_wmma_kernel on AMD), the exact keys
+// (zha_exact_kernel / zha_exact_scalar_kernel, zha_exact_wmma_kernel) and the tail (zha_tail_mma_kernel /
+// zha_tail_scalar_kernel), on one KV group of Inkling 2 Mini's shape with random inputs.  On AMD both paths run: the
+// scalar kernels everywhere, the matrix-core ones too on a card that has them (gfx11 / gfx12, zha_wmma_card()).  The
+// reference rounds where the kernels do (the queries, keys, values and weights in fp16) and sums in double, so what is
+// left is the order of the kernels' fp32 sums.
+// inkling2_zha_test [--dump FILE]: FILE gets every output (score, rstar, top, the exact and the tail parts) of the
+// path the engine runs on this card raw, to compare two builds.  Exit 0 all within the tolerances, 1 not, 77 no GPU.
 #include "inkling2_zha.cu"
 
 #include <cstdio>
@@ -160,40 +162,72 @@ int main(int argc, char** argv) {
     float* d_bias = up(bias);
     const int blocks = (kRows + kZhaTokens - 1) / kZhaTokens, words = kMax / 32;
     uint32_t* d_bits = up(std::vector<uint32_t>((size_t) blocks * words, 0));
-    float* d_part = up(std::vector<float>((size_t) kRows * kPer * kSegs * 130, 0.f));
+    const size_t n_part = (size_t) kRows * kPer * kSegs * 130;
+    float* d_part = up(std::vector<float>(n_part, 0.f));
     zha_bits_kernel<<<dim3(blocks, grid(words, 128)), 128>>>(d_sel, 1, hs, kRows, kMax, d_bits, words, nullptr);
+    // a path's outputs: 0 the tensor cores (NVIDIA) or the scalar kernels (AMD), 1 the matrix cores (AMD)
+    struct Out {
+        const char* name;
+        std::vector<float> score;
+        std::vector<uint8_t> rstar;
+        std::vector<float> top, part;
+    };
+    const auto run = [&](int path) {
+        ck(cudaMemset(d_score, 0, kPer * hs * sizeof(float)), "memset");
+        ck(cudaMemset(d_rstar, 0, kPer * hs), "memset");
+        ck(cudaMemset(d_top, 0xFF, kPer * kRows * sizeof(float)), "memset");
+        ck(cudaMemset(d_part, 0, n_part * sizeof(float)), "memset");
 #if defined(__HIPCC__)
-    zha_score_scalar_kernel<4><<<dim3(blocks, 3), kZhaScalarThreads>>>(d_q, d_kh, d_bh, kBuilt, kMax, kRows, kHeads, kG,
-                                                                     kPer, d_score, d_rstar, hs, q8n, kPos, kC, kRecent,
-                                                                     d_top);
-    zha_exact_scalar_kernel<<<dim3(blocks, kSplit), kZhaScalarThreads>>>(
-        d_q, stage, d_cmap, ring, kRing, d_sel, 1, hs, kMax, kPos, kRows, kHeads, kG, kPer, kC, kRecent, d_bias,
-        kExtent, d_part, kSegs, d_bits, words);
-    zha_tail_scalar_kernel<4><<<dim3(blocks, kTsplit), kZhaScalarThreads>>>(
-        d_ts, d_sel, d_tr, d_vh, kMax, kPos, kRows, kG, kPer, kC, kRecent, hs, 1, d_part, kSegs, kSplit, q8n);
+        const char* name = path ? "wmma" : "scalar";
+        if (path) {
+            zha_score_wmma_kernel<4><<<dim3(blocks, 3), kZhaWarps * 32>>>(d_q, d_kh, d_bh, kBuilt, kMax, kRows, kHeads,
+                                                                           kG, kPer, d_score, d_rstar, hs, q8n, kPos, kC,
+                                                                           kRecent, d_top);
+            zha_exact_wmma_kernel<<<dim3(blocks, kSplit), kZhaWarps * 32>>>(
+                d_q, stage, d_cmap, ring, kRing, d_sel, 1, hs, kMax, kPos, kRows, kHeads, kG, kPer, kC, kRecent, d_bias,
+                kExtent, d_part, kSegs, d_bits, words);
+        } else {
+            zha_score_scalar_kernel<4><<<dim3(blocks, 3), kZhaScalarThreads>>>(d_q, d_kh, d_bh, kBuilt, kMax, kRows,
+                                                                             kHeads, kG, kPer, d_score, d_rstar, hs, q8n,
+                                                                             kPos, kC, kRecent, d_top);
+            zha_exact_scalar_kernel<<<dim3(blocks, kSplit), kZhaScalarThreads>>>(
+                d_q, stage, d_cmap, ring, kRing, d_sel, 1, hs, kMax, kPos, kRows, kHeads, kG, kPer, kC, kRecent, d_bias,
+                kExtent, d_part, kSegs, d_bits, words);
+        }
+        zha_tail_scalar_kernel<4><<<dim3(blocks, kTsplit), kZhaScalarThreads>>>(
+            d_ts, d_sel, d_tr, d_vh, kMax, kPos, kRows, kG, kPer, kC, kRecent, hs, 1, d_part, kSegs, kSplit, q8n);
 #else
-    zha_score_kernel<4><<<dim3(blocks, 3), kZhaWarps * 32>>>(d_q, d_kh, d_bh, kBuilt, kMax, kRows, kHeads, kG, kPer,
-                                                              d_score, d_rstar, hs, q8n, kPos, kC, kRecent, d_top);
-    ck(cudaFuncSetAttribute(zha_exact_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * kZhaRaw), "attribute");
-    zha_exact_kernel<<<dim3(blocks, kSplit), kZhaWarps * 32, 2 * kZhaRaw>>>(
-        d_q, stage, d_cmap, ring, kRing, d_sel, 1, hs, kMax, kPos, kRows, kHeads, kG, kPer, kC, kRecent, d_bias,
-        kExtent, d_part, kSegs, d_bits, words);
-    zha_tail_mma_kernel<4><<<dim3(blocks, kTsplit), kZhaWarps * 32>>>(d_ts, d_sel, d_tr, d_vh, kMax, kPos, kRows, kG,
-                                                                     kPer, kC, kRecent, hs, 1, d_part, kSegs, kSplit, q8n);
+        const char* name = "mma";
+        (void) path;
+        zha_score_kernel<4><<<dim3(blocks, 3), kZhaWarps * 32>>>(d_q, d_kh, d_bh, kBuilt, kMax, kRows, kHeads, kG, kPer,
+                                                                  d_score, d_rstar, hs, q8n, kPos, kC, kRecent, d_top);
+        ck(cudaFuncSetAttribute(zha_exact_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * kZhaRaw), "attribute");
+        zha_exact_kernel<<<dim3(blocks, kSplit), kZhaWarps * 32, 2 * kZhaRaw>>>(
+            d_q, stage, d_cmap, ring, kRing, d_sel, 1, hs, kMax, kPos, kRows, kHeads, kG, kPer, kC, kRecent, d_bias,
+            kExtent, d_part, kSegs, d_bits, words);
+        zha_tail_mma_kernel<4><<<dim3(blocks, kTsplit), kZhaWarps * 32>>>(d_ts, d_sel, d_tr, d_vh, kMax, kPos, kRows, kG,
+                                                                         kPer, kC, kRecent, hs, 1, d_part, kSegs, kSplit,
+                                                                         q8n);
 #endif
-    ck(cudaGetLastError(), "launch");
-    ck(cudaDeviceSynchronize(), "the kernels");
-    const auto score = down(d_score, kPer * hs);
-    const auto rstar = down(d_rstar, kPer * hs);
-    const auto top = down(d_top, kPer * kRows);
-    const auto part = down(d_part, (size_t) kRows * kPer * kSegs * 130);
-    if (!dump.empty()) {
+        ck(cudaGetLastError(), "launch");
+        ck(cudaDeviceSynchronize(), "the kernels");
+        return Out{name, down(d_score, kPer * hs), down(d_rstar, kPer * hs), down(d_top, kPer * kRows),
+                   down(d_part, n_part)};
+    };
+    std::vector<Out> outs;
+    outs.push_back(run(0));
+#if defined(__HIPCC__)
+    if (zha_wmma_card()) outs.push_back(run(1));
+#endif
+    const int nv = (int) outs.size();
+    if (!dump.empty()) {   // the engine's path on this card: the last
+        const Out& d = outs.back();
         FILE* f = std::fopen(dump.c_str(), "wb");
         if (!f) return 1;
-        std::fwrite(score.data(), 4, score.size(), f);
-        std::fwrite(rstar.data(), 1, rstar.size(), f);
-        std::fwrite(top.data(), 4, top.size(), f);
-        std::fwrite(part.data(), 4, part.size(), f);
+        std::fwrite(d.score.data(), 4, d.score.size(), f);
+        std::fwrite(d.rstar.data(), 1, d.rstar.size(), f);
+        std::fwrite(d.top.data(), 4, d.top.size(), f);
+        std::fwrite(d.part.data(), 4, d.part.size(), f);
         std::fclose(f);
     }
 
@@ -201,7 +235,12 @@ int main(int argc, char** argv) {
     const auto qr = [&](int t, int p, int d, float scale) {
         return r16((double) (q[((size_t) t * kHeads + kG * kPer + p) * 128 + d] * scale));
     };
-    Check c_score("score", 1e-4), c_rstar("rstar", 0), c_top("top", 1e-4);
+    struct Checks {
+        Check score{"score", 1e-4}, rstar{"rstar", 0}, top{"top", 1e-4};
+        Check em{"exact top", 1e-4}, el{"exact sum", 1e-4}, eo{"exact out", 1e-3};
+        Check tm{"tail top", 1e-5}, tl{"tail sum", 1e-4}, to{"tail out", 1e-3};
+    };
+    std::vector<Checks> cks(nv);
     const float sc = 1.f / std::sqrt(128.f);
     for (int p = 0; p < kPer; ++p)
         for (int t = 0; t < kRows; ++t) {
@@ -224,25 +263,29 @@ int main(int argc, char** argv) {
                 for (int r = 0; r < kR; ++r)
                     if (r != arg) gap = std::min(gap, v[arg] - v[r]);
                 const size_t at = (size_t) p * hs + (size_t) t * kMax + c;
-                c_score.see(score[at], v[arg], v[arg]);
-                c_rstar.see(gap < 1e-4 ? arg : rstar[at], arg, 1);
+                for (int k = 0; k < nv; ++k) {
+                    cks[k].score.see(outs[k].score[at], v[arg], v[arg]);
+                    cks[k].rstar.see(gap < 1e-4 ? arg : outs[k].rstar[at], arg, 1);
+                }
                 if (c >= 1 && c <= nf) tmax = std::max(tmax, v[arg]);
             }
-            c_top.see(top[(size_t) p * kRows + t], tmax, tmax);
+            for (int k = 0; k < nv; ++k) cks[k].top.see(outs[k].top[(size_t) p * kRows + t], tmax, tmax);
         }
 
     // the parts: (top, sum, values) of a segment; values compared as values / sum
-    Check c_em("exact top", 1e-4), c_el("exact sum", 1e-4), c_eo("exact out", 1e-3);
-    Check c_tm("tail top", 1e-5), c_tl("tail sum", 1e-4), c_to("tail out", 1e-3);
-    const auto see_part = [&](int t, int p, int seg, double m, double l, const double* o, Check& cm, Check& cl,
-                              Check& co) {
-        const float* pp = &part[(((size_t) t * kPer + p) * kSegs + seg) * 130];
-        cm.see(pp[128], m, m);
-        cl.see(pp[129], l, l);   // the sum: relative
-        if (l > 0 && pp[129] > 0) {
-            double big = 0;
-            for (int d = 0; d < 128; ++d) big = std::max(big, std::fabs(o[d] / l));
-            for (int d = 0; d < 128; ++d) co.see(pp[d] / pp[129], o[d] / l, big);
+    const auto see_part = [&](int t, int p, int seg, double m, double l, const double* o, bool exact) {
+        for (int k = 0; k < nv; ++k) {
+            Check& cm = exact ? cks[k].em : cks[k].tm;
+            Check& cl = exact ? cks[k].el : cks[k].tl;
+            Check& co = exact ? cks[k].eo : cks[k].to;
+            const float* pp = &outs[k].part[(((size_t) t * kPer + p) * kSegs + seg) * 130];
+            cm.see(pp[128], m, m);
+            cl.see(pp[129], l, l);   // the sum: relative
+            if (l > 0 && pp[129] > 0) {
+                double big = 0;
+                for (int d = 0; d < 128; ++d) big = std::max(big, std::fabs(o[d] / l));
+                for (int d = 0; d < 128; ++d) co.see(pp[d] / pp[129], o[d] / l, big);
+            }
         }
     };
     // exact: the block's window list (zha_exact_kernel), every kSplit-th chunk a segment
@@ -304,7 +347,7 @@ int main(int argc, char** argv) {
                             for (int d = 0; d < 128; ++d) o[d] += pe * vv[j][d];
                         }
                     }
-                    see_part(t, p, seg, m == -INFINITY ? -INFINITY : m * 0.6931471805599453, l, o, c_em, c_el, c_eo);
+                    see_part(t, p, seg, m == -INFINITY ? -INFINITY : m * 0.6931471805599453, l, o, true);
                 }
     }
     // tail: segment kSplit + y of chunks [cb, ce), tiles of 16 chunks; a chunk's weight on its best reference's row
@@ -340,12 +383,16 @@ int main(int argc, char** argv) {
                             for (int d = 0; d < 128; ++d) o[d] += pe * (c < ce ? sdeq(vhat, row, d) : 0.0);
                         }
                     }
-                    see_part(t, p, kSplit + y, m, l, o, c_tm, c_tl, c_to);
+                    see_part(t, p, kSplit + y, m, l, o, false);
                 }
         }
     }
     bool ok = true;
-    for (const Check* c : {&c_score, &c_rstar, &c_top, &c_em, &c_el, &c_eo, &c_tm, &c_tl, &c_to}) ok = c->report() && ok;
+    for (int k = 0; k < nv; ++k) {
+        std::printf("-- %s\n", outs[k].name);
+        const Checks& c = cks[k];
+        for (const Check* x : {&c.score, &c.rstar, &c.top, &c.em, &c.el, &c.eo, &c.tm, &c.tl, &c.to}) ok = x->report() && ok;
+    }
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

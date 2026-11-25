@@ -16,6 +16,13 @@
 #include <algorithm>
 #include <cmath>
 
+#if defined(__HIPCC__)
+#include <atomic>
+#include <cstdlib>
+
+#include "strata/kernels/gfx_arch.hpp"
+#endif
+
 namespace strata::poly::ink {
 namespace {
 
@@ -2219,6 +2226,434 @@ zha_tail_scalar_kernel(const float* __restrict__ score, const uint8_t* __restric
     for (int i = 0; i < kZhaQuarter; ++i) pp[kZhaQuarter * qd + i] = o[i];
     if (qd == 0) pp[kZhaDim] = m, pp[kZhaDim + 1] = l;
 }
+
+// ---- the exact keys and the chunk scores of a prompt batch on the matrix cores (RDNA4 gfx12, RDNA3 gfx11) ------
+// zha_exact_wmma_kernel and zha_score_wmma_kernel: the grids, blocks (12 warps: 4 of 16 tokens a head), tiles and
+// outputs of zha_exact_kernel and zha_score_kernel, on v_wmma_f32_16x16x16_f16 (wave32) steps done transposed as in
+// ink_wmma_kernel (inkling2.cu): S^T = K Q^T, O^T = V^T P^T.  Lane l holds row (token) l % 16 of its warp; its
+// accumulator holds tile rows (keys, or dims of O^T) 8 (l / 16) + i on gfx12 and 2 i + l / 16 on gfx11 (the layouts
+// of src/split/src/hip/mma.h), so a row's softmax lives in lanes l and l ^ 16.  On gfx12 a lane's 8 scores are its
+// B fragment of P^T as they are; on gfx11 (16 k a lane) the two lanes swap theirs.  The rounding is the tensor cores'
+// (zha_exact_kernel's, zha_score_kernel's): the queries, keys, values and weights go in as one fp16 each, the sums
+// are fp32; only the order of the sums differs.  Other HIP cards, or STRATA_INK_ZHA_WMMA=0, run the scalar kernels.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define ZHA_WMMA 12
+#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+    defined(__gfx1150__) || defined(__gfx1151__)
+#define ZHA_WMMA 11   // the list of strata::kernels::gfx_arch_is_gfx11_wmma()
+#else
+#define ZHA_WMMA 0
+#endif
+
+constexpr int kZhaVt = kZhaKeys + 8;   // a dim's row of the transposed values, halves
+
+#if ZHA_WMMA
+typedef _Float16 zw_h8 __attribute__((ext_vector_type(8)));
+typedef _Float16 zw_h16 __attribute__((ext_vector_type(16)));
+typedef float zw_f8 __attribute__((ext_vector_type(8)));
+#if ZHA_WMMA == 11
+typedef zw_h16 zw_ab;   // an A or B operand: all 16 k of a row (lanes l and l + 16 the same)
+constexpr int kZwK = 16;
+#else
+typedef zw_h8 zw_ab;    // 8 k of a row: 8 (l / 16) + 0..7
+constexpr int kZwK = 8;
+#endif
+
+__device__ __forceinline__ zw_f8 zw_mma(zw_ab a, zw_ab b, zw_f8 c) {
+#if ZHA_WMMA == 11
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#endif
+}
+
+__device__ __forceinline__ zw_f8 zw_zero() { return zw_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}; }
+
+// the lane's first k of a step, and the tile row of its accumulator's element i
+__device__ __forceinline__ int zw_k0(int kh) { return ZHA_WMMA == 11 ? 0 : 8 * kh; }
+__device__ __forceinline__ int zw_row(int i, int kh) { return ZHA_WMMA == 11 ? 2 * i + kh : 8 * kh + i; }
+
+// an operand's kZwK consecutive halves from shared memory (16-byte aligned)
+__device__ __forceinline__ zw_ab zw_ld(const __half* p) {
+#if ZHA_WMMA == 11
+    const zw_h8 lo = *reinterpret_cast<const zw_h8*>(p), hi = *reinterpret_cast<const zw_h8*>(p + 8);
+    return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+#else
+    return *reinterpret_cast<const zw_h8*>(p);
+#endif
+}
+
+// the row's query times scale, rounded to fp16, as B fragments of Q^T (16 dims a step; 0 for a dead row)
+__device__ __forceinline__ void zw_query(const float* q, bool live, size_t at, float scale, int kh,
+                                         zw_ab (&qb)[kZhaDim / 16]) {
+#pragma unroll
+    for (int kk = 0; kk < kZhaDim / 16; ++kk)
+#pragma unroll
+        for (int i = 0; i < kZwK; i += 4) {
+            float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (live) x = *reinterpret_cast<const float4*>(q + at + 16 * kk + zw_k0(kh) + i);
+            qb[kk][i] = (_Float16) (x.x * scale), qb[kk][i + 1] = (_Float16) (x.y * scale);
+            qb[kk][i + 2] = (_Float16) (x.z * scale), qb[kk][i + 3] = (_Float16) (x.w * scale);
+        }
+}
+
+// Without these the compiler sinks a tile's 32 products to their first use and hoists all 32 fragment loads of
+// shared memory ahead of them (255 VGPRs on gfx12; on gfx11, 16 halves a fragment, 170 spilled).  zw_pin() makes a
+// 16-row step's products due at the end of the step, zw_fence() keeps the next step's loads after it: 8 fragments
+// live at a time (184 VGPRs on gfx12, 247 on gfx11, no spills).
+__device__ __forceinline__ void zw_fence() { asm volatile("" ::: "memory"); }
+__device__ __forceinline__ void zw_pin(zw_f8& c) { asm volatile("" : "+v"(c)); }
+
+// S^T of a 64-row tile: s[t][i] is the row's product with tile row 16 t + zw_row(i, kh)
+__device__ __forceinline__ void zw_scores(const __half (*ks)[kZhaRow], const zw_ab (&qb)[kZhaDim / 16], int col, int kh,
+                                          zw_f8 (&s)[kZhaKeys / 16]) {
+#pragma unroll
+    for (int t = 0; t < kZhaKeys / 16; ++t) {
+        zw_fence();
+        zw_f8 c = zw_zero();
+#pragma unroll
+        for (int kk = 0; kk < kZhaDim / 16; ++kk) c = zw_mma(zw_ld(&ks[16 * t + col][16 * kk + zw_k0(kh)]), qb[kk], c);
+        zw_pin(c);
+        s[t] = c;
+    }
+}
+
+// the B fragment of P^T for 16 keys from the lane's 8 weights (rounded to fp16): gfx11 takes the partner lane's 8 too
+__device__ __forceinline__ zw_ab zw_weights(const zw_f8& s, int kh) {
+#if ZHA_WMMA == 11
+    uint32_t mine[4], other[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        mine[j] = (uint32_t) __builtin_bit_cast(unsigned short, (_Float16) s[2 * j]) |
+                  (uint32_t) __builtin_bit_cast(unsigned short, (_Float16) s[2 * j + 1]) << 16;
+        other[j] = __shfl_xor_sync(0xffffffffu, mine[j], 16);
+    }
+    zw_h16 b;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {   // key 2 i + kh is the lane's element i, key 2 i + 1 - kh the partner's
+        const _Float16 a = __builtin_bit_cast(_Float16, (unsigned short) (mine[i / 2] >> (16 * (i & 1))));
+        const _Float16 o = __builtin_bit_cast(_Float16, (unsigned short) (other[i / 2] >> (16 * (i & 1))));
+        b[2 * i] = kh ? o : a;
+        b[2 * i + 1] = kh ? a : o;
+    }
+    return b;
+#else
+    (void) kh;
+    zw_h8 b;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) b[i] = (_Float16) s[i];
+    return b;
+#endif
+}
+
+// 8 values (dims d..d+7) of key r of chunk c's keys (v false) or values (v true), as zha_tile_load() takes them
+__device__ __forceinline__ void zw_deq8(bool q8, bool v, const ZhaKv& stage, const ZhaKv& ring, long long r0,
+                                        size_t slot, int g, int C, int r, int d, float (&x)[8]) {
+    if (q8) {
+        const size_t at = (size_t) (r0 + r) * (size_t) ring.row + (size_t) g * kZhaDim;
+        const float s = __half2float(__ushort_as_half((v ? ring.vs : ring.ks)[at / 32 + d / 32]));
+        const uint2 a = *reinterpret_cast<const uint2*>((v ? ring.vc : ring.kc) + at + d);
+        const int8_t* pa = reinterpret_cast<const int8_t*>(&a);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) x[e] = pa[e] * s;
+    } else {
+        const size_t key = slot * C + r;
+        const float s = __half2float(__ushort_as_half((v ? stage.vs : stage.ks)[key * 4 + d / 32]));
+        const uint32_t a = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(v ? stage.vc : stage.kc) +
+                                                              key * 64 + d / 2);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) x[e] = (float) ((int) ((a >> (4 * e)) & 15) - 8) * s;
+    }
+}
+
+// Chunk c's keys into ks [key][dim] and its values into vt [dim][key] (the A fragments of V^T), fp16 as in
+// zha_tile_load().  The values go two keys a thread, a word a store: lanes of a half-warp take 16 key pairs and the
+// two halves two groups of 8 dims, so a warp's stores hit 32 banks.
+__device__ __forceinline__ void zw_tile_load(int c, const ZhaKv& stage, const int* cmap, const ZhaKv& ring,
+                                             long long n_ring, int g, int C, int c_ring, __half (*ks)[kZhaRow],
+                                             __half (*vt)[kZhaVt]) {
+    const bool q8 = c >= c_ring;
+    const long long r0 = q8 ? ((long long) c * C) % n_ring : 0;
+    const size_t slot = q8 ? 0 : (size_t) cmap[c];
+    for (int i = threadIdx.x; i < kZhaKeys * (kZhaDim / 8); i += blockDim.x) {
+        const int r = i / (kZhaDim / 8), d = 8 * (i % (kZhaDim / 8));
+        float x[8];
+        zw_deq8(q8, false, stage, ring, r0, slot, g, C, r, d, x);
+        uint4 u;
+        uint32_t* w = &u.x;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const __half2 h = __floats2half2_rn(x[2 * e], x[2 * e + 1]);
+            w[e] = *reinterpret_cast<const uint32_t*>(&h);
+        }
+        *reinterpret_cast<uint4*>(&ks[r][d]) = u;
+    }
+    for (int i = threadIdx.x; i < kZhaKeys / 2 * (kZhaDim / 8); i += blockDim.x) {
+        const int j = 2 * ((i & 15) + 16 * ((i >> 5) & 1)), d = 8 * (((i >> 4) & 1) + 2 * (i >> 6));
+        float x0[8], x1[8];
+        zw_deq8(q8, true, stage, ring, r0, slot, g, C, j, d, x0);
+        zw_deq8(q8, true, stage, ring, r0, slot, g, C, j + 1, d, x1);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const __half2 h = __floats2half2_rn(x0[e], x1[e]);
+            *reinterpret_cast<__half2*>(&vt[d + e][j]) = h;
+        }
+    }
+}
+#endif
+
+__global__ void __launch_bounds__(kZhaWarps * 32)
+zha_exact_wmma_kernel(const float* __restrict__ q, ZhaKv stage, const int* __restrict__ cmap, ZhaKv ring,
+                      long long n_ring, const uint8_t* __restrict__ sel, int sel_heads, size_t hs, int max_chunks,
+                      long long pos, int rows, int n_head, int g, int per, int C, int recent,
+                      const float* __restrict__ bias, int extent, float* __restrict__ part, int segs,
+                      const uint32_t* __restrict__ bits, int words) {
+#if ZHA_WMMA
+    __shared__ __align__(16) __half ks[kZhaKeys][kZhaRow];
+    __shared__ __align__(16) __half vt[kZhaDim][kZhaVt];
+    __shared__ uint32_t want[32];
+    __shared__ int lst[1024], nlst;
+    constexpr float LOG2E = 1.44269504f;
+    const int t0 = blockIdx.x * kZhaTokens, lane = threadIdx.x & 31, w = threadIdx.x >> 5, col = lane & 15, kh = lane >> 4;
+    const int p = w % per, head = g * per + p, tok = t0 + 16 * (w / per) + col;
+    const bool warp_live = w < per * 4, live = warp_live && tok < rows;
+    zw_ab qb[kZhaDim / 16];
+    zw_query(q, live, ((size_t) tok * n_head + head) * kZhaDim, rsqrtf((float) kZhaDim) * LOG2E, kh, qb);
+    const long long own = pos + tok;
+    long long fr;
+    zha_far(own, C, recent, &fr);
+    const uint8_t* srow = sel + (sel_heads > 1 ? (size_t) p * hs : 0) + (size_t) min(tok, rows - 1) * max_chunks;
+    const float* brow = bias + ((size_t) p * rows + min(tok, rows - 1)) * extent;
+    const int t_last = min(t0 + kZhaTokens, rows) - 1;
+    long long fr_first, fr_last;
+    zha_far(pos + t0, C, recent, &fr_first);
+    const int nf_last = zha_far(pos + t_last, C, recent, &fr_last);
+    const int c_ring = (int) (fr_first / C), c_end = (int) ((pos + t_last) / C) + 1;
+    zw_f8 o[kZhaDim / 16];   // O^T: dims 16 dt + zw_row(i, kh) of the row
+#pragma unroll
+    for (int dt = 0; dt < kZhaDim / 16; ++dt) o[dt] = zw_zero();
+    float m = -INFINITY, l = 0.f;
+    for (int w0 = 0; w0 < c_end; w0 += 1024) {
+        if (threadIdx.x < 32) {   // as zha_exact_kernel: the block's chunks of the window
+            const int wi = (w0 >> 5) + threadIdx.x;
+            uint32_t x = wi < words ? bits[(size_t) blockIdx.x * words + wi] : 0u;
+            for (int k = 0; k < 32; ++k) {
+                const int c = 32 * wi + k;
+                if (c >= c_end) x &= ~(1u << k);
+                else if (c == 0 || c >= c_ring) x |= 1u << k;
+                else if (c > nf_last) x &= ~(1u << k);
+            }
+            want[threadIdx.x] = x;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int n = 0, k = 0;
+            for (int b = 0; b < 32; ++b)
+                for (uint32_t bw = want[b]; bw; bw &= bw - 1, ++k)
+                    if (k % gridDim.y == blockIdx.y) lst[n++] = w0 + 32 * b + __ffs(bw) - 1;
+            nlst = n;
+        }
+        __syncthreads();
+        const int n_items = nlst;
+        for (int it = 0; it < n_items; ++it) {
+            const int c = lst[it];
+            zw_tile_load(c, stage, cmap, ring, n_ring, g, C, c_ring, ks, vt);
+            __syncthreads();
+            // the warp's 16 tokens: the chunk only if one of them reads it exactly (the block's other tokens may)
+            const bool ex = live && ((long long) c * C >= fr || c == 0 || srow[c]);
+            if (__ballot_sync(0xffffffffu, ex)) {
+                zw_f8 s[kZhaKeys / 16];
+                zw_scores(ks, qb, col, kh, s);
+                // the mask and the bias by distance d = own - key (the row's distance to the tile's key 0, less k);
+                // the bias only in a tile some row of the warp has a distance below the extent of
+                const int d0 = (int) (own - (long long) c * C);
+                const bool near = extent > 0 && __ballot_sync(0xffffffffu, ex && d0 - (kZhaKeys - 1) < extent);
+                float mx = -INFINITY;
+#pragma unroll
+                for (int t = 0; t < kZhaKeys / 16; ++t)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int d = d0 - 16 * t - zw_row(i, kh);
+                        float v = s[t][i];
+                        if (near) {
+                            const float b = brow[min(max(d, 0), extent - 1)] * LOG2E;
+                            v = d < extent ? v + b : v;
+                        }
+                        v = !ex || d < 0 ? -INFINITY : v;
+                        s[t][i] = v;
+                        mx = fmaxf(mx, v);
+                    }
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16));
+                // exp2 as v_exp_f32 (exp2f() adds a scaling for results below 2^-126: weights that are 0 in fp16)
+                const float now = fmaxf(m, mx), base = now == -INFINITY ? 0.f : now;
+                const float f = __builtin_amdgcn_exp2f(m - base);
+                m = now;
+                l *= f;
+#pragma unroll
+                for (int dt = 0; dt < kZhaDim / 16; ++dt)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) o[dt][i] *= f;
+#pragma unroll
+                for (int t = 0; t < kZhaKeys / 16; ++t)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        s[t][i] = __builtin_amdgcn_exp2f(s[t][i] - base);
+                        l += s[t][i];
+                    }
+                // O^T += V^T P^T: keys 16 kg.. of dims 16 dt..
+#pragma unroll
+                for (int kg = 0; kg < kZhaKeys / 16; ++kg) {
+                    zw_fence();
+                    const zw_ab pb = zw_weights(s[kg], kh);
+#pragma unroll
+                    for (int dt = 0; dt < kZhaDim / 16; ++dt)
+                        o[dt] = zw_mma(zw_ld(&vt[16 * dt + col][16 * kg + zw_k0(kh)]), pb, o[dt]);
+#pragma unroll
+                    for (int dt = 0; dt < kZhaDim / 16; ++dt) zw_pin(o[dt]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if (!warp_live) return;
+    l += __shfl_xor_sync(0xffffffffu, l, 16);
+    if (tok >= rows) return;
+    float* pp = part + (((size_t) tok * per + p) * segs + blockIdx.y) * (kZhaDim + 2);
+#pragma unroll
+    for (int dt = 0; dt < kZhaDim / 16; ++dt)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) pp[16 * dt + zw_row(i, kh)] = o[dt][i];
+    if (kh == 0) {
+        pp[kZhaDim] = m == -INFINITY ? -INFINITY : m * 0.69314718f;
+        pp[kZhaDim + 1] = l;
+    }
+#else
+    (void) q, (void) stage, (void) cmap, (void) ring, (void) n_ring, (void) sel, (void) sel_heads, (void) hs,
+        (void) max_chunks, (void) pos, (void) rows, (void) n_head, (void) g, (void) per, (void) C, (void) recent,
+        (void) bias, (void) extent, (void) part, (void) segs, (void) bits, (void) words;
+    __builtin_trap();   // zha_attend() launches it on gfx11 / gfx12 only (zha_wmma_card())
+#endif
+}
+
+// The chunk scores of zha_score_kernel (4 references a chunk): S^T of 64 summary rows (16 chunks) at a time; on
+// gfx12 a lane's 8 rows are 2 whole chunks, on gfx11 2 references of each of 4 chunks, the other 2 in lane l ^ 16.
+template <int R>
+__global__ void __launch_bounds__(kZhaWarps * 32)
+zha_score_wmma_kernel(const float* __restrict__ q, const __half* __restrict__ khat, const float* __restrict__ bhat,
+                      int nch, int max_chunks, int rows, int n_head, int g, int per, float* __restrict__ score,
+                      uint8_t* __restrict__ rstar, size_t hs, size_t q8n, long long pos, int C, int recent,
+                      float* __restrict__ top) {
+    static_assert(R == 4, "zha_score_wmma_kernel: 4 references a chunk");
+#if ZHA_WMMA
+    __shared__ __align__(16) __half ks[kZhaKeys][kZhaRow];
+    __shared__ float bs[kZhaKeys];
+    constexpr int CPT = kZhaKeys / R;
+    __shared__ float sbuf[3][kZhaTokens][CPT];
+    __shared__ uint8_t rbuf[3][kZhaTokens][CPT];
+    const int t0 = blockIdx.x * kZhaTokens, lane = threadIdx.x & 31, w = threadIdx.x >> 5, col = lane & 15, kh = lane >> 4;
+    const int p = w % per, head = g * per + p, tl = 16 * (w / per) + col, tok = t0 + tl;
+    const bool warp_live = w < per * 4, live = warp_live && tok < rows;
+    zw_ab qb[kZhaDim / 16];
+    zw_query(q, live, ((size_t) tok * n_head + head) * kZhaDim, rsqrtf((float) kZhaDim), kh, qb);
+    const float* bg = bhat + (size_t) g * zq_cap(q8n, max_chunks) * R;
+    long long fr;
+    const int nft = top && live ? zha_far(pos + tok, C, recent, &fr) : 0;
+    float tmax = -INFINITY;
+    const int span = ((nch + gridDim.y - 1) / gridDim.y + CPT - 1) / CPT * CPT;
+    const int cb = blockIdx.y * span, ce = min(nch, cb + span);
+    for (int c0 = cb; c0 < ce; c0 += CPT) {
+        const int nr = min(CPT, ce - c0) * R;
+        for (int i = threadIdx.x; i < kZhaKeys * (kZhaDim / 8); i += blockDim.x) {
+            const int r = i / (kZhaDim / 8), d = 8 * (i % (kZhaDim / 8));
+            uint4 x = make_uint4(0, 0, 0, 0);
+            if (r < nr) x = zsum8h(khat, q8n, ((size_t) g * zq_cap(q8n, max_chunks) + c0) * R + r, d);
+            *reinterpret_cast<uint4*>(&ks[r][d]) = x;
+        }
+        for (int i = threadIdx.x; i < kZhaKeys; i += blockDim.x) bs[i] = i < nr ? bg[(size_t) c0 * R + i] : -INFINITY;
+        __syncthreads();
+        if (warp_live) {
+            zw_f8 s[kZhaKeys / 16];
+            zw_scores(ks, qb, col, kh, s);
+#pragma unroll
+            for (int t = 0; t < kZhaKeys / 16; ++t)
+#if ZHA_WMMA == 11
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {   // chunk 4 t + h: references kh (element 2 h) and 2 + kh (2 h + 1)
+                    const int r0 = 16 * t + 4 * h + kh;
+                    const float v0 = s[t][2 * h] + bs[r0], v1 = s[t][2 * h + 1] + bs[r0 + 2];
+                    float best = v1 > v0 ? v1 : v0;
+                    int arg = v1 > v0 ? 2 + kh : kh;
+                    const float ob = __shfl_xor_sync(0xffffffffu, best, 16);
+                    const int oa = __shfl_xor_sync(0xffffffffu, arg, 16);
+                    if (ob > best || (ob == best && oa < arg)) best = ob, arg = oa;   // the first of equal ones
+                    const int cc = 4 * t + h, c = c0 + cc;
+                    if (!live || kh != 0 || c >= ce) continue;
+#else
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {   // chunk 4 t + 2 kh + h: references 0..3 at elements 4 h..4 h + 3
+                    float best = -INFINITY;
+                    int arg = 0;
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {   // the largest reference, the first of equal ones
+                        const float v = s[t][4 * h + r] + bs[16 * t + 8 * kh + 4 * h + r];
+                        if (r == 0 || v > best) best = v, arg = r;
+                    }
+                    const int cc = 4 * t + 2 * kh + h, c = c0 + cc;
+                    if (!live || c >= ce) continue;
+#endif
+                    if (c >= 1 && c <= nft) tmax = fmaxf(tmax, best);
+                    sbuf[p][tl][cc] = best;
+                    rbuf[p][tl][cc] = (uint8_t) arg;
+                }
+        }
+        __syncthreads();
+        const int nc = min(CPT, ce - c0), tn = min(kZhaTokens, rows - t0);
+        for (int i = threadIdx.x; i < per * kZhaTokens * CPT; i += blockDim.x) {
+            const int cc = i % CPT, t = (i / CPT) % kZhaTokens, pp = i / (CPT * kZhaTokens);
+            if (cc >= nc || t >= tn) continue;
+            const size_t at = (size_t) pp * hs + (size_t) (t0 + t) * max_chunks + c0 + cc;
+            score[at] = sbuf[pp][t][cc];
+            rstar[at] = rbuf[pp][t][cc];
+        }
+    }
+    if (top && warp_live) {   // the two lanes of a row, then one atomic a (head, token) and block
+        const float mm = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 16));
+        if (kh == 0 && live && mm != -INFINITY) zha_atomic_max(top + (size_t) p * rows + tok, mm);
+    }
+#else
+    (void) q, (void) khat, (void) bhat, (void) nch, (void) max_chunks, (void) rows, (void) n_head, (void) g, (void) per,
+        (void) score, (void) rstar, (void) hs, (void) q8n, (void) pos, (void) C, (void) recent, (void) top;
+    __builtin_trap();   // zha_attend() launches it on gfx11 / gfx12 only (zha_wmma_card())
+#endif
+}
+
+// Whether the current card runs the matrix-core kernels above (gfx11 / gfx12, the lists of strata/kernels/
+// gfx_arch.hpp; STRATA_INK_ZHA_WMMA=0 keeps the scalar ones).  The arch macros are the device pass's alone, so the host
+// asks the card, once a device.
+bool zha_wmma_card() {
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_INK_ZHA_WMMA");
+        return v && v[0] == '0';
+    }();
+    if (off) return false;
+    static std::atomic<int> cards[16] = {};   // a device's: 1 yes, 2 no, 0 not yet asked
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    int card = cards[dev].load(std::memory_order_relaxed);
+    if (!card) {
+        cudaDeviceProp pr{};
+        const bool ok = cudaGetDeviceProperties(&pr, dev) == cudaSuccess &&
+                        (strata::kernels::gfx_arch_is_gfx12_wmma(pr.gcnArchName) ||
+                         strata::kernels::gfx_arch_is_gfx11_wmma(pr.gcnArchName));
+        (void) cudaGetLastError();
+        card = ok ? 1 : 2;
+        cards[dev].store(card, std::memory_order_relaxed);
+    }
+    return card == 1;
+}
 #endif  // __HIPCC__
 
 // The cache's part of a step for KV head g: each chunk the step reads (cmap >= 0) the cache holds is stamped and
@@ -2676,11 +3111,16 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
             throw std::runtime_error("ink::zha_attend: memset");
 #if defined(__HIPCC__)
         if (fused && per > 3) throw std::logic_error("ink::zha_attend: groups of up to 3 heads");
-        if (fused)
-            zha_score_scalar_kernel<4><<<dim3(tblocks, std::min(split, std::max(1, nch / (kZhaKeys / 4)))),
-                                         kZhaScalarThreads, 0, cs(stream)>>>(q, (const __half*) khat, bhat, nch, max_chunks,
-                                                                             rows, n_head, g, per, sc, rs, hs, q8n, pos,
-                                                                             z.C, z.recent, top);
+        const bool wmma = zha_wmma_card();   // the matrix cores (gfx11 / gfx12), else the scalar kernels
+        const dim3 sgrid(tblocks, std::min(split, std::max(1, nch / (kZhaKeys / 4))));
+        if (fused && wmma)
+            zha_score_wmma_kernel<4><<<sgrid, kZhaWarps * 32, 0, cs(stream)>>>(q, (const __half*) khat, bhat, nch,
+                                                                              max_chunks, rows, n_head, g, per, sc, rs,
+                                                                              hs, q8n, pos, z.C, z.recent, top);
+        else if (fused)
+            zha_score_scalar_kernel<4><<<sgrid, kZhaScalarThreads, 0, cs(stream)>>>(q, (const __half*) khat, bhat, nch,
+                                                                                   max_chunks, rows, n_head, g, per, sc,
+                                                                                   rs, hs, q8n, pos, z.C, z.recent, top);
 #else
         if (fused)   // the chunk scores on the tensor cores, the largest reference in registers
             zha_score_kernel<4><<<dim3(tblocks, std::min(split, std::max(1, nch / (kZhaKeys / 4)))), kZhaWarps * 32, 0,
@@ -2768,9 +3208,14 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
                                                                                     bits, words, nullptr);
 #if defined(__HIPCC__)
             if (per > 3) throw std::logic_error("ink::zha_attend: groups of up to 3 heads");
-            zha_exact_scalar_kernel<<<dim3(blocks, kExactSplit), kZhaScalarThreads, 0, cs(stream)>>>(
-                q, wk.stage, cmap, ring, n_ring, wk.sel, sels, hs, max_chunks, pos, rows, n_head, g, per, z.C,
-                z.recent, bias, extent, part, psegs, bits, words);
+            if (wmma)
+                zha_exact_wmma_kernel<<<dim3(blocks, kExactSplit), kZhaWarps * 32, 0, cs(stream)>>>(
+                    q, wk.stage, cmap, ring, n_ring, wk.sel, sels, hs, max_chunks, pos, rows, n_head, g, per, z.C,
+                    z.recent, bias, extent, part, psegs, bits, words);
+            else
+                zha_exact_scalar_kernel<<<dim3(blocks, kExactSplit), kZhaScalarThreads, 0, cs(stream)>>>(
+                    q, wk.stage, cmap, ring, n_ring, wk.sel, sels, hs, max_chunks, pos, rows, n_head, g, per, z.C,
+                    z.recent, bias, extent, part, psegs, bits, words);
             zha_tail_scalar_kernel<4><<<dim3(blocks, tsplit), kZhaScalarThreads, 0, cs(stream)>>>(
                 sc, wk.sel, rs, (const __half*) vhat, max_chunks, pos, rows, g, per, z.C, z.recent, hs, sels, part,
                 psegs, kExactSplit, q8n);
