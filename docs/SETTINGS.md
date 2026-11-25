@@ -11,7 +11,7 @@ A number or a word is set like any environment variable, for example `STRATA_KVA
 (`terminal/strata-<model>.json`), which the server passes to the engine. The Strata project's Terminal writes it there with
 `strata launch --set NAME=value`.
 
-## Switches you can turn on (349)
+## Switches you can turn on (350)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -363,11 +363,12 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_VHEAD_BITPLANE` | number | NVIDIA and AMD | - |
 | `STRATA_VOLTA_FOREVER` | text | NVIDIA and AMD | - |
 | `STRATA_VRAM_FREE` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
+| `STRATA_VRAM_WATCH_MS` | number | NVIDIA and AMD | [VRAM_ELASTIC.md](VRAM_ELASTIC.md) |
 | `STRATA_WATCHDOG_S` | number | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WDDM_MARGIN_MIB` | number | AMD | [AMD_HIP.md](AMD_HIP.md) |
 
-## Switches that go back to earlier behaviour (128)
+## Switches that go back to earlier behaviour (129)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -499,6 +500,7 @@ version made it the default.
 | `STRATA_UMA_PIN_CAP` | on / off | AMD | v0.2.16 | [BATCHING.md](BATCHING.md) |
 | `STRATA_UMA_RESERVE_GIB` | on / off | NVIDIA and AMD | v0.2.16 | [release-notes-0.2.2.md](release-notes-0.2.2.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_VMM_READDRESS` | on / off | NVIDIA and AMD | - | - |
+| `STRATA_VRAM_WATCH` | on / off | NVIDIA and AMD | - | [VRAM_ELASTIC.md](VRAM_ELASTIC.md) |
 | `STRATA_WDDM_OTHERS` | number | AMD | - | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WDDM_SHARED_RESERVE_MIB` | number | NVIDIA and AMD | v0.2.17 | - |
 | `STRATA_XN_F16` | on / off | NVIDIA and AMD | v0.2.16 | [DETAILS.md](DETAILS.md) |

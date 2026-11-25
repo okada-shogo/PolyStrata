@@ -36,8 +36,8 @@ and **(code; measured in the PR)**:
   quarter of it (64 MiB at least), the cache gives at least that much back in whole pieces; when a piece and 128 MiB
   more are free beyond the reserve it takes them again, the experts it gave up first, so the cache after a shrink and a
   grow holds the experts it held before;
-- this also happens **while the engine is idle**, every 2 s (`STRATA_VRAM_WATCH_MS`; `STRATA_VRAM_WATCH=0`: only at a
-  request's start), never inside a request or while batch slots are writing. A freeze (`STRATA_FREEZE_EXPERTS`) gives
+- this also happens **while the engine is idle**, every 2 s (`--vram-elastic-watch-ms N`, 100 at least; 0: only at a
+  request's start. `STRATA_VRAM_WATCH_MS` and `STRATA_VRAM_WATCH=0` do the same from the environment), never inside a request or while batch slots are writing. A freeze (`STRATA_FREEZE_EXPERTS`) gives
   way to it as it does to `POST /v1/vram`. The log says `strata-poly: idle: the expert cache A -> B experts ...`;
 - `POST /v1/vram` resizes the same way, a piece at a time, instead of filling the cache again;
 - on AMD under WSL2 (librocdxg) the kept pieces are not unmapped and mapped again for each shrink, with or without the
