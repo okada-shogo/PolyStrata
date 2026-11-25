@@ -34632,7 +34632,7 @@
    "last_date": "2026-11-20",
    "status": "default",
    "owner": "poly",
-   "note": "[reviewed] the host mirror of the experts outside VRAM that the card reads (CUDA, unified addressing), on where it applies unless =0; on Windows off unless =1 or --lock-experts (engine/src/poly/engine.cpp:5100). Inkling 2: the mirror holds the cached experts too where the RAM keeps max(8 GiB, 20%) free beside it; =partial (or --no-full-mirror) keeps it to the experts outside VRAM",
+   "note": "[reviewed] the host mirror of the experts outside VRAM that the card reads (CUDA, unified addressing), on where it applies unless =0; on Windows off unless =1 or --lock-experts (engine/src/poly/engine.cpp:5100). Inkling 2: the mirror holds the cached experts too where the RAM keeps max(8 GiB, 20%) free beside it; --no-full-mirror keeps it to the experts outside VRAM",
    "retire_after": "",
    "retired_in": ""
   },

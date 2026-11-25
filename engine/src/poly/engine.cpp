@@ -6344,10 +6344,10 @@ void Engine::build_mirror() {
 #ifdef _WIN32
     if (avail) avail -= std::min(avail, cached_file_bytes());   // as the budget counts them (load())
 #endif
-    // The whole mirror (full_mirror_default(), unless --no-full-mirror or STRATA_POLY_MIRROR=partial): the cached
+    // The whole mirror (full_mirror_default(), unless --no-full-mirror): the cached
     // experts have their copies too, where the RAM free to this process keeps max(8 GiB, 20% of its RAM) beside them.
     // The RAM is the process's: under WSL or a container, the VM's or the group's, not the host's.
-    const bool partial_asked = !opt_.full_mirror || (asked && std::string(asked) == "partial");
+    const bool partial_asked = !opt_.full_mirror;
     const size_t ram = ram_total(), keep = std::max(size_t(8) << 30, ram / 5);
     size_t total = 0;
     for (int pass = full_mirror_default() && !partial_asked && !mirror_short_ ? 0 : 1; pass < 2; ++pass) {
