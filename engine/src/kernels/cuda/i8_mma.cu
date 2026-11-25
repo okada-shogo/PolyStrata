@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <type_traits>
 
 #define ggml_cuda_dp4a(a, b, c) STRATA_DP4A((a), (b), (c))
@@ -55,6 +56,11 @@ bool gemm_iq_i8_takes(int ty, int K) {
 }
 
 void gemm_iq_i8_turing(bool on) { i8m_turing.store(on, std::memory_order_relaxed); }
+void gemm_iq_i8_dp4a(int mode) { i8m_dp4a_mode.store(mode < 0 ? -1 : mode > 0 ? 1 : 0, std::memory_order_relaxed); }
+bool gemm_iq_i8_dp4a_on() {
+    const I8mCard c = i8m_card();
+    return c.on && c.dp4a && c.arch == 750;
+}
 void gemm_iq_i8_allow(int ty, bool on) {
     if (!i8m_asked_type(ty)) return;
     if (on) i8m_allowed.fetch_or(uint64_t{1} << ty, std::memory_order_relaxed);

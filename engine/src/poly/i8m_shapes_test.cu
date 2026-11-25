@@ -6,7 +6,9 @@
 // random blocks with sane scales, the activations quantized by the kernel's own quantizer.
 //
 // "the launcher's pick" is i8m_launch_type() itself (on Ampere and newer the raw stage copy where it takes it; on
-// Turing i8m_cf75()), so every other shape is also checked against what a card runs by default.
+// Turing i8m_cf75()), so every other shape is also checked against what a card runs by default.  On Turing's code
+// (sm_75) each shape is also run by dp4a (I8M_CF_DP4A, a GeForce GTX 16's products: "... dp4a"), against the same
+// reference, the MMAs' shape "as before".
 // usage: poly_i8m_shapes_test [--time | --ab N]   (--time: also each shape's time on this card, the best of 3 runs of 10;
 // exit 0: every shape gives the same bits; 77: no card or no int8 MMA)
 #if !defined(__HIPCC__)
@@ -187,7 +189,7 @@ bool launch(const Problem& p, const Launch& l) {
         std::printf("    [type %d, tile %d rows, CF %d: %zu bytes of shared memory, %d threads, %d blocks a multiprocessor]\n", T,
                     16 * NJ, CF, bytes, i8m_nt(T, NJ, 64, CF), per_sm);
         // Turing's shapes are there for two blocks a multiprocessor: fewer is a failure (the same bits, the speed lost)
-        if (CF != 0 && CF == i8m_cf75(T, NJ, 64) && i8m_card().arch < 800 && per_sm < 2) {
+        if ((CF & ~I8M_CF_DP4A) != 0 && (CF & ~I8M_CF_DP4A) == i8m_cf75(T, NJ, 64) && i8m_card().arch < 800 && per_sm < 2) {
             std::printf("    FAILED: type %d, tile %d rows, CF %d fits %d block a multiprocessor, not 2\n", T, 16 * NJ, CF, per_sm);
             g_occupancy_ok = false;
         }
@@ -212,7 +214,8 @@ Fn one() {
 // (tiles of 16 and 64 rows only in the shapes that use them: fewer kernels to compile)
 template <int T, int CF>
 Fn by_nj(int nj) {
-    constexpr bool narrow = CF == 0 || CF == I8M_CF_CVT2 || CF == (I8M_CF_K128 | I8M_CF_T256 | I8M_CF_CVT2);
+    constexpr int B = CF & ~I8M_CF_DP4A;
+    constexpr bool narrow = B == 0 || B == I8M_CF_CVT2 || B == (I8M_CF_K128 | I8M_CF_T256 | I8M_CF_CVT2);
     if constexpr (narrow) {
         if (nj == 1) return one<T, 1, CF>();
         if (nj == 4) return one<T, 4, CF>();
@@ -221,7 +224,7 @@ Fn by_nj(int nj) {
 }
 
 // A shape: CF, and the most activation rows a tile has (8: as the launcher picks, 4 / 2: no wider than 64 / 32)
-struct Shape { const char* name; int cf, cap; };
+struct Shape { const char* name; int cf, cap; bool dp = false; };   // dp: by dp4a (I8M_CF_DP4A, Turing's code only)
 constexpr int K128 = I8M_CF_K128 | I8M_CF_T256;
 constexpr Shape kShapes[] = {
     {"as before", 0, 8},
@@ -240,12 +243,28 @@ constexpr Shape kShapes[] = {
     {"swz cvt2", I8M_CF_SWZ | I8M_CF_CVT2, 8},
     {"k128 swz", K128 | I8M_CF_SWZ, 8},
     {"k128 swz cvt2", K128 | I8M_CF_SWZ | I8M_CF_CVT2, 8},
+    {"as before dp4a", 0, 8, true},
+    {"Turing's dp4a", -1, 8, true},
+    {"launcher's pick dp4a", -2, 8, true},
+    {"main's pick dp4a", -3, 8, true},
+    {"cvt dp4a", I8M_CF_CVT, 8, true},
+    {"cvt2 dp4a", I8M_CF_CVT2, 8, true},
+    {"256 thr cvt2 dp4a", I8M_CF_T256 | I8M_CF_CVT2, 8, true},
+    {"na1 dp4a", I8M_CF_NA1, 8, true},
+    {"tile 64 cvt2 dp4a", I8M_CF_CVT2, 4, true},
+    {"k128 dp4a", K128, 8, true},
+    {"k128 cvt dp4a", K128 | I8M_CF_CVT, 8, true},
+    {"k128 cvt2 dp4a", K128 | I8M_CF_CVT2, 8, true},
+    {"k128 t64 cvt2 dp4a", K128 | I8M_CF_CVT2, 4, true},
+    {"swz cvt2 dp4a", I8M_CF_SWZ | I8M_CF_CVT2, 8, true},
+    {"k128 swz dp4a", K128 | I8M_CF_SWZ, 8, true},
+    {"k128 swz cvt2 dp4a", K128 | I8M_CF_SWZ | I8M_CF_CVT2, 8, true},
 };
 
 template <int T>
 Fn pick(int cf, int nj) {
     switch (cf) {
-#define S8_CASE(C) case C: return by_nj<T, C>(nj);
+#define S8_CASE(C) case C: return by_nj<T, C>(nj); case C | I8M_CF_DP4A: return by_nj<T, C | I8M_CF_DP4A>(nj);
         S8_CASE(0) S8_CASE(I8M_CF_CVT) S8_CASE(I8M_CF_CVT2) S8_CASE(I8M_CF_T256 | I8M_CF_CVT2) S8_CASE(I8M_CF_NA1)
         S8_CASE(K128) S8_CASE(K128 | I8M_CF_CVT) S8_CASE(K128 | I8M_CF_CVT2) S8_CASE(I8M_CF_SWZ | I8M_CF_CVT2)
         S8_CASE(K128 | I8M_CF_SWZ) S8_CASE(K128 | I8M_CF_SWZ | I8M_CF_CVT2)
@@ -273,7 +292,9 @@ bool run(const Problem& p, const Shape& s, int only = -1) {
         if (s.cf == -2 || s.cf == -3) {   // the launcher's own pick for this card (on Ampere and newer: the raw stage copy where
                                           // it takes it); -3: without the Ampere selection (i8m_amp_types() 0), as main
             const uint64_t amp = i8m_amp_types().load();
+            const int dp_mode = i8m_dp4a_mode.load();
             if (s.cf == -3) i8m_amp_types().store(0);
+            i8m_dp4a_mode.store(s.dp ? 1 : dp_mode);
             const float* XD = (const float*) (p.xq + (size_t) p.rows * p.K);
             int dev = 0;
             cudaGetDevice(&dev);
@@ -288,10 +309,11 @@ bool run(const Problem& p, const Shape& s, int only = -1) {
                 default: break;
             }
             i8m_amp_types().store(amp);
+            i8m_dp4a_mode.store(dp_mode);
             if (!done) return false;
             continue;
         }
-        const int nj = std::min(l.nj, s.cap), cf = s.cf >= 0 ? s.cf : i8m_cf75(p.T, nj, 64);
+        const int nj = std::min(l.nj, s.cap), cf = (s.cf >= 0 ? s.cf : i8m_cf75(p.T, nj, 64)) | (s.dp ? I8M_CF_DP4A : 0);
         const Fn f = pick_type(p.T, cf, nj);
         if (!f) {   // (a shape not compiled for this tile: a failure, not a launch of another shape)
             std::printf("  no kernel for type %d, tile %d rows, CF %d\n", p.T, 16 * nj, cf);
@@ -421,7 +443,8 @@ int main(int argc, char** argv) {
             continue;
         }
         for (const Shape& s : kShapes) {
-            if ((s.cf > 0 || s.cf == -1) && i8m_card().arch >= 800 && i8m_card().arch != 860) {   // (compiled empty there)
+            if (((s.cf > 0 || s.cf == -1) && i8m_card().arch >= 800 && i8m_card().arch != 860) ||
+                (s.dp && i8m_card().arch != 750)) {   // (compiled empty there)
                 if (!timing) std::printf("  %-20s not compiled for this card\n", s.name);
                 continue;
             }
@@ -429,7 +452,7 @@ int main(int argc, char** argv) {
             if (!run(p, s) || !ok(cudaDeviceSynchronize(), s.name)) { all = false; continue; }
             cudaMemcpy(got.data(), p.Y, got.size() * sizeof(float), cudaMemcpyDeviceToHost);
             bool same = true;
-            if (s.cf == 0 && s.cap == 8) ref = got;
+            if (s.cf == 0 && s.cap == 8 && !s.dp) ref = got;
             else same = std::memcmp(ref.data(), got.data(), ref.size() * sizeof(uint32_t)) == 0;
             size_t diff = 0;
             if (!same)
@@ -450,7 +473,7 @@ int main(int argc, char** argv) {
                 cudaEventElapsedTime(&ms, e0, e1);
                 best = std::min(best, ms / 10);
             }
-            if (s.cf == 0 && s.cap == 8) base_ms = best;
+            if (s.cf == 0 && s.cap == 8 && !s.dp) base_ms = best;
             std::printf("  %-22s %s  %8.1f us  %5.1f T MAC/s  %+6.1f%%  by launch:", s.name, same ? "same bits" : "DIFFERENT", best * 1e3,
                         macs / (best * 1e-3) / 1e12, base_ms > 0 ? (base_ms / best - 1) * 100 : 0.0);
             for (size_t li = 0; li < p.launches.size(); ++li) {   // each class's launch alone: its most rows, its time

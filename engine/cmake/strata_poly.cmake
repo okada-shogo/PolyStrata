@@ -482,6 +482,15 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
     set_tests_properties(poly_mmq_paths_test_blas PROPERTIES ENVIRONMENT "STRATA_POLY_PROMPT_BLAS=1")
     set_tests_properties(poly_mmq_paths_test_x2 PROPERTIES ENVIRONMENT "STRATA_PREFILL_NVFP4=w4a4x2")
     set_tests_properties(poly_mmq_paths_test_w4a8 PROPERTIES ENVIRONMENT "STRATA_PREFILL_NVFP4=w4a8")
+    # the int8 prompt kernel by dp4a (Turing's code on a GTX 16) against its MMAs, bit for bit; needs sm_75 code (77 without)
+    if(NOT STRATA_POLY_MMQ)
+      add_executable(poly_i8m_dp4a_test src/poly/i8m_dp4a_test.cu)
+      target_include_directories(poly_i8m_dp4a_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                                           ${_strata_ggml_root}/ggml/include)
+      target_link_libraries(poly_i8m_dp4a_test PRIVATE strata_poly_mmq ggml-base ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+      add_test(NAME poly_i8m_dp4a_test COMMAND poly_i8m_dp4a_test)
+      set_tests_properties(poly_i8m_dp4a_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+    endif()
   endif()
   # LFM2's short convolution against the same arithmetic on the host; needs a card, so it is run by hand
   add_executable(poly_shortconv_test src/poly/shortconv_test.cu src/poly/kernels.cu)

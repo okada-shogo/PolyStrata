@@ -8903,6 +8903,8 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
 namespace strata::kernels {
 bool gemm_iq_i8_takes(int, int) { return false; }
 void gemm_iq_i8_turing(bool) {}
+void gemm_iq_i8_dp4a(int) {}
+bool gemm_iq_i8_dp4a_on() { return false; }
 void gemm_iq_i8_allow(int, bool) {}
 void gemm_iq_i8_quantize(const float*, const int32_t*, int64_t, int64_t, int, void*, void*) {}
 bool gemm_iq_i8_grouped(int, const void*, size_t, int, int, const void*, int64_t, const int32_t*, int, int, const int32_t*, float*,
