@@ -9992,7 +9992,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family("hy4" if svc.hy4 else None)
+        svc.set_family("hy4" if svc.hy4 else "inkling" if svc.call_format == "inkling" else None)
         if svc.hy4:
             svc._force_text = hy4_dialect.force_text
         requested = cfg.get("parallel")

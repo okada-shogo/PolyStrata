@@ -644,5 +644,37 @@ class Pictures(unittest.TestCase):
             self.assertIn("only supported for user and tool messages", str(e.exception))
 
 
+class EffortWordsTest(unittest.TestCase):
+    """A client's reasoning effort reaches Inkling 2's template in the template's own words and numbers."""
+
+    def setUp(self):
+        import serve.frontend as F
+        self.F = F
+        F.use_family("inkling")
+        self.addCleanup(F.use_family, None)
+
+    def test_words_and_numbers(self):
+        for given, kwargs in (("minimal", {"reasoning_effort": "minimal"}), ("low", {"reasoning_effort": "low"}),
+                              ("medium", {"reasoning_effort": "medium"}), ("high", {"reasoning_effort": "high"}),
+                              ("xhigh", {"reasoning_effort": "xhigh"}), ("max", {"reasoning_effort": "max"}),
+                              ("none", {"enable_thinking": False}), (0.1, {"reasoning_effort": 0.1}),
+                              ("0.2", {"reasoning_effort": 0.2}), (0, {"enable_thinking": False}),
+                              (False, {"enable_thinking": False})):
+            with self.subTest(given=given):
+                self.assertEqual(self.F.effort_kwargs(given), kwargs)
+
+    def test_out_of_range_and_unknown_are_refused(self):
+        for given in (1.0, -0.1, "ludicrous"):
+            with self.subTest(given=given), self.assertRaises(ValueError):
+                self.F.effort_kwargs(given)
+
+    def test_qwen_table_is_unchanged(self):
+        self.F.use_family(None)
+        self.assertEqual(self.F.effort_kwargs("high"), {"reasoning_effort": "xhigh"})
+        self.assertEqual(self.F.effort_kwargs("minimal"), {"enable_thinking": False})
+        with self.assertRaises(ValueError):
+            self.F.effort_kwargs(0.1)
+
+
 if __name__ == "__main__":
     unittest.main()
