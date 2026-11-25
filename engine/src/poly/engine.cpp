@@ -1203,6 +1203,18 @@ void Engine::vmm_settle() {
 #endif
 }
 
+// A piece the card refused is not an error of the next launch.  HIP's VMM calls are runtime calls: a failed
+// hipMemCreate() or hipMemMap() stays as the thread's last error until hipGetLastError() takes it, where CUDA's driver
+// calls leave the runtime's last error alone.  grow_cache() takes a refusal as "the cache keeps what was mapped", and
+// the error then came out of the first checked launch after it: "copy2: out of memory" at the third request of a
+// coding agent's session on an RX 9070 XT (64K context, the default reserve; ROCm 7.2.4).  Taken off only when it is
+// that call's own error, so that a launch's error before it still reaches its ck().
+static void forget_refusal([[maybe_unused]] CUresult r) {
+#if defined(STRATA_USE_HIP)
+    if (r != CUDA_SUCCESS && cudaPeekAtLastError() == r) (void) cudaGetLastError();
+#endif
+}
+
 // VRAM for the first `bytes` of m, in pieces of at most `piece` bytes.  Throws std::runtime_error.
 void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
     // With the pool a piece is one of its handles and comes from it, never from the card; a map it cannot serve
@@ -1238,7 +1250,8 @@ void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
         } else if (pool_on_ && pool_claimed_) {
             throw std::runtime_error("no VRAM for " + std::string(what) + " (" + std::to_string(n >> 20) +
                                      " MiB more)");
-        } else if (cuMemCreate(&h, n, &prop, 0) != CUDA_SUCCESS) {
+        } else if (const CUresult made = cuMemCreate(&h, n, &prop, 0); made != CUDA_SUCCESS) {
+            forget_refusal(made);
             throw std::runtime_error("no VRAM for " + std::string(what) + " (" + std::to_string(n >> 20) +
                                      " MiB more)");
         }
@@ -1247,6 +1260,7 @@ void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
         if (mapped != CUDA_SUCCESS) {
             if (pool_on_) vpool_.push_back(h);
             else cuMemRelease(h);
+            forget_refusal(mapped);
         }
         cu_ck(mapped, "mapping VRAM");
         m.pieces.emplace_back(h, n);
@@ -1712,8 +1726,7 @@ void Engine::cover(int64_t end) {
         // maps below throw: the context does not fit the VRAM this engine has.
         if (more > vpool_bytes()) shrink_cache(more - vpool_bytes());
     } else if (exp_) {
-        size_t free_b = 0, total_b = 0;
-        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        const size_t free_b = card_free();
         const size_t quarter = (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
         size_t cut = held + more > budget_ ? held + more - budget_ : 0;
         if (free_b < more + quarter) cut = std::max(cut, more + quarter - free_b);
@@ -2715,9 +2728,7 @@ bool Engine::mind_card_vram() {
         const size_t have = vpool_bytes(), slack = 2 * kv_step_bytes();
         return have >= slack + (16u << 20) && grow_cache(have - slack) > 0;
     }
-    size_t free_b = 0, total_b = 0;
-    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    const int64_t free = (int64_t) (free_b >> 20);   // this card's
+    const int64_t free = (int64_t) (card_free() >> 20);   // this card's
     if (!vmm_) {   // a cache in one allocation is filled again
         if (free >= reserve_mib_ / 4) return false;
         resize_card_cache(opt_.vram_reserve_mib);
@@ -2732,7 +2743,31 @@ bool Engine::mind_card_vram() {
         held_is_budget();
         return true;
     }
-    return free >= keep + (int64_t) (kArenaPiece >> 20) && grow_cache(size_t(free - keep) << 20) > 0;
+    if (free < keep + (int64_t) (kArenaPiece >> 20)) return false;
+    grow_refused_ = false;
+    const bool grew = grow_cache(size_t(free - keep) << 20) > 0;
+    if (grow_refused_) {
+        // The card refused a piece the free VRAM had room for, so it has less than a piece now, whatever it says is
+        // free: that much is not there (vram_unseen_; twice the reserve at most), and `keep` of what it has stays free.
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        vram_unseen_ = std::min(free_b, size_t(2 * reserve_mib_) << 20);
+        std::fprintf(stderr, "strata-poly: the card refused a piece of the expert cache with %zu MiB said to be free; "
+                             "the cache is sized without %zu MiB of that from now on\n", free_b >> 20, vram_unseen_ >> 20);
+        const int64_t now = (int64_t) (card_free() >> 20);
+        if (now < keep) {
+            shrink_cache(size_t(keep - now) << 20);
+            held_is_budget();
+        }
+        return true;
+    }
+    return grew;
+}
+
+size_t Engine::card_free() {
+    size_t free_b = 0, total_b = 0;
+    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    return free_b > vram_unseen_ ? free_b - vram_unseen_ : 0;
 }
 
 // A read of several calls copies each layer's experts that are not cached through the staging buffer, a round
@@ -2912,6 +2947,7 @@ int Engine::grow_cache(size_t bytes, bool later) {
     try {
         vmm_map(arena_, std::min(arena_.mapped + bytes, arena_.reserved), kArenaPiece, "the expert cache");
     } catch (const std::runtime_error&) {
+        grow_refused_ = true;
     }
     if (arena_.mapped < exp_at_ + kTail) return 0;
     zero_vram(exp_ + exp_at_, arena_.mapped - exp_at_);   // the new slots' tails
