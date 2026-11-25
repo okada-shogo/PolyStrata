@@ -16859,7 +16859,7 @@
   {
    "name": "STRATA_INK_ZHA_BUDGET",
    "backends": [
-    "cuda"
+    "cuda-hip"
    ],
    "reads": [
     {
@@ -16894,7 +16894,7 @@
   {
    "name": "STRATA_INK_ZHA_MAX",
    "backends": [
-    "cuda"
+    "cuda-hip"
    ],
    "reads": [
     {
@@ -16929,7 +16929,7 @@
   {
    "name": "STRATA_INK_ZHA_POOL",
    "backends": [
-    "cuda"
+    "cuda-hip"
    ],
    "reads": [
     {
