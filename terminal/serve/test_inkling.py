@@ -710,9 +710,10 @@ class EffortsMatchTheModelTemplate(unittest.TestCase):
                     effort = float(given) if isinstance(given, str) and given[0].isdigit() else given
                     self.assertEqual(ours, self.official.render(self.USER, reasoning_effort=effort))
 
-    def test_default_is_the_templates(self):
+    def test_default_is_the_templates_low(self):
+        # a request that names no effort gets "low" (server.INKLING_DEFAULT_EFFORT), the template's 0.2
         self.assertEqual(self.svc.render_prompt(*openai_to_messages({"messages": self.USER})),
-                         self.official.render(self.USER))
+                         self.official.render(self.USER, reasoning_effort="low"))
 
     def test_off_is_the_template_at_zero_with_the_text_block_open(self):
         for how in ({"reasoning_effort": "none"}, {"reasoning_effort": 0}, {"reasoning_effort": False},
