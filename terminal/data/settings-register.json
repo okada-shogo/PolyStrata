@@ -15795,6 +15795,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_I8M_TURING",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cuda/i8_mma.cuh",
+     "line": 1008,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "0dd159c6a2",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "0dd159c6a2",
+   "last_date": "2026-11-24",
+   "status": "rollback",
+   "owner": "",
+   "note": "Inkling 2 on Turing (sm_75): 0 goes back to the earlier shape of the int8 prompt tiles (one block a multiprocessor) instead of the stages of 128 and 256 threads; the answers are the same.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_I8_BISECT",
    "backends": [
     "cuda-hip"

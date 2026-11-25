@@ -442,6 +442,16 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
   target_link_libraries(poly_mmq_tiles_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   add_test(NAME poly_mmq_tiles_test COMMAND poly_mmq_tiles_test)
   set_tests_properties(poly_mmq_tiles_test PROPERTIES SKIP_RETURN_CODE 77)
+  # the int8 prompt kernel in each tile shape a card may be given against the shape it had before, bit for bit, on
+  # Inkling 2 Mini's products (--time: each shape's time); needs a card
+  if(NOT STRATA_POLY_MMQ AND NOT STRATA_ENABLE_HIP)
+    add_executable(poly_i8m_shapes_test src/poly/i8m_shapes_test.cu)
+    target_include_directories(poly_i8m_shapes_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda
+                                                           ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${_strata_gpu_include_directories})
+    target_link_libraries(poly_i8m_shapes_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+    add_test(NAME poly_i8m_shapes_test COMMAND poly_i8m_shapes_test)
+    set_tests_properties(poly_i8m_shapes_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # the int8 product of a matrix whose rows end inside a stage (32-value blocks) against the same rows padded with
   # zero blocks, bit for bit; needs a card
   if(NOT STRATA_POLY_MMQ)
