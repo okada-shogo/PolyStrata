@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1007,6 +1008,13 @@ protected:
     float* scratch_batch_ = nullptr;
     void use_scratch(bool batch);
     void fill_now();
+    void owe_refills();
+    void fill_owed();
+    void drop_owed(int il, int e);
+    void end_owe() {   ///< a read's cuts are done: what they owe is uploaded
+        if (std::exchange(owe_, false)) fill_owed();
+    }
+    void abandon_owed();   ///< after a failed fill_owed(): the owed experts leave the cache, their slots empty
     void widen_stage();
     void narrow_stage();
     void trim_stage();
@@ -1551,6 +1559,17 @@ protected:
         uint8_t* slot;
     };
     std::vector<Refill> refill_;   ///< empty slots of the cache the follower is to fill (grow_cache(later))
+    /// shrink_cache() takes refill_'s experts as uploaded, where fill_now() would upload them first: their slots
+    /// are theirs (layers' slot), and their bytes come when fill_owed() uploads them, into the slot the cuts leave
+    /// them; one a cut takes out is never uploaded.  1 for each such expert (layer * experts + expert).
+    std::vector<uint8_t> owed_;
+    int n_owed_ = 0;
+    /// An owed expert's slot in the mirror, which owe_refills() gives up as fill_now() would (a spare for
+    /// mirror_keep()), where its bytes stay until a mirror_take() hands the spare out; then null.
+    std::vector<uint8_t*> owed_src_;
+    std::unordered_map<uint8_t*, size_t> owed_spare_;   ///< those spares: whose bytes they hold
+    bool owe_ = false;   ///< read(): the cuts of a read's start leave fill_owed() to the read, before its first layer
+    bool owes_ = false;  ///< shrink_cache() owes refill_'s uploads (owe_refills()), else uploads them first: Inkling 2's
     /// with Options::ram_experts_mib: the CPU's experts read through the mapping, whose pages stay in the working set
     /// (ram_keep(), at the load and after a long prompt); the others come from pool_
     std::vector<uint8_t> kept_;

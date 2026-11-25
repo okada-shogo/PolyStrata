@@ -2381,9 +2381,11 @@ void Engine::shrink_cache(size_t bytes) {
     size_t cut = arena_.mapped;
     for (size_t i = arena_.pieces.size(); i > 0 && arena_.mapped - cut < bytes; --i) cut -= arena_.pieces[i - 1].second;
     settle_swaps();
-    fill_now();
+    if (owes_) owe_refills();
+    else fill_now();
     ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
     const size_t ne = (size_t) n_expert_, end = cut > kTail ? cut - kTail : 0;   // kTail stays past the last slot
+    const auto owed = [&](int il, int e) { return n_owed_ > 0 && owed_[(size_t) il * ne + (size_t) e] != 0; };
     struct Held {
         float recent;
         int64_t prior;
@@ -2418,14 +2420,18 @@ void Engine::shrink_cache(size_t bytes) {
         size_t& k = next[(size_t) L.trade];
         if (k < l.size() && more(x, l[k])) {
             uint8_t*& to = layers_[(size_t) l[k].il].slot[(size_t) l[k].e];
-            mirror_keep(l[k].il, l[k].e, to);   // before x's copy takes its slot
-            ck(cudaMemcpyAsync(to, from, L.slot_bytes, cudaMemcpyDeviceToDevice, cs(st_)), "the expert cache");
+            if (owed(l[k].il, l[k].e)) drop_owed(l[k].il, l[k].e);
+            else mirror_keep(l[k].il, l[k].e, to);   // before x's copy takes its slot
+            // an owed one's bytes go to its new slot when they come
+            if (!owed(x.il, x.e))
+                ck(cudaMemcpyAsync(to, from, L.slot_bytes, cudaMemcpyDeviceToDevice, cs(st_)), "the expert cache");
             from = to;
             to = nullptr;
             if (give_back_) gave_back_[(size_t) l[k].il * ne + (size_t) l[k].e] = 1;
             ++k;
         } else {
-            mirror_keep(x.il, x.e, from);
+            if (owed(x.il, x.e)) drop_owed(x.il, x.e);
+            else mirror_keep(x.il, x.e, from);
             from = nullptr;
             if (give_back_) gave_back_[(size_t) x.il * ne + (size_t) x.e] = 1;
         }
@@ -2444,6 +2450,7 @@ void Engine::shrink_cache(size_t bytes) {
         exp_at_ = std::min(exp_at_, top);
     }
     staged_il_ = -1;
+    if (!owe_) fill_owed();
 }
 
 float* Engine::fbuf(size_t n) {
@@ -3325,6 +3332,10 @@ void Engine::resize_card_cache(int mib) {
     for (Layer& L : layers_) std::fill(L.slot.begin(), L.slot.end(), nullptr);
     refill_.clear();
     gave_back_.clear();
+    std::fill(owed_.begin(), owed_.end(), (uint8_t) 0);
+    std::fill(owed_src_.begin(), owed_src_.end(), nullptr);
+    owed_spare_.clear();
+    n_owed_ = 0;
     staged_il_ = -1;
     cached_ = 0;
     exp_at_ = 0;
@@ -4196,6 +4207,121 @@ void Engine::fill_now() {
         ++cached_;
     }
     refill_.clear();
+}
+
+// shrink_cache()'s fill_now() without the uploads: each refill_ expert takes its slot as fill_now() gives it, and is
+// owed its bytes (fill_owed()).  The cut then decides as it did with them uploaded, and an owed expert it takes
+// out needs neither its upload nor the copy back that would follow it (drop_owed()); one it moves needs no copy
+// from its old slot.  After a short answer, IQ4_NL's read of 2,048 tokens uploaded 306 such experts (1.3 GiB, 108
+// ms on the RTX 2070 Super) before its first layer, and its cuts gave many of them up again.
+void Engine::owe_refills() {
+    if (refill_.empty()) return;
+    owed_.resize(layers_.size() * (size_t) n_expert_, 0);
+    owed_src_.resize(owed_.size(), nullptr);
+    for (const Refill& r : refill_) {
+        const size_t i = (size_t) r.il * n_expert_ + r.e;
+        layers_[(size_t) r.il].slot[(size_t) r.e] = r.slot;
+        coming_[i] = 0;
+        owed_[i] = 1;
+        // its mirror slot becomes a spare as fill_now() makes it one, so the cut's copies back have the spares they
+        // had, but at the front: the ones taken first are the others
+        if (uint8_t* m = mirror_of_.empty() ? nullptr : mirror_of_[i]; m && !refills_mirror()) {
+            owed_src_[i] = m;
+            owed_spare_[m] = i;
+            std::vector<uint8_t*>& sp = mirror_spare_[(size_t) layers_[(size_t) r.il].trade];
+            sp.insert(sp.begin(), m);
+            mirror_of_[i] = nullptr;
+        }
+        ++n_owed_;
+        ++cached_;
+    }
+    refill_.clear();
+}
+
+// The owed experts' bytes, into the slots the cuts left them, as fill_now() uploads them.
+void Engine::fill_owed() {
+    if (n_owed_ == 0) return;
+    for (size_t il = 0; il < layers_.size(); ++il) {
+        Layer& L = layers_[il];
+        for (int e = 0; e < n_expert_; ++e) {
+            uint8_t& o = owed_[il * (size_t) n_expert_ + (size_t) e];
+            if (!o) continue;
+            uint8_t* s = L.slot[(size_t) e];
+            uint8_t*& src = owed_src_[il * (size_t) n_expert_ + (size_t) e];
+            if (src) {   // the spare still holds it (the copy is queued before any later use of the spare)
+                h2d(s, src, L.gu2() + L.d_bytes);
+                owed_spare_.erase(src);
+                src = nullptr;
+            } else if (const uint8_t* m = mirror((int) il, e)) {
+                h2d(s, m, L.gu2() + L.d_bytes);
+                if (!refills_mirror()) mirror_give((int) il, e);
+            } else {
+                h2d(s, L.exp_gate + (size_t) e * L.gu_stride, L.gu_bytes);
+                h2d(s + L.gu_bytes, L.exp_up + (size_t) e * L.u_stride, L.u_bytes);
+                h2d(s + L.gu2(), L.exp_down + (size_t) e * L.d_bytes, L.d_bytes);
+            }
+            o = 0;   // (after the copy is queued: abandon_owed() takes one whose copy threw)
+            --n_owed_;
+        }
+    }
+}
+
+// fill_owed() threw (a CUDA error): an expert still owed has a slot with no bytes in it, so it leaves the cache, and
+// its mirror copy is its own again where its spare still holds it.
+void Engine::abandon_owed() {
+    if (n_owed_ == 0) return;
+    const size_t ne = (size_t) n_expert_;
+    for (size_t k = 0; k < owed_.size(); ++k) {
+        if (!owed_[k]) continue;
+        owed_[k] = 0;
+        layers_[k / ne].slot[k % ne] = nullptr;
+        --cached_;
+        if (uint8_t* m = owed_src_[k]) {
+            std::vector<uint8_t*>& sp = mirror_spare_[(size_t) layers_[k / ne].trade];
+            sp.erase(std::find(sp.begin(), sp.end(), m));
+            owed_spare_.erase(m);
+            owed_src_[k] = nullptr;
+            mirror_of_[k] = m;
+        }
+    }
+    n_owed_ = 0;
+    staged_il_ = -1;
+}
+
+// An owed expert that a cut takes out: never uploaded, so the mirror keeps the copy fill_now() would have given up
+// and mirror_keep() taken back.  One with no copy there gets one from the files, where mirror_keep() would have
+// copied it back from the card.
+void Engine::drop_owed(int il, int e) {
+    const size_t k = (size_t) il * n_expert_ + (size_t) e;
+    owed_[k] = 0;
+    --n_owed_;
+    if (uint8_t* m = owed_src_[k]) {   // its spare still holds it: the mirror's slot again
+        std::vector<uint8_t*>& sp = mirror_spare_[(size_t) layers_[(size_t) il].trade];
+        sp.erase(std::find(sp.begin(), sp.end(), m));
+        owed_spare_.erase(m);
+        owed_src_[k] = nullptr;
+        mirror_of_[k] = m;
+        return;
+    }
+    if (mirror_of_.empty() || mirror(il, e)) return;
+    // A spare no owed expert's bytes are in, from the back as mirror_take() hands them out.  Only an owed one's left:
+    // mirror_take() queues that expert's upload from it on st_, which must be done before the CPU writes it.
+    std::vector<uint8_t*>& sp = mirror_spare_[(size_t) layers_[(size_t) il].trade];
+    uint8_t* s = nullptr;
+    for (size_t j = sp.size(); j > 0 && !s; --j)
+        if (!owed_spare_.count(sp[j - 1])) {
+            s = sp[j - 1];
+            sp.erase(sp.begin() + (ptrdiff_t) (j - 1));
+        }
+    if (!s && (s = mirror_take(il))) ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
+    if (!s) return lock_queue(il, e);
+    // (from the files on this thread: an expert with no mirror copy that was on its way into the cache, rare; the
+    // copy back from the card fill_now() was followed by would have held the thread as long)
+    const Layer& L = layers_[(size_t) il];
+    std::memcpy(s, L.exp_gate + (size_t) e * L.gu_stride, L.gu_bytes);
+    std::memcpy(s + L.gu_bytes, L.exp_up + (size_t) e * L.u_stride, L.u_bytes);
+    std::memcpy(s + L.gu2(), L.exp_down + (size_t) e * L.d_bytes, L.d_bytes);
+    mirror_of_[(size_t) il * (size_t) n_expert_ + (size_t) e] = s;
 }
 
 // What a layer copies to the staging buffer ahead of its routing: the experts outside the cache, the most used
@@ -7727,6 +7853,18 @@ uint8_t* Engine::mirror_take(int il) {
     if (mirror_spare_.empty() || c < 0 || mirror_spare_[(size_t) c].empty()) return nullptr;
     uint8_t* s = mirror_spare_[(size_t) c].back();
     mirror_spare_[(size_t) c].pop_back();
+    // An owed expert's bytes are there: it is uploaded now, from them, as fill_now() would have (on st_, before
+    // what takes the spare writes it), and is no longer owed.
+    if (!owed_spare_.empty())
+        if (const auto it = owed_spare_.find(s); it != owed_spare_.end()) {
+            const size_t k = it->second, ne = (size_t) n_expert_;
+            const Layer& L = layers_[k / ne];
+            h2d(L.slot[k % ne], s, L.gu2() + L.d_bytes);
+            owed_src_[k] = nullptr;
+            owed_[k] = 0;
+            --n_owed_;
+            owed_spare_.erase(it);
+        }
     return s;
 }
 
@@ -9824,6 +9962,19 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     if (n < (n_co > 0 ? 0 : 1) || all > read_rows_)
         throw std::logic_error("read takes 1 to max_read() tokens, co-reads among them");
     lock_idle_.store(false, std::memory_order_relaxed);
+    // The cuts of the read's start (take_prompt(), cover(), widen_stage(), carry_take()) owe their uploads to the
+    // read's first layer: an expert one of them keeps that a later one takes out is never uploaded.
+    struct Owe {
+        Engine& e;
+        ~Owe() {
+            try {
+                e.end_owe();
+            } catch (...) {   // (an error the read throws already, or the next call's): no slot is left owed
+                e.abandon_owed();
+            }
+        }
+    } owe{*this};
+    owe_ = owes_;
     for (const Image& im : images_)
         if (im.at < pos_ + n && im.at + im.n > pos_)
             throw std::logic_error("read takes no rows of a picture: eval() does, a picture a call");
@@ -9912,6 +10063,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     // co-reads go through the layers in packs whatever the experts: one by one their calls would wait as long
     if (n_co == 0 &&
         (n_calls == 1 || !mmq_ || all_cached() || all < opt_.stage_ahead || !(reads_by_layer() || groups))) {
+        end_owe();
         turn = share_to(n_layer_);   // eval() takes the calls through the cards after this one
         pmark(prof::kCopyH2D);   // the first call's embeddings, as a call's own start marks them
         // On several cards the next one takes a call on a thread of its own, while this one runs the call after
@@ -9987,6 +10139,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         pmark(prof::kCopyH2D);
         return read_groups(marks, n_marks, turn, n);
     }
+    end_owe();
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row, r_bytes = r_row * sizeof(float);
     const size_t part = (size_t) std::max(streams(), draft_ ? 3 : 1) * rows_ * e_row;   // a call's rows of r_
     float* const r0 = r_;
@@ -10169,6 +10322,7 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
     for (; g > 1 && !(base = carry_take((size_t) g * per * sizeof(float), most)); g = (g + 1) / 2) {
     }
     g = std::max(g, 1);
+    end_owe();
     moe_left_ = false;
     moe_left_scale_ = nullptr;
     reset_call();

@@ -269,6 +269,9 @@ void Inkling2::load_geometry() {
         const char* v = std::getenv("STRATA_INK_PRESTAGE");
         prestage_ = v && std::string(v) == "1";
     }
+    // A read's cuts take the experts a short answer left on their way into the cache as uploaded, and upload the
+    // ones they keep after the last of them (Engine::owe_refills()).  The same experts end in the cache.
+    owes_ = true;
 #else
     if (const char* v = std::getenv("STRATA_INK_PRESTAGE"); v && std::string(v) == "1")
         std::fprintf(stderr, "strata-poly: STRATA_INK_PRESTAGE=1 is CUDA only: off\n");
