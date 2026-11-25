@@ -727,12 +727,14 @@ size_t Inkling2::recurrent_floats() const { return slots_.size() * past_floats()
 // ROCm on Linux gives VRAM back only with its addresses (Engine::vmm_unmap()), and a prompt's lent buffers crashed
 // strata-poly there (an RX 9070 XT, Inkling 2 Mini IQ4_NL with some experts in RAM): the prompt batch's scratch stays
 // out of them, in one layout as before.  With the experts frozen (STRATA_FREEZE_EXPERTS, --check-batch) lend_prompt()
-// lends nothing, and the small layout would only take VRAM from the expert cache for the whole run.
+// lends nothing, and the small layout would only take VRAM from the expert cache for the whole run; but where a read's
+// calls may take more tokens (Options::prompt_batch 0) the layouts follow them, out of the VRAM that is free.
 bool Inkling2::scores_apart() const {
 #ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
     return false;
 #else
-    return !ds_file_ && !freeze_experts_asked_ && mmq_ && vmm_ && !split_ && rows_ >= kStageRows;
+    return (!ds_file_ || auto_rows_) && (!freeze_experts_asked_ || auto_rows_) && mmq_ && vmm_ && !split_ &&
+           rows_ >= kStageRows;
 #endif
 }
 
@@ -753,7 +755,123 @@ bool Inkling2::every_expert_fits() const {
     return (size_t) vram_free_mib() << 20 >= need;
 }
 
-bool Inkling2::scratch_layouts() const { return scores_apart() && !every_expert_fits(); }
+// With Options::prompt_batch 0 the batch layout follows the read (Engine::widen_rows()) wherever it may.
+bool Inkling2::scratch_layouts() const { return scores_apart() && (auto_rows_ || !every_expert_fits()); }
+
+// The window slots' rings for calls of `rows` tokens: window_ rows and the call's.
+size_t Inkling2::rows_bytes(int rows) const {
+    const size_t grain = auto_rows_ && !rows_malloc_ ? (pool_on_ ? pg_ : grain_) : 1;
+    size_t n = 0;
+    for (const Slot& s : slots_) n += runs(s.il) && blocks_[(size_t) s.il].swa ? 2 : 0;
+    const size_t ring = (size_t) std::min(opt_.max_context, window_ + rows) * kv_row();
+    return n * ((ring + grain - 1) / grain * grain);
+}
+
+// rows_ is now what it is from `was`: each window slot's ring takes window_ rows and a call's, and the last keep_
+// positions before pos_ move to their places in it (the rows past them are of no position the next call reads).  VRAM
+// for a wider ring first: where it is not there, every ring stays as it was.
+void Inkling2::resize_rows(int was) {
+    (void) was;
+    const int r = std::min(opt_.max_context, window_ + rows_);
+    if (rows_malloc_) {   // HIP: a wide read's rings in one allocation of their own, the alloc()'s ones kept aside
+        if (r == ring_) return;
+        const size_t row = kv_row(), ring = (size_t) r * row;
+        ck(cudaStreamSynchronize(cs(st_)), "the attention cache");
+        std::vector<uint16_t**> caches;
+        for (Slot& s : slots_)
+            if (s.keys && blocks_[(size_t) s.il].swa) caches.push_back(&s.keys), caches.push_back(&s.vals);
+        uint8_t* wide = nullptr;
+        if (r > ring_) {
+            void* p = nullptr;
+            if (cudaMalloc(&p, caches.size() * ring) != cudaSuccess) {
+                (void) cudaGetLastError();
+                throw std::runtime_error("no VRAM for a wide read's rings");
+            }
+            wide = (uint8_t*) p;
+            zero_vram(wide, caches.size() * ring);
+            ring_homes_.clear();
+        }
+        // the copies first, then the pointers: a copy that fails leaves every slot where it was
+        const int old = ring_;
+        try {
+            for (size_t i = 0; i < caches.size(); ++i) {
+                uint8_t* const from = (uint8_t*) *caches[i];
+                uint8_t* const to = wide ? wide + i * ring : (uint8_t*) ring_homes_.at(i);
+                ring_ = old;
+                window_runs(pos_, [&](size_t place, size_t at, size_t m) {
+                    ck(cudaMemcpyAsync(ring_tmp_ + place * row, from + at * row, m * row, cudaMemcpyDeviceToDevice,
+                                       cs(st_)),
+                       "the attention cache");
+                });
+                ring_ = r;
+                window_runs(pos_, [&](size_t place, size_t at, size_t m) {
+                    ck(cudaMemcpyAsync(to + at * row, ring_tmp_ + place * row, m * row, cudaMemcpyDeviceToDevice,
+                                       cs(st_)),
+                       "the attention cache");
+                });
+            }
+        } catch (...) {
+            ring_ = old;
+            if (wide) cudaFree(wide);
+            throw;
+        }
+        for (size_t i = 0; i < caches.size(); ++i) {
+            uint16_t* const to = wide ? (uint16_t*) (wide + i * ring) : ring_homes_.at(i);
+            if (wide) ring_homes_.push_back(*caches[i]);
+            *caches[i] = to;
+        }
+        ring_ = r;
+        if (!wide) {   // back home: the wide rings go
+            ck(cudaStreamSynchronize(cs(st_)), "the attention cache");
+            ck(cudaFree(ring_wide_), "the attention cache");
+            ring_wide_ = nullptr;
+            ring_homes_.clear();
+        } else {
+            ring_wide_ = wide;
+        }
+        return;
+    }
+    if (r == ring_ || rings_.empty()) {
+        ring_ = r;
+        return;
+    }
+    const size_t row = kv_row();
+    ck(cudaStreamSynchronize(cs(st_)), "the attention cache");
+    if (r > ring_) {
+        std::vector<size_t> had;
+        try {
+            for (size_t i : rings_) {
+                Mapped& m = grows_[i];
+                had.push_back(m.mapped);
+                vmm_map(m, (size_t) r * row, SIZE_MAX, "the attention cache");
+                zero_vram((uint8_t*) m.base + had.back(), m.mapped - had.back());
+            }
+        } catch (const std::runtime_error&) {
+            ck(cudaStreamSynchronize(cs(st_)), "the attention cache");
+            for (size_t j = 0; j < had.size(); ++j) vmm_unmap(grows_[rings_[j]], had[j]);
+            throw;
+        }
+    }
+    const int old = ring_;
+    for (size_t i : rings_) {
+        uint8_t* const cache = (uint8_t*) grows_[i].base;
+        ring_ = old;
+        window_runs(pos_, [&](size_t place, size_t at, size_t m) {
+            ck(cudaMemcpyAsync(ring_tmp_ + place * row, cache + at * row, m * row, cudaMemcpyDeviceToDevice, cs(st_)),
+               "the attention cache");
+        });
+        ring_ = r;
+        window_runs(pos_, [&](size_t place, size_t at, size_t m) {
+            ck(cudaMemcpyAsync(cache + at * row, ring_tmp_ + place * row, m * row, cudaMemcpyDeviceToDevice, cs(st_)),
+               "the attention cache");
+        });
+    }
+    ring_ = r;
+    if (r < old) {
+        ck(cudaStreamSynchronize(cs(st_)), "the attention cache");
+        for (size_t i : rings_) vmm_unmap(grows_[i], (size_t) r * row);
+    }
+}
 
 int Inkling2::widest() const { return std::max(n_head_ * head_dim_, 2 * n_embd_); }
 
@@ -768,9 +886,18 @@ void Inkling2::alloc_caches() {
         if (!runs(s.il)) continue;
         s.past = st;
         st += past_floats();
-        if (blocks_[(size_t) s.il].swa) {
+        if (blocks_[(size_t) s.il].swa && auto_rows_ && !rows_malloc_) {
+            // the ring follows the read's calls (resize_rows()): addresses for the widest
+            const size_t most = (size_t) std::min(opt_.max_context, window_ + cap_rows_) * row;
+            for (uint16_t** c : {&s.keys, &s.vals}) {
+                rings_.push_back(seq_grows((size_t) ring_ * row, most, "the attention cache"));
+                *c = (uint16_t*) grows_[rings_.back()].base;
+            }
+            if (!ring_tmp_) ring_tmp_ = (uint8_t*) dmalloc((size_t) keep_ * row, "the attention cache");
+        } else if (blocks_[(size_t) s.il].swa) {
             s.keys = (uint16_t*) seq_alloc((size_t) ring_ * row, "the attention cache");
             s.vals = (uint16_t*) seq_alloc((size_t) ring_ * row, "the attention cache");
+            if (rows_malloc_ && !ring_tmp_) ring_tmp_ = (uint8_t*) dmalloc((size_t) keep_ * row, "the attention cache");
         } else {
             s.keys = (uint16_t*) kv_alloc(row, 1);
             s.vals = (uint16_t*) kv_alloc(row, 1);
@@ -883,6 +1010,7 @@ void Inkling2::assign_scratch() {
 }
 
 Inkling2::~Inkling2() {
+    if (ring_wide_) cudaFree(ring_wide_);   // a read that never ended (rows_malloc_)
     if (side_) cudaStreamSynchronize(cs(side_));
     for (void* e : {side_go_, side_done_})
         if (e) cudaEventDestroy((cudaEvent_t) e);
