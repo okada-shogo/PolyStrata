@@ -1010,6 +1010,7 @@ protected:
     void trim_stage();
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
     bool mind_card_vram();
+    size_t card_free();   ///< cudaMemGetInfo()'s free VRAM less vram_unseen_
     size_t trim_card_kv(int64_t end);
     int64_t kv_rows_for(int64_t end) const;   ///< the rows cover() maps for `end`
     int64_t kv_grow() const;    ///< cover()'s step: kKvGrow, or kKvGrowBatch with batch slots off Metal
@@ -1136,6 +1137,11 @@ protected:
     uint64_t rec_tries_ = 0;        ///< record()'s instantiations (STRATA_POLY_RECORD_FAIL, STRATA_POLY_RECORD_DROP)
     int rec_off_ = 0;               ///< calls left that record nothing: the card had no VRAM, and graph_room() none
     int rec_room_mib_ = 0;          ///< what graph_room() took from the expert cache; mind_card_vram() keeps it free
+    /// What cudaMemGetInfo() still called free when the card last refused a piece of the expert cache that
+    /// mind_card_vram() asked for (by the logs of an RX 9070 XT on native ROCm 7.2.4, 350 to 440 MiB).  The free VRAM
+    /// mind_card_vram(), cover(), widen_rows() and Inkling 2's index size the cache by is less this (card_free()).
+    size_t vram_unseen_ = 0;
+    bool grow_refused_ = false;     ///< grow_cache() mapped less than it asked for: the card refused a piece
     bool rec_short_ = false;        ///< a recording found no VRAM in this call: graph_room() at the next one
     bool direct_ = false;           ///< run_direct() is running a recording's launches unrecorded
     size_t rec_dropped_ = 0, rec_unrecorded_ = 0;

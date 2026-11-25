@@ -2561,8 +2561,7 @@ void Inkling2::zha_recap(ZSlot& S, int cap) {
     const size_t bytes_old = 2 * rows_old * (code + scale) + rows_old * sizeof(float);
     ck(cudaStreamSynchronize(cs(st_)), "the index's summaries");
     if (S.zk && exp_ && bytes_new > bytes_old) {
-        size_t free_b = 0, total_b = 0;
-        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        const size_t free_b = card_free();
         const size_t quarter = (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
         if (free_b < bytes_new + quarter) {
             shrink_cache(bytes_new + quarter - free_b);
