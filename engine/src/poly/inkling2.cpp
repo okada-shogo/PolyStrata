@@ -224,6 +224,9 @@ void Inkling2::load_geometry() {
         const char* v = std::getenv("STRATA_INK_PRESTAGE");
         prestage_ = v && std::string(v) == "1";
     }
+#else
+    if (const char* v = std::getenv("STRATA_INK_PRESTAGE"); v && std::string(v) == "1")
+        std::fprintf(stderr, "strata-poly: STRATA_INK_PRESTAGE=1 is CUDA only: off\n");
 #endif
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;
@@ -316,6 +319,8 @@ void Inkling2::load_geometry() {
                      "attention.sliding_window_pattern differs between a layer's applications");
             }
     if (!opt_.draft_model.empty()) ds_open();
+    if (prestage_ && carry_rows() == 0)   // read_groups() prestages, and the drafter's prompt reads go call by call
+        std::fprintf(stderr, "strata-poly: STRATA_INK_PRESTAGE=1 does nothing with --draft-model: off\n");
     if (opt_.window == 0) opt_.window = ds_file_ ? ds_block_ : 1;
 }
 
