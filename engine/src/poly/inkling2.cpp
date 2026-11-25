@@ -1195,7 +1195,6 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
             if (visit == ds_visit_[k]) copy_rows(r_, ds_tap_ + (size_t) k * rows_ * n_embd_, n);
     }
     Slot& S = slots_[(size_t) slot_of(il, pass_of(il))];
-    const size_t ne = (size_t) n * n_embd_;
     const int kv = n_kv_ * head_dim_, hq = n_head_ * head_dim_;
     // step()'s rows (rows_of_), each a token of its own sequence: what reads or writes a sequence's states, caches or
     // position goes a row at a time, each with a token's launches and its own sequence's slot (run_slot())
@@ -1548,6 +1547,13 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
             ink_conv_few(c, InkConv{}, n_embd_, 1, taps_, n, st_, rec_n_, snap_bits_);
             dbg("attn", il, ao_, n_embd_);
         } else {
+#if !defined(STRATA_GPU_METAL)
+            // and the stream's update in the convolution's pass (Metal: ink_conv() and then axpy() or the copies)
+            const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
+            ink_conv_acc(aoraw_, past_a(S), fp(B.a_conv), ao_, r_, mode == 1 ? bl_[il / blk_] : nullptr, mode,
+                         n_embd_, taps_, n, st_, snap_of(past_a(S)), rec_n_, snap_bits_);
+            dbg("attn", il, ao_, n_embd_);
+#else
             ink_conv(aoraw_, past_a(S), fp(B.a_conv), nullptr, ao_, n_embd_, 1, taps_, n, st_, snap_of(past_a(S)),
                      rec_n_, snap_bits_);
             dbg("attn", il, ao_, n_embd_);
@@ -1555,8 +1561,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                 if (!(il == core_start_ && looped)) copy_rows(r_, bl_[il / blk_], n);
                 copy_rows(ao_, r_, n);
             } else {
-                axpy(ao_, 1.f, r_, (int) ne, true, st_);
+                axpy(ao_, 1.f, r_, n * n_embd_, true, st_);
             }
+#endif
         }
     }
 
@@ -1617,9 +1624,14 @@ void Inkling2::tail_rows(int il, int n) {
         ink_conv_few(c, InkConv{}, n_embd_, 1, taps_, n, st_, rec_n_, snap_bits_);
         return;
     }
+#if !defined(STRATA_GPU_METAL)
+    ink_conv_acc(fo_, past_f(S), fp(blocks_[(size_t) il].f_conv), fc_, r_, nullptr, 0, n_embd_, taps_, n, st_,
+                 snap_of(past_f(S)), rec_n_, snap_bits_);
+#else
     ink_conv(fo_, past_f(S), fp(blocks_[(size_t) il].f_conv), nullptr, fc_, n_embd_, 1, taps_, n, st_,
              snap_of(past_f(S)), rec_n_, snap_bits_);
     axpy(fc_, 1.f, r_, n * n_embd_, true, st_);
+#endif
 }
 
 // After the core's last layer, its first again, until the passes are done.  Called for every layer a call runs,

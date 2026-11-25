@@ -626,6 +626,38 @@ void case_conv_acc() {
     }
 }
 
+// ink_conv_acc(): a prompt's convolution and the stream's update in one pass, against ink_conv() and then the launches
+// it stands for (axpy(out, 1, acc), or the copies of mode 1 and 2), byte for byte, with a call's snapshots
+void case_conv_acc_rows() {
+    const int channels = kEmbd;
+    for (const int mode : {0, 1, 2})
+        for (const int rows : {9, 100, 1024}) {
+            const auto x = randv((size_t) rows * channels, 1.0f), acc = randv((size_t) rows * channels, 1.0f);
+            const auto st = randv((size_t) (kTaps - 1) * channels, 1.0f), w = randv((size_t) channels * kTaps, 0.5f);
+            const size_t stride = (size_t) (kTaps - 1) * channels;
+            const unsigned bits = 0x5u;   // the states after tokens 0 and 2
+            Dev<float> dx(x), dw(w), a1(acc), a2(acc), s1(st), s2(st), o1((size_t) rows * channels),
+                o2((size_t) rows * channels), k1((size_t) rows * channels), k2((size_t) rows * channels),
+                n1(2 * stride), n2(2 * stride);
+            ink_conv(dx, s1, dw, nullptr, o1, channels, 1, kTaps, rows, stream(), n1, stride, bits);
+            if (mode == 0) {
+                axpy(o1, 1.f, a1, rows * channels, true, stream());
+            } else {
+                const size_t b = (size_t) rows * channels * sizeof(float);
+                if (mode == 1) ck(cudaMemcpyAsync(k1.p, a1.p, b, cudaMemcpyDeviceToDevice, (cudaStream_t) stream()), "copy");
+                ck(cudaMemcpyAsync(a1.p, o1.p, b, cudaMemcpyDeviceToDevice, (cudaStream_t) stream()), "copy");
+            }
+            ink_conv_acc(dx, s2, dw, o2, a2, mode == 1 ? k2.p : nullptr, mode, channels, kTaps, rows, stream(), n2,
+                         stride, bits);
+            const std::string tag = fmt("ink_conv_acc mode %d, %d rows = ink_conv() + the update", mode, rows);
+            same_bits(tag + ": out", o2.get(), o1.get());
+            same_bits(tag + ": the stream", a2.get(), a1.get());
+            same_bits(tag + ": the state", s2.get(), s1.get());
+            same_bits(tag + ": the snapshots", n2.get(), n1.get());
+            if (mode == 1) same_bits(tag + ": kept", k2.get(), k1.get());
+        }
+}
+
 // ink_moe_conv_add(): a token's experts' weighted sum (with each expert's scale and without), then its convolution
 void case_moe_conv_add() {
     for (const bool scaled : {false, true}) {
@@ -1434,6 +1466,7 @@ const Case kCases[] = {
     {"kv8_store", case_kv8_store},
     {"conv", case_conv},
     {"conv_acc", case_conv_acc},
+    {"conv_acc_rows", case_conv_acc_rows},
     {"moe_conv_add", case_moe_conv_add},
     {"qkv", case_qkv},
     {"mix", case_mix},

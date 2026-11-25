@@ -782,6 +782,25 @@ __global__ void ink_conv_kernel(const float* __restrict__ x, const float* __rest
     out[idx] = conv_value(x, state, w, dyn, channels, heads, taps, t, c, norm);
 }
 
+// ink_conv_kernel's value, written to out, and then the stream's update ink_conv_few_kernel makes (mode 0:
+// acc += out, as axpy(out, 1, acc) adds it; 1: keep = acc, then acc = out; 2: acc = out), the same bits as
+// ink_conv_kernel and then axpy() or the copies.  acc and keep are not x or out.
+__global__ void ink_conv_acc_kernel(const float* __restrict__ x, const float* __restrict__ state,
+                                    const float* __restrict__ w, float* __restrict__ out, float* __restrict__ acc,
+                                    float* __restrict__ keep, int mode, int channels, int taps, int rows, float norm) {
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= size_t(rows) * channels) return;
+    const int t = (int) (idx / channels), c = (int) (idx % channels);
+    const float y = conv_value(x, state, w, nullptr, channels, 1, taps, t, c, norm);
+    out[idx] = y;
+    if (mode == 0) {
+        acc[idx] = acc[idx] + y;
+    } else {
+        if (mode == 1) keep[idx] = acc[idx];
+        acc[idx] = y;
+    }
+}
+
 // A channel a thread: the state after each token of the call that bits names (bit t: after token t), the j-th such
 // state at snap + j * stride.  Before ink_conv_state_kernel, which overwrites the state.
 __global__ void ink_conv_snaps_kernel(const float* x, const float* state, float* snap, size_t stride, unsigned bits,
@@ -2960,6 +2979,24 @@ void ink_conv(const float* x, float* state, const float* w, const float* dyn, fl
     ink_conv_kernel<<<grid((size_t) rows * channels, 256), 256, 0, cs(stream)>>>(x, state, w, dyn, out, channels,
                                                                                   heads, taps, rows, norm);
     launched("ink_conv");
+    if (snap && snap_bits) {
+        ink_conv_snaps_kernel<<<grid((size_t) channels, 256), 256, 0, cs(stream)>>>(x, state, snap, snap_stride,
+                                                                                    snap_bits, channels, taps);
+        launched("ink_conv_snaps");
+    }
+    ink_conv_state_kernel<<<grid((size_t) channels, 256), 256, 0, cs(stream)>>>(x, state, channels, taps, rows);
+    launched("ink_conv_state");
+}
+
+void ink_conv_acc(const float* x, float* state, const float* w, float* out, float* acc, float* keep, int mode,
+                  int channels, int taps, int rows, void* stream, float* snap, size_t snap_stride, unsigned snap_bits) {
+    if (taps < 2 || taps > 8) throw std::invalid_argument("ink_conv_acc: 2 to 8 taps");
+    if (mode < 0 || mode > 2 || (mode == 1 && !keep)) throw std::invalid_argument("ink_conv_acc: mode");
+    if (rows <= 0) return;
+    const float norm = 1.0f / std::sqrt((float) (taps + 1));
+    ink_conv_acc_kernel<<<grid((size_t) rows * channels, 256), 256, 0, cs(stream)>>>(x, state, w, out, acc, keep, mode,
+                                                                                      channels, taps, rows, norm);
+    launched("ink_conv_acc");
     if (snap && snap_bits) {
         ink_conv_snaps_kernel<<<grid((size_t) channels, 256), 256, 0, cs(stream)>>>(x, state, snap, snap_stride,
                                                                                     snap_bits, channels, taps);
