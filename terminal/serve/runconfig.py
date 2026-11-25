@@ -22,7 +22,7 @@ EDITABLE = [
     ("sampling.temperature", ("sampling", "num>=0"),
      "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
     ("sampling.top_p", ("sampling", "0<x<=1"), "Default top_p for requests that send none"),
-    ("sampling.top_k", ("sampling", "int>=0"), "Default top_k for requests that send none (0 = off: the whole vocabulary on Inkling and the other strata-poly models, at most 64 candidates on the Strata engines)"),
+    ("sampling.top_k", ("sampling", "int>=0"), "Default top_k for requests that send none (0 = off; Strata engines keep at most 64)"),
     ("sampling.min_p", ("sampling", "0<=x<=1"), "Default min_p for requests that send none"),
     ("reasoning_budget_tokens", "int>=0", "Cap the thinking of every request at this many tokens (0 or empty: no cap)"),
     ("fit_max_tokens", "bool", "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 like llama.cpp"),
