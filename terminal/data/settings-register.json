@@ -34587,6 +34587,78 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_POLY_RECORD_DROP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 6836,
+     "backend": "cuda-hip",
+     "fn": "env_every"
+    },
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 6966,
+     "backend": "cuda-hip",
+     "fn": "env_every"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4319541e6b",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "4319541e6b",
+   "last_date": "2026-11-24",
+   "status": "research",
+   "owner": "",
+   "note": "test only: Inkling 2, every Nth call (and before every Nth layer recording) drops the layer recordings made so far, to exercise their re-making.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_POLY_RECORD_FAIL",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 6836,
+     "backend": "cuda-hip",
+     "fn": "env_every"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4319541e6b",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "4319541e6b",
+   "last_date": "2026-11-24",
+   "status": "research",
+   "owner": "",
+   "note": "test only: Inkling 2, every Nth layer recording (CUDA graph) fails as one the card has no VRAM for, so that call runs unrecorded. Like STRATA_POLY_STEP_RECORD_FAIL, which does it for batch-slot step recordings.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_POLY_STAGED_TILES",
    "backends": [
     "cuda-hip"
