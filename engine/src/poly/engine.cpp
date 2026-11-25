@@ -2602,6 +2602,14 @@ void Engine::load_moe(int il, bool shared) {
 }
 
 // The engine for a model file: its general.architecture says which.
+std::optional<std::string> Engine::drafter_beside(const std::string& model, bool look) {
+    const Shards file(model);
+    const MetaValue* arch = file.get("general.architecture");
+    const std::string name = arch ? arch->s : std::string();
+    if (name == "inkling2_loop" || name == "inkling2") return look ? Inkling2::drafter_beside(model) : std::string();
+    return std::nullopt;
+}
+
 std::unique_ptr<Engine> Engine::open(const Options& o) {
     const Shards file(o.model);
     const MetaValue* arch = file.get("general.architecture");
@@ -2856,6 +2864,18 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
     for (size_t i = 0; i < count; ++i) h[i] = bf16_of(f[i]);
     h2d(d.p, h.data(), out);
     return d;
+}
+
+int Engine::reserve_with_mib(uint64_t more) const {
+    if (asked_reserve_mib_ >= 0) return reserve_mib_;
+#if defined(STRATA_GPU_METAL)
+    return reserve_mib_;
+#else
+    size_t free_b = 0, total_b = 0;
+    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0) + more;
+    return std::max(reserve_mib_, default_reserve_mib(total_b, ram > 0 && files + (5ULL << 30) > ram));
+#endif
 }
 
 int64_t Engine::vram_free_mib() const {
@@ -5130,6 +5150,7 @@ void Engine::alloc() {
     const size_t batch_floats = scratch_at_;
     rows_floats_.assign(1, batch_floats);
     for (int b = 2 * rows_; auto_rows_ && b <= cap_rows_; b *= 2) rows_floats_.push_back(count_scratch(b));
+    batch_floats_ = batch_floats;
     // The scratch in two layouts where the prompt's buffers are lent (below) and the architecture can: the one for
     // a prompt's batch is lent with them, and a call of a few tokens has a layout of its own.  At a prompt batch of
     // 2,048 Qwen3.6's scratch is 450 MB, of which the few tokens' layout keeps some 70 (the attention's scores).
@@ -5155,6 +5176,7 @@ void Engine::alloc() {
         shared_scratch();   // counts the few tokens' layout
         assign_scratch();
         scratch_few_ = (float*) dmalloc(scratch_at_ * sizeof(float), "scratch");
+        few_floats_ = scratch_at_;
     } else {
         scratch_ = (float*) dmalloc(batch_floats * sizeof(float), "scratch");
         scratch_at_ = 0;

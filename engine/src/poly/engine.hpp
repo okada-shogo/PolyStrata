@@ -256,6 +256,16 @@ struct Image {
     const float* rows = nullptr;
 };
 
+/// A drafter file (Options::draft_model) weighed against an engine loaded without it (Engine::draft_fit()).
+struct DraftFit {
+    bool on = false;         ///< load it: with its VRAM taken, enough of the routed experts stay on the card
+    int experts = 0;         ///< routed experts in VRAM now, without the drafter
+    int with = 0;            ///< about how many would stay with the drafter's buffers in VRAM too
+    int total = 0;           ///< the model's routed experts
+    int64_t mib = 0;         ///< the drafter's VRAM: its weights, caches and scratch
+    std::string why;         ///< the reason in a few words
+};
+
 class Engine {
 public:
     Engine();
@@ -266,6 +276,19 @@ public:
     /// The engine of the architecture the model file names, loaded.  Throws std::runtime_error, as do eval and
     /// the other calls that touch the device.
     static std::unique_ptr<Engine> open(const Options& o);
+    /// For a model whose architecture loads a drafter of its own by default when one lies next to it (Inkling 2:
+    /// a DSpark drafter, dspark-*.gguf): that file, or an empty string for none (or when `look` is false: the folder
+    /// is not read).  No value for other models.
+    static std::optional<std::string> drafter_beside(const std::string& model, bool look = true);
+    /// The drafter `file` weighed against this engine, loaded without it: its VRAM and how many experts it would
+    /// leave on the card (strata-poly loads it by default only when DraftFit::on).  Only an engine of an
+    /// architecture drafter_beside() answers for implements it.
+    virtual DraftFit draft_fit(const std::string& file) const {
+        DraftFit f;
+        f.why = "this model loads no drafter by default";
+        (void) file;
+        return f;
+    }
     void load(const Options& o);
 
     int n_vocab() const { return n_vocab_; }
@@ -968,6 +991,10 @@ protected:
     /// buffers their places in the prompt's, use_scratch(false) in the other.  Recordings are made and replayed
     /// with the few tokens' layout only.
     bool two_scratch_ = false, prompt_scratch_ = false;
+    size_t batch_floats_ = 0, few_floats_ = 0;   ///< the scratch's layouts' floats: a prompt batch's, a few tokens'
+    /// The reserve load() would keep with `more` bytes of files beside the model's (a drafter's): it grows where
+    /// they make the RAM tight (fill_expert_cache()).  The reserve load() kept where one was asked for.
+    int reserve_with_mib(uint64_t more) const;
     float* scratch_few_ = nullptr;
     float* scratch_batch_ = nullptr;
     void use_scratch(bool batch);

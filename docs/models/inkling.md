@@ -308,7 +308,11 @@ as before. Use an NVIDIA card or a Mac for now.
 Not run yet: an AMD card on native Linux or Windows, `--expert-gpu` on two cards (built but not run), `--layer-split`
 on two unequal cards (below; it has run on two RTX 2070 Super), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL on a Mac.
 Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on the CPU. The
-draft file is an option (`--draft-model`). Several requests at once (`"parallel"`, see [BATCHING.md](../BATCHING.md))
+DSpark drafter (`dspark-*.gguf`) loads by default on an NVIDIA or AMD card when it lies next to the model and at least
+two thirds of the routed experts stay in VRAM with it; the engine prints one line saying whether it loaded and why. With
+fewer experts in VRAM it is slower (an 8 GB card: 7% slower with IQ4_NL), so it stays off there; on an RX 9070 XT it
+writes 15% faster with IQ4_NL and 21% faster with UD-Q2_K_XL. `--draft-model FILE` loads one anyway, and
+`--draft-model none` or `--no-draft` leaves it out. Several requests at once (`"parallel"`, see [BATCHING.md](../BATCHING.md))
 are opt-in on an NVIDIA card (up to 16 slots), not with the draft file, not with `--layer-split` and not on AMD. With
 `--tail-skip` (setup's small-card flags) a chat's answer can then depend on the other chats writing at the same time.
 On a Mac the engine takes one request at a time for this model, and the installer writes `"parallel": 1` there. Its

@@ -33,6 +33,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1939,9 +1940,11 @@ void usage() {
                  "                         the block guesses 3, and 4 for GLM 5.3 Flash)\n"
                  "  --lookup N             guess what followed an earlier repeat of the last N or more tokens\n"
                  "                         (default 3, 0 = never)\n"
-                 "  --no-draft             do not run the block that guesses ahead\n"
+                 "  --no-draft             do not run the block that guesses ahead (for Inkling 2, the drafter)\n"
                  "  --draft-model FILE     a file of the same model to take that block from, when --model has none;\n"
-                 "                         for Gemma 4, its draft model (a gemma4-assistant file)\n"
+                 "                         for Gemma 4, its draft model (a gemma4-assistant file); for Inkling 2, its\n"
+                 "                         DSpark drafter: by default a dspark-*.gguf next to the model loads when two\n"
+                 "                         thirds of the experts stay in VRAM with it (none = no drafter)\n"
                  "  --draft-vocab N        the block guesses among the vocabulary's first N tokens (default:\n"
                  "                         131072 for Qwen3.6, Ornith and Tiel, all of it for the others; 0 = all)\n"
                  "  --no-graphs            launch a token's kernels one by one (default: a layer's are recorded once\n"
@@ -2368,7 +2371,51 @@ int main(int argc, char** argv) {
     std::unique_ptr<Engine> loaded;
     try {
         const Clock::time_point t0 = Clock::now();
+        // Inkling 2's DSpark drafter: --draft-model FILE loads it and --no-draft or --draft-model none leaves it out.
+        // Without either, one next to the model loads when the card has the VRAM for it (Engine::draft_fit()): the
+        // engine loads without it first, and that engine stays when the drafter would not fit, the same engine as
+        // with --no-draft; else it loads again with the drafter.
+        std::optional<std::string> beside;
+        try {
+            beside = Engine::drafter_beside(o.model, o.draft && o.draft_model.empty());
+        } catch (const std::exception&) {   // a model Engine::open() cannot read says so itself
+        }
+        // --draft-model none (or off): no drafter, and none looked for next to the model
+        const bool no_drafter = beside && (o.draft_model == "none" || o.draft_model == "off");
+        if (beside && (!o.draft || no_drafter)) o.draft_model.clear();
+        std::string draft_line;
+        if (!beside) {
+        } else if (!o.draft_model.empty()) {
+            draft_line = "on: --draft-model " + o.draft_model;
+        } else if (!o.draft || no_drafter) {
+            draft_line = std::string("off: ") + (o.draft ? "--draft-model none" : "--no-draft");
+        } else if (beside->empty()) {
+            draft_line = "off: no dspark-*.gguf next to the model (--draft-model FILE loads one)";
+        } else if (o.window == 1) {
+            draft_line = "off: --window 1 takes no guesses";
+        }
         loaded = Engine::open(o);
+        if (beside && !beside->empty() && draft_line.empty()) {
+            const std::string name = std::filesystem::path(*beside).filename().string();
+            const auto fit = loaded->draft_fit(*beside);
+            const std::string size = fit.mib > 0 ? " (" + std::to_string(fit.mib) + " MiB)" : "";
+            if (fit.on) {
+                std::fprintf(stderr, "strata-poly: DSpark drafter on: %s%s: %s; loading again with it "
+                                     "(--draft-model none leaves it out)\n", name.c_str(), size.c_str(), fit.why.c_str());
+                loaded.reset();
+                o.draft_model = *beside;
+                try {
+                    loaded = Engine::open(o);
+                } catch (const std::exception& e) {   // as without it, which loaded
+                    o.draft_model.clear();
+                    loaded = Engine::open(o);
+                    draft_line = "off: " + name + " did not load (" + e.what() + ")";
+                }
+            } else {
+                draft_line = "off: " + name + size + ": " + fit.why + " (--draft-model FILE loads it anyway)";
+            }
+        }
+        if (!draft_line.empty()) std::fprintf(stderr, "strata-poly: DSpark drafter %s\n", draft_line.c_str());
         Engine& engine = *loaded;
         [[maybe_unused]] const double load_s = ms_since(t0) / 1000.0;
         std::fprintf(stderr, "strata-poly: loaded in %.1f s; %d of %d routed experts in VRAM (%.1f GiB), %d CPU threads\n",

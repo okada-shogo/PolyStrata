@@ -28,6 +28,9 @@ public:
     // pictures (inkling2_pictures.cpp): a picture's rows go in a call of their own, and skip the token norm
     bool sees() const override { return true; }
     int64_t whole(int64_t at, int64_t m) const override;
+    /// The smallest DSpark drafter next to the model whose matrices ds_load() takes (Engine::drafter_beside()).
+    static std::string drafter_beside(const std::string& model);
+    DraftFit draft_fit(const std::string& file) const override;
 
 protected:
     void load_geometry() override;
@@ -209,6 +212,9 @@ private:
     Dev msg_query(int il);
     void ds_open();
     void ds_load();
+    size_t ds_bytes(const Shards& f) const;
+    /// A drafter matrix's type ds_load() takes: BF16 or Q8_0
+    static bool ds_mat_type(uint32_t type);
     void ds_commit(int n);
     void ds_fold();
     void ds_block(int nb);
@@ -258,6 +264,7 @@ private:
         int64_t cap = 0;
     };
     static constexpr int kDsRing = 16;   ///< positions whose Markov-head context ds_ring_ keeps
+    static constexpr double kDsShare = 2.0 / 3.0;   ///< draft_fit(): the routed experts' share that stays in VRAM with it
     static constexpr int kDsRows = 8;    ///< a block's rows at most
     std::unique_ptr<Shards> ds_file_;
     std::vector<DsLayer> ds_;
