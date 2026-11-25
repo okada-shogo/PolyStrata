@@ -13,9 +13,12 @@ how that was checked). It runs on an NVIDIA card from Turing on (compute capabil
 on one card and one sequence at a time: with `--batch` above 1 the engine reads one sequence (as with `--kv q8_0`),
 and the load stops with a message with `--draft-model`, `--layer-split`, `--expert-gpu` and on a Mac.
 
-On AMD the prompt's three tensor-core kernels (the chunk scores, the exact keys, the tail) run as plain FMA kernels
-with the same rounding (queries, keys, values and weights in fp16, sums in fp32); only the order of the sums differs.
-`poly_zha_kernels_test` checks them, and the NVIDIA ones, against a CPU reference.
+On AMD the prompt's three tensor-core kernels (the chunk scores, the exact keys, the tail) run with the same rounding
+(queries, keys, values and weights in fp16, sums in fp32); only the order of the sums differs. On RDNA3 and RDNA4
+cards (gfx11, gfx12) the chunk scores and the exact keys run on the matrix cores (WMMA), the tail as a plain FMA
+kernel; other AMD cards run all three as FMA kernels, and `STRATA_INK_ZHA_WMMA=0` keeps them on any card. The gfx11
+path is built but has not run on a card yet. `poly_zha_kernels_test` checks every one of them, and the NVIDIA ones,
+against a CPU reference.
 
 The method is ZHA ("Zyphra Hierarchical Attention", [arXiv 2610.42112](https://arxiv.org/abs/2610.42112)), one level
 of it, with the paper's reference queries trained for this model.

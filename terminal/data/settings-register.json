@@ -16962,6 +16962,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_INK_ZHA_WMMA",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/inkling2_zha.cu",
+     "line": 2635,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/INKLING_ZHA.md:19"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "rollback",
+   "owner": "poly",
+   "note": "0: with STRATA_INK_ZHA on an AMD card with matrix cores (gfx11 / gfx12), the prompt's chunk scores and exact keys go back to the scalar FMA kernels instead of the WMMA ones (engine/src/poly/inkling2_zha.cu zha_wmma_card())",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_IO_PF_AHEAD",
    "backends": [
     "cuda-hip"
