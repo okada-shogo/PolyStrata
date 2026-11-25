@@ -15795,6 +15795,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_I8M_DP4A",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cuda/i8_mma.cuh",
+     "line": 1534,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "55e7aea384",
+   "first_date": "2026-11-26",
+   "since": null,
+   "last_commit": "55e7aea384",
+   "last_date": "2026-11-26",
+   "status": "rollback",
+   "owner": "",
+   "note": "Inkling 2 --prompt-int8 on Turing code (sm_75): unset picks dp4a on a GeForce GTX 16 (no tensor cores) where a probe finds the MMAs not faster; 0 never takes dp4a. 1 takes it on any Turing card, as a test of its bits (test only). Same answers.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8M_DP4A_LOG",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cuda/i8_mma.cuh",
+     "line": 1544,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "55e7aea384",
+   "first_date": "2026-11-26",
+   "since": null,
+   "last_commit": "55e7aea384",
+   "last_date": "2026-11-26",
+   "status": "research",
+   "owner": "",
+   "note": "test only: 1 prints the probe that times the MMAs against dp4a (run it on any Turing card; the pick is unchanged).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_I8M_RAW",
    "backends": [
     "cuda-hip"
