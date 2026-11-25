@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -4376,6 +4377,9 @@ void Engine::load(const Options& o) {
     }
     ev_ = ev_row_[0];
     blas_ = blas_create(st_);
+#if !defined(STRATA_GPU_METAL)
+    if (f32_tiles_) tune_f32_tiles();
+#endif
     // The card maps VRAM onto reserved addresses a piece at a time: the attention caches grow with the sequence,
     // and the expert cache has what a short one leaves (cover()).  With --kv-whole the attention caches are one
     // allocation each (kv_alloc()) and the expert cache still gives VRAM to other programs and takes it back
@@ -5591,6 +5595,46 @@ ExpertScales Engine::expert_scales(const Layer& L, const int32_t* ids) const {
     return s;
 }
 
+#if !defined(STRATA_GPU_METAL)
+void Engine::tune_f32_tiles() {
+    if (f32_tile_shapes_.empty()) return;
+    // off: 0, off, no or false (any case); unset or anything else: on
+    if (const char* on = std::getenv("STRATA_POLY_F32_AUTOTUNE"); on && *on) {
+        std::string v(on);
+        for (char& c : v) c = (char) std::tolower((unsigned char) c);
+        if (v == "0" || v == "off" || v == "no" || v == "false") {
+            std::fprintf(stderr, "strata-poly: F32 tiles: STRATA_POLY_F32_AUTOTUNE=%s, the cost model's picks\n", on);
+            return;
+        }
+    }
+    // the cache: STRATA_POLY_F32_TUNE_CACHE, else cache/f32-tiles.txt in the PolyStrata-data folder the model is in,
+    // else the user's cache folder
+    std::string cache;
+    if (const char* c = std::getenv("STRATA_POLY_F32_TUNE_CACHE"); c && *c) cache = c;
+    if (cache.empty()) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path m = fs::absolute(fs::path(opt_.model), ec);
+        for (fs::path p = m; !ec && p.has_parent_path() && p != p.parent_path(); p = p.parent_path())
+            if (p.filename() == "PolyStrata-data") {
+                cache = (p / "cache" / "f32-tiles.txt").string();
+                break;
+            }
+    }
+    if (cache.empty()) {
+#if defined(_WIN32)
+        if (const char* d = std::getenv("LOCALAPPDATA"); d && *d) cache = std::string(d) + "\\PolyStrata\\cache\\f32-tiles.txt";
+#else
+        if (const char* d = std::getenv("XDG_CACHE_HOME"); d && *d) cache = std::string(d) + "/polystrata/f32-tiles.txt";
+        else if (const char* h = std::getenv("HOME"); h && *h) cache = std::string(h) + "/.cache/polystrata/f32-tiles.txt";
+#endif
+    }
+    std::string log;
+    gemm_f32_tiles_autotune(blas_, f32_tile_shapes_, std::min(opt_.prompt_batch, 4096), cache, &log);
+    std::fprintf(stderr, "strata-poly: F32 tiles: %s\n", log.c_str());
+}
+#endif
+
 void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
     if (w.type == kTypeF32 || w.type == kTypeBF16) {
         const int per = rows_per_x ? rows_per_x : w.n_out;
@@ -5603,6 +5647,9 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
                 bf16_to_f32((const uint16_t*) w.p, wf_, count, st_);
                 wf = wf_;
             }
+#if !defined(STRATA_GPU_METAL)
+            if (f32_tiles_ && per == w.n_out) return gemm_f32_tiles(blas_, wf, x, y, w.n_in, w.n_out, n);
+#endif
             return gemm_f32(blas_, wf, x, y, w.n_in, w.n_out, per, n);
         }
         if (w.type == kTypeF32) return gemv_f32(fp(w), x, y, w.n_in, w.n_out, per, n, st_);
