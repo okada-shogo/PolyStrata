@@ -128,6 +128,10 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_I8_WG` | number | Intel Arc | [INTEL_INT8_EXPERTS.md](INTEL_INT8_EXPERTS.md) |
 | `STRATA_INK_FAST_CTRL` | on / off | NVIDIA | - |
 | `STRATA_INK_PRESTAGE` | on / off | NVIDIA | [inkling.md](models/inkling.md) |
+| `STRATA_INK_ZHA` | text | NVIDIA and AMD | [INKLING_ZHA.md](INKLING_ZHA.md), [inkling.md](models/inkling.md) |
+| `STRATA_INK_ZHA_BUDGET` | number | NVIDIA and AMD | [INKLING_ZHA.md](INKLING_ZHA.md) |
+| `STRATA_INK_ZHA_MAX` | number | NVIDIA and AMD | [INKLING_ZHA.md](INKLING_ZHA.md) |
+| `STRATA_INK_ZHA_POOL` | number | NVIDIA and AMD | [INKLING_ZHA.md](INKLING_ZHA.md) |
 | `STRATA_IO_PF_AHEAD` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_IO_PF_GATE` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [release-notes-0.2.0.md](release-notes-0.2.0.md) |
 | `STRATA_IO_PF_GATE_LO` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
@@ -370,7 +374,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WDDM_MARGIN_MIB` | number | AMD | [AMD_HIP.md](AMD_HIP.md) |
 
-## Switches that go back to earlier behaviour (121)
+## Switches that go back to earlier behaviour (123)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -409,9 +413,11 @@ version made it the default.
 | `STRATA_IGPU_PROMPT_SET` | on / off | NVIDIA and AMD | v0.2.16 | [AMD_HIP.md](AMD_HIP.md), [RADEON_780M.md](RADEON_780M.md), [release-notes-0.2.1.md](release-notes-0.2.1.md) |
 | `STRATA_IL_PAD` | number | NVIDIA and AMD | v0.2.16 | - |
 | `STRATA_INK_FLASH` | on / off | NVIDIA and AMD | - | - |
+| `STRATA_INK_FLASH_TOKENS` | number | NVIDIA and AMD | - | - |
 | `STRATA_INK_KERNEL_TABLES` | on / off | NVIDIA | - | [inkling.md](models/inkling.md) |
 | `STRATA_INK_MMA75` | on / off | NVIDIA and AMD | - | [inkling.md](models/inkling.md) |
 | `STRATA_INK_PROJECT_MIXED` | on / off | NVIDIA | - | - |
+| `STRATA_INK_ZHA_WMMA` | on / off | AMD | - | [INKLING_ZHA.md](INKLING_ZHA.md) |
 | `STRATA_IQ3_LANES` | on / off | NVIDIA | - | - |
 | `STRATA_IQ_MT_MIN` | on / off | NVIDIA and AMD, CPU | v0.2.16 | [BATCHING.md](BATCHING.md), [DETAILS.md](DETAILS.md), [OLDER_GPUS.md](OLDER_GPUS.md) |
 | `STRATA_IQ_SLOT_LANES` | on / off | NVIDIA | - | - |
