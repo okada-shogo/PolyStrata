@@ -101,8 +101,7 @@ takes them back. Where the RAM has room, the engine keeps a pinned copy of every
 (NVIDIA, where the engine makes a mirror: Linux by default, Windows with `STRATA_POLY_MIRROR=1`): an expert the cache gives up then needs no copy back from the card, and goes back to it straight
 from pinned memory. The start line says `mirror: all experts (… GiB pinned …)`. It is made when the RAM free to the
 engine (under WSL or in a container, theirs) keeps max(8 GiB, 20% of it) free beside the copy; IQ4_NL takes about
-4.7 GiB more than the copy of the experts outside VRAM alone. The answers are the same. `--no-full-mirror`
-(or `STRATA_POLY_MIRROR=partial`; on Windows, where `STRATA_POLY_MIRROR=1` makes the mirror, `--no-full-mirror`) keeps
+4.7 GiB more than the copy of the experts outside VRAM alone. The answers are the same. `--no-full-mirror` keeps
 the copy to the experts outside VRAM, as before.
 
 On a laptop with an RTX 4070 Laptop (8 GB), a Core i7-14700HX and 32 GB of RAM, on Windows, UD-Q3_K_XL has 1,216 of
