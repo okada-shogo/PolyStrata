@@ -453,8 +453,8 @@ WARM_MIN_TOKENS = 2048           # a shorter prompt start is quick to read again
 BEFORE_LOAD_TIMEOUT_S = 120.0  # #1997: how long the before_load command may run (the config's before_load_timeout_s)
 
 
-# A request that names no effort: "low" (0.2) rather than the template's 0.9.  On GSM8K, HumanEval-free IFEval and
-# long-context probes (190 items, RX 9070 XT, IQ4_NL) it scored the same within noise at half the tokens or less, and
+# A request that names no effort: "low" (0.2) rather than the template's 0.9.  On GSM8K, IFEval and longer probes
+# (140 items, RX 9070 XT, IQ4_NL) it scored the same within noise at half the tokens or less, and
 # at greedy decoding its thinking looped on 2 of 60 IFEval prompts instead of 8.
 INKLING_DEFAULT_EFFORT = "low"
 
