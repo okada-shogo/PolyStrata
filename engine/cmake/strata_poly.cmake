@@ -229,7 +229,7 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
     # Optional model/state check; run by hand with an MTP GGUF and frozen prompt IDs.
     add_executable(poly_gdn_mma_state_test src/poly/gdn_mma_state_test.cpp src/poly/engine.cpp src/poly/expert_card.cpp src/poly/glm5next.cpp
                    src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp
-                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/cpu_experts.cpp src/poly/kernels.cu
+                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/inkling2_zha.cu src/poly/cpu_experts.cpp src/poly/kernels.cu
                    src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
     target_include_directories(poly_gdn_mma_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(poly_gdn_mma_state_test PRIVATE strata_poly_mmq strata_kernels strata_spec strata_quant
@@ -238,7 +238,7 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
 
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/expert_card.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
-                            src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
+                            src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/inkling2_zha.cu src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                             src/poly/spill.cpp src/core/conversation_memory.cpp src/core/conversation_file.cpp
                             src/poly/bench_report.cpp src/poly/bench_probe.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
@@ -264,6 +264,14 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
                                            ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                            ${_strata_poly_driver}
                                            Threads::Threads)
+  # the ZHA index's prompt kernels (tensor cores on NVIDIA, FMA on AMD) against a CPU reference
+  if(STRATA_BUILD_TESTS)
+    add_executable(poly_zha_kernels_test src/poly/inkling2_zha_test.cu)
+    target_include_directories(poly_zha_kernels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+    target_link_libraries(poly_zha_kernels_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+    add_test(NAME poly_zha_kernels_test COMMAND poly_zha_kernels_test)
+    set_tests_properties(poly_zha_kernels_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  endif()
   # needs the model file, so it is run by hand: poly_expert_parity MODEL.gguf
   add_executable(poly_expert_parity src/poly/expert_parity.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu)
   target_include_directories(poly_expert_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -275,7 +283,7 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
   # poly_draft_race_test MODEL.gguf [RUNS] [LAYER_SPLIT]
   add_executable(poly_draft_race_test src/poly/draft_race_test.cpp src/poly/engine.cpp src/poly/expert_card.cpp src/poly/glm5next.cpp
                                       src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
-                                      src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu
+                                      src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/inkling2_zha.cu
                                       src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                                       src/core/conversation_memory.cpp)
   target_include_directories(poly_draft_race_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -287,7 +295,7 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
   # so it is run by hand: poly_layer_split_picks_test MODEL.gguf [LAYER_SPLIT] [TOKENS]
   add_executable(poly_layer_split_picks_test src/poly/layer_split_picks_test.cpp src/poly/engine.cpp src/poly/expert_card.cpp src/poly/glm5next.cpp
                                              src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
-                                             src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu
+                                             src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/inkling2_zha.cu
                                              src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                                              src/core/conversation_memory.cpp)
   target_include_directories(poly_layer_split_picks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -299,7 +307,7 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
   # so it is run by hand: poly_logits_dump MODEL.gguf --tokens ID,ID,... (its usage says the rest)
   add_executable(poly_logits_dump src/poly/logits_dump.cpp src/poly/engine.cpp src/poly/expert_card.cpp src/poly/glm5next.cpp
                                   src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
-                                  src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu
+                                  src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/laguna.cpp src/poly/inkling2.cpp src/poly/inkling2_pictures.cpp src/poly/inkling2.cu src/poly/inkling2_zha.cu
                                   src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                                   src/core/conversation_memory.cpp)
   target_include_directories(poly_logits_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
