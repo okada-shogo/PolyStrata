@@ -3544,9 +3544,10 @@ void Engine::widen_stage() {
     if (stage_lent_ || stage_wide_ <= stage_narrow_) return;
     if (up_) ck(cudaStreamSynchronize(cs(up_)), "the expert staging buffer");
     ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
-    // prestage_: a second part as large, for the next layer run's experts while a run's calls go (prestage(), which
-    // copies from the pinned mirror only)
-    const size_t one = stage_wide_ + 256 + kTail, span = prestage_ && !mirror_of_.empty() ? pad(one) + one : one;
+    // prestage_: room for the next layer run's experts beside a run's, while the run's calls go (prestage(), which
+    // copies from the pinned mirror only): as much as the two largest runs side by side need (ring_need()), at most a
+    // layer's twice
+    const size_t one = stage_wide_ + 256 + kTail, span = prestage_ && !mirror_of_.empty() ? ring_need() : one;
     const size_t want = up_to(span, pool_on_ ? pg_ : grain_) - stage_map_.mapped;
     size_t free_b = 0, total_b = 0;
     ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
@@ -3562,7 +3563,7 @@ void Engine::widen_stage() {
     stage_lent_ = true;   // narrow_stage() gives back what was cut even if the map below fails
     try {
         vmm_map(stage_map_, span, SIZE_MAX, "the expert staging buffer");
-        stage_two_ = span > one ? pad(one) : 0;
+        stage_two_ = prestage_ && !mirror_of_.empty() ? span : 0;
     } catch (const std::runtime_error&) {
         // without the second part each run's experts are copied when the run starts, as without prestage_
         bool mapped = false;
@@ -3578,8 +3579,65 @@ void Engine::widen_stage() {
             return;
         }
     }
-    stage_bytes_ = stage_wide_;
+    // a run's experts in one round, as many as the buffer holds (no more than the layer's, or than the run's need)
+    stage_bytes_ = stage_two_ ? std::min(stage_wide_, stage_two_ - 256 - kTail) : stage_wide_;
     staged_il_ = -1;
+}
+
+// The bytes stage() writes for m experts of L: gate and up back to back, the downs after them, and kTail.
+size_t Engine::stage_span(const Layer& L, int m) const {
+    return pad(pad((size_t) m * L.gu_step) + (size_t) m * L.d_bytes + kTail);
+}
+
+// prestage_: what a read's staging buffer needs for each layer run's experts outside VRAM and the next run's beside
+// them, the largest two neighbours (and a group's last run and the next group's first), as the cache is now.  A
+// layer whose experts are mostly cached needs little: the rest of the two layers' room the old split kept (2 x 627 MB
+// of IQ4_NL's) stays the cache's.  At most that split, at least a layer's room as without prestage_ when the cache
+// holds every expert of the largest run.
+size_t Engine::ring_need() {
+    settle_swaps();   // the experts on their way take their slots now, not during the read
+    const size_t one = stage_wide_ + 256 + kTail, most = pad(one) + one;
+    std::vector<size_t> need;
+    for (int il = lo_; il < hi_; il = next_layer(il)) {
+        const Layer& L = layers_[(size_t) il];
+        const int m = L.moe && mmq_ && L.mmq ? std::min(uncached(L), (int) (stage_wide_ / (L.gu_step + L.d_bytes))) : 0;
+        need.push_back(m > 0 ? stage_span(L, m) : 0);
+    }
+    size_t r = stage_narrow_ + 256 + kTail;
+    for (size_t i = 0; i < need.size(); ++i) r = std::max(r, need[i] + need[i + 1 < need.size() ? i + 1 : 0] + 256);
+    return std::min(pad(r), most & ~size_t(255));   // (256-byte steps: prestage() puts a copy at the top's end)
+}
+
+// prestage_: read_groups() took its rows out of the cache after widen_stage() sized the buffer, so some runs may
+// have more experts outside VRAM now: the buffer grows to what they need, a few times at most (each growth takes
+// experts from the cache again).  A run whose experts and the next's do not fit side by side still runs, its
+// experts copied when it starts (prestage()).
+void Engine::widen_ring() {
+    for (int k = 0; k < 4 && stage_two_; ++k) {
+        const size_t span = ring_need();
+        if (span <= stage_two_) return;
+        if (up_) ck(cudaStreamSynchronize(cs(up_)), "the expert staging buffer");
+        ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
+        const size_t to = up_to(span, pool_on_ ? pg_ : grain_), want = to > stage_map_.mapped ? to - stage_map_.mapped : 0;
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        if (pool_on_) free_b = vpool_bytes();
+        const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+        if (exp_ && free_b < want + quarter) {
+            const size_t had = arena_.mapped;
+            shrink_cache(want + quarter - free_b);
+            held_is_budget();
+            stage_cut_ += had - arena_.mapped;
+        }
+        try {
+            vmm_map(stage_map_, span, SIZE_MAX, "the expert staging buffer");
+        } catch (const std::runtime_error&) {
+            return;
+        }
+        stage_two_ = span;
+        stage_bytes_ = std::min(stage_wide_, stage_two_ - 256 - kTail);
+        staged_il_ = -1;
+    }
 }
 
 // The read is done: the staging buffer goes back to stage_narrow_, and the expert cache takes back what it gave
@@ -4340,21 +4398,25 @@ void Engine::plan_ahead(Layer& L, int il) {
 int Engine::uncached(const Layer& L) const { return (int) std::count(L.slot.begin(), L.slot.end(), nullptr); }
 
 // prestage_: in read_groups(), the experts of the next layer run's layer (next_home_) that are not cached go to the
-// staging buffer's other part (stage_two_) while this run's calls read theirs, on the upload stream behind the copy
+// staging buffer's other end (stage_two_) while this run's calls read theirs, on the upload stream behind the copy
 // of this run's.  That part was the run before's, whose last call the copy waits for (ev_free_ marks it until this
 // call's experts are read).  From the pinned mirror only: its copies are queued at once, where the pinned buffers'
 // would hold this call's launches up while the CPU fills them.  The next run takes them if its experts are still the
 // ones copied (moe_rows()), else copies its own as without this.  The experts, their layout and the launches are
 // the same either way, so the results are too.
-void Engine::prestage(int n) {
+void Engine::prestage(int n, size_t mine) {
     const int il = next_home_;
     Layer& N = layers_[(size_t) il];
     if (!stage_two_ || mirror_of_.empty() || !batched(N, n)) return;
     plan_ahead(N, il);
     const int m = (int) N.ahead.size();
     if (m == 0 || m != uncached(N)) return;
+    // The two runs' copies take the buffer's two ends in turn: this run's is at the bottom (0) or the top, and
+    // `mine` bytes long.  The next one's takes the other end, where it does not reach this one's.
+    const size_t span = stage_span(N, m);
+    if (stage_at_ == 0 ? span + mine > stage_two_ : span > stage_at_) return;
     pre_.il = il;
-    pre_.at = stage_at_ ? 0 : stage_two_;
+    pre_.at = stage_at_ == 0 ? (stage_two_ - span) & ~size_t(255) : 0;
     pre_.experts = N.ahead;
     pre_.ev ^= 1;
     ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) ev_free_, 0), "expert staging");
@@ -8081,7 +8143,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     // The next run's experts go to the other part while this run's calls are read, if this layer's that are not
     // cached are all in this part (no later round of a call copies to the buffer).
     pre_hits_ += pre;
-    if ((early || pre) && next_home_ >= 0 && n_ahead == uncached(L)) prestage(n);
+    if ((early || pre) && next_home_ >= 0 && n_ahead == uncached(L)) prestage(n, stage_span(L, n_ahead));
 
     const Clock::time_point t0 = Clock::now();
     ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
@@ -10322,6 +10384,7 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
     for (; g > 1 && !(base = carry_take((size_t) g * per * sizeof(float), most)); g = (g + 1) / 2) {
     }
     g = std::max(g, 1);
+    if (prestage_) widen_ring();   // (a cut of the cache: before end_owe())
     end_owe();
     moe_left_ = false;
     moe_left_scale_ = nullptr;
@@ -10398,8 +10461,9 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
     }
     restore();
     if (prestage_)
-        std::fprintf(stderr, "strata-poly: prestage: %d of %d layer runs had their experts copied during the run before%s\n",
-                     pre_hits_, pre_runs_,
+        std::fprintf(stderr, "strata-poly: prestage: %d of %d layer runs had their experts copied during the run before, "
+                             "%zu MiB of staging%s\n",
+                     pre_hits_, pre_runs_, stage_two_ >> 20,
                      pre_on ? "" : mirror_of_.empty() ? " (no pinned mirror)" : " (no VRAM for a second part)");
     pos_ = pos0 + n;
     stats_.tokens += n;

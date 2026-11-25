@@ -872,7 +872,10 @@ protected:
     void trim_step_graphs(size_t keep, bool all);
     void moe_rows(Layer& L, int il, int n);
     void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false, uint8_t* to = nullptr);
-    void prestage(int n);
+    void prestage(int n, size_t mine);
+    size_t stage_span(const Layer& L, int m) const;
+    size_t ring_need();
+    void widen_ring();
     void drop_prestage();
     int uncached(const Layer& L) const;
     void stage_rest(const Layer& L, const int32_t* experts, const std::vector<int>& which, int m, void* stream,
@@ -1491,8 +1494,8 @@ protected:
     void* ev_hr_ = nullptr;                       ///< marks the card's last read of h_r_ by draft_input()
     int staged_il_ = -1;                          ///< the layer whose experts the buffer holds for its next call, or -1
     std::vector<int32_t> staged_;                 ///< those experts, in the buffer's order: one round of the layer's
-    size_t stage_at_ = 0;                         ///< where in stage_ they are: 0, or stage_two_ (prestage())
-    size_t stage_two_ = 0;                        ///< where the buffer's second part starts while a read maps it, or 0
+    size_t stage_at_ = 0;                         ///< where in stage_ they are: 0, or the top (prestage())
+    size_t stage_two_ = 0;                        ///< the bytes of stage_ two runs' copies share while a read maps them, or 0
     struct Prestaged {
         int il = -1;                              ///< the layer whose experts prestage() copies, or -1
         size_t at = 0;                            ///< where in stage_
