@@ -1502,16 +1502,17 @@ static bool vmm_under_dxg() {
 #endif
 
 #ifdef STRATA_VMM_EQUAL_PIECES
-// Which reservations' pieces must all be of one size (hip_compat/cuda.h): 2 every one, under WSL2, where ROCm reaches the
-// card through librocdxg (vmm_under_dxg()); 1 the expert cache's only, on native ROCm 7.2.4 (/dev/kfd, an
-// RX 9070 XT), which refuses its shorter last piece as WSL2 does, while the other reservations (attention caches, the
-// staging buffer, a prompt's work memory) map as before there; 0 none.  STRATA_VMM_EQUAL_PIECES=all (or 1), =arena
-// and =0 say it for any Linux HIP build.
+// Which reservations' pieces must all be of one size (hip_compat/cuda.h): 2 every one, 1 the expert cache's only, 0
+// none.  2 on every Linux HIP build: under WSL2 (librocdxg, vmm_under_dxg()) and on native ROCm 7.2.4 (/dev/kfd, an
+// RX 9070 XT) alike, ROCm refuses a piece mapped after a larger one in the same reservation (the expert cache's
+// shorter last piece, and a 68 MiB attention cache's 4 MiB last piece after 8 MiB ones, which stopped a 32K prompt on
+// native Fedora).  STRATA_VMM_EQUAL_PIECES=all (or 1), =arena and =0 say it.  On native Linux the expert cache's
+// pieces are still sized to the room (64, 32 or 16 MiB, below), as #326 sizes them; under WSL2 as before.
 static int vmm_equal_mode() {
     static const int mode = [] {
         if (const char* v = std::getenv("STRATA_VMM_EQUAL_PIECES"); v && v[0])
             return v[0] == '0' ? 0 : std::strcmp(v, "arena") == 0 ? 1 : 2;
-        return vmm_under_dxg() ? 2 : 1;
+        return 2;
     }();
     return mode;
 }
@@ -1660,7 +1661,7 @@ void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
     if (!pool_on_ && (m.equal || vmm_equal_pieces())) {   // whole pieces of the reservation's one size
         // an expert cache that was cut to nothing keeps its piece size for the next map (native only: under WSL
         // vmm_equal_pieces() chooses it again, as before)
-        const bool keep = m.equal && !vmm_equal_pieces();
+        const bool keep = m.equal && !vmm_under_dxg();
         piece = vmm_piece(m.reserved, m.pieces.empty() ? (keep ? m.piece0 : 0) : m.pieces.front().second, bytes, piece,
                           vmm_unit(grain_));
         if (keep && m.pieces.empty()) m.piece0 = piece;
@@ -3026,7 +3027,7 @@ void Engine::fill_expert_cache() {
 #endif
         size_t arena_piece = kArenaPiece;
 #ifdef STRATA_VMM_EQUAL_PIECES
-        if (!pool_on_ && arena_.equal && !vmm_equal_pieces() && free_b > reserve) {   // native; WSL sizes as before
+        if (!pool_on_ && arena_.equal && !vmm_under_dxg() && free_b > reserve) {   // native; WSL sizes as before
             arena_.piece0 = 0;   // chosen again for this load
             // With equal pieces a map covers whole pieces, so it must be sized to the pieces that fit under free
             // minus the reserve, never past it: a cap that needs the room rounded up to a piece is tried with 32 and
