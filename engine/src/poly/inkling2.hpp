@@ -47,6 +47,13 @@ protected:
     bool scratch_layouts() const override;
     bool scores_apart() const;   ///< the attention's scores outside the scratch, for its two layouts to share
     bool every_expert_fits() const;
+    bool auto_rows() const override { return true; }
+    size_t rows_bytes(int rows) const override;
+    void resize_rows(int was) override;
+    std::vector<size_t> rings_;   ///< auto_rows_: the window slots' keys and values, as Engine::grows_ has them
+    uint8_t* ring_tmp_ = nullptr; ///< resize_rows()'s copy of a ring's kept rows
+    uint8_t* ring_wide_ = nullptr;   ///< Engine::rows_malloc_: a wide read's rings, each window slot's keys and values
+    std::vector<uint16_t*> ring_homes_;   ///< and the alloc_caches() rings they stand in for, in that order
     int widest() const override;
     int streams() const override { return 1; }
     void reset_call() override;

@@ -74,7 +74,9 @@ struct Options {
     bool dump = false;            ///< print a checksum of every stage, for comparing against llama.cpp
     // A prompt batch.  More tokens a call and a larger staging buffer read a prompt faster, and both take VRAM
     // that the expert cache, and so decoding, does without.
-    int prompt_batch = 1024;      ///< prompt tokens one eval() takes; the scratch is about 1.4 MiB of VRAM a token
+    int prompt_batch = 1024;      ///< prompt tokens one eval() takes; the scratch is about 1.4 MiB of VRAM a token;
+                                  ///< 0: by the VRAM, where the architecture can (auto_rows()), else 1024
+    int prompt_batch_max = 0;     ///< prompt_batch 0: the most tokens a call may take (0: by the card)
     int stage_mib = 0;            ///< the buffer the experts that are not cached pass through, never more than a
                                   ///< layer's experts take; 0: 128 where a read can widen it (stage_read_mib) on
                                   ///< CUDA, else 2048, about what a layer of Q2_K experts leaves out of the cache
@@ -291,8 +293,8 @@ public:
     /// resize); refreeze_experts() puts it back, and the resized cache is what every request reads.
     void unfreeze_experts();
     void refreeze_experts();
-    /// The most tokens one eval() takes.
-    int max_rows() const { return rows_; }
+    /// The most tokens one eval() takes.  (A read's calls may take more: Options::prompt_batch 0.)
+    int max_rows() const { return base_rows_; }
     /// Feed n tokens from position pos().  With want_logits, logits() then holds the scores of the token after the
     /// last one.
     void eval(const int32_t* tokens, int n, bool want_logits);
@@ -333,6 +335,7 @@ public:
     void end_read() {
         if (stage_lent_) narrow_stage();
         if (carry_lent_) carry_give();
+        if (rows_ != base_rows_) narrow_rows();
         if (prompt_lends_) lend_prompt();
     }
 
@@ -518,6 +521,15 @@ protected:
     /// Whether assign_scratch() may be called again with other buf_rows_, so that the scratch has a layout for a
     /// few tokens and one for a prompt's batch (use_scratch()).
     virtual bool scratch_layouts() const { return false; }
+    /// Options::prompt_batch 0: whether the architecture's calls may take more tokens for a long read than for a
+    /// short one (rows_ between base_rows_ and cap_rows_; resize_rows()).
+    virtual bool auto_rows() const { return false; }
+    /// The VRAM the architecture's buffers of the sequence take for calls of `rows` tokens beyond what they take
+    /// for none (a window layer's ring), as resize_rows() maps it.
+    virtual size_t rows_bytes(int rows) const { (void) rows; return 0; }
+    /// rows_ is now what it is from `was`: the architecture's buffers of the sequence follow it, with what they
+    /// hold.  Throws std::runtime_error where the VRAM is not there, and leaves them as they were.
+    virtual void resize_rows(int was) { (void) was; }
     /// The widest input lin() gets, beside the model's width and the FFNs'.
     virtual int widest() const = 0;
     /// The copies of a token's embedding a layer's input starts from.
@@ -861,8 +873,34 @@ protected:
     /// What take_prompt()'s cut of the expert cache gave up beyond the work memory's share (whole pieces).
     size_t work_over_ = 0;
     bool work_lent_ = false;
-    void take_prompt();
+    void take_prompt(int rows = 0);
     void lend_prompt();
+    /// auto_rows_: the prompt's buffers for calls of `rows` tokens, where they are (prompt_map_), or what they need.
+    struct PromptLayout {
+        size_t at[12] = {}, total = 0;   ///< gu_, hx_, dx_, hf_, mq_, mq2_, mqu_, mqx_, the batch's scratch, work, xq_, q8_
+        size_t work_floats = 0, work_halves = 0, work_bytes = 0;
+    };
+    PromptLayout prompt_layout(int rows) const;
+    void place_prompt(const PromptLayout& l);   ///< the buffers at their places in prompt_map_ and work_map_
+    std::vector<size_t> rows_floats_;   ///< the batch layout's scratch floats for base_rows_ << k rows
+    int q_max_ = 0;
+    bool mixed_tiles_ = false;
+    uint8_t* prompt_base_ = nullptr;   ///< where the prompt's buffers start (prompt_map_, or one allocation)
+    uint8_t* prompt_base0_ = nullptr;  ///< alloc()'s (prompt_base_ is rows_wide_ while a wide read has its own)
+    void* xq_few_ = nullptr;   ///< auto_rows_: xq_ and q8_ for a call of a few tokens; a batch's are in prompt_map_
+    void* q8_few_ = nullptr;
+    void* xq_batch_ = nullptr;
+    void* q8_batch_ = nullptr;
+    size_t count_scratch(int rows);   ///< the batch layout's floats for calls of `rows` tokens (a counting pass)
+    void auto_batch();                ///< alloc(): Options::prompt_batch 0's rows_, cap_rows_ and auto_rows_
+    size_t rows_cut_ = 0;      ///< what widen_rows() took from the expert cache, for narrow_rows() to give back
+    int pick_rows(int want) const;
+    bool widen_rows(int rows, int want);
+    void narrow_rows();
+    /// auto_rows_: a buffer of the sequence's own whose VRAM follows rows_ (resize_rows()): `bytes` now, addresses
+    /// for `most`.  Returns its index in grows_.
+    size_t seq_grows(size_t bytes, size_t most, const char* what);
+    std::vector<Mapped> grows_;
     /// The scratch in two layouts (scratch_layouts()): one for a call of fewer than kStageRows tokens, which stays,
     /// and one for a prompt's batch, which is part of prompt_map_ and lent with it.  use_scratch(true) gives the
     /// buffers their places in the prompt's, use_scratch(false) in the other.  Recordings are made and replayed
@@ -1021,6 +1059,16 @@ protected:
     int n_expert_ = 0, n_used_ = 0, n_ff_exp_ = 0, n_ff_shexp_ = 0, n_moe_ = 0;
     int rows_ = 1;            ///< tokens the scratch is sized for
     int read_rows_ = 1;       ///< the most tokens read() takes
+    /// Options::prompt_batch 0 (auto_rows_): a read's calls take rows_ tokens, from base_rows_ (a call's outside a
+    /// read, and between reads) up to cap_rows_ (widen_rows()); else all three are the one batch.
+    int base_rows_ = 1, cap_rows_ = 1;
+    bool auto_rows_ = false;
+    bool auto_asked_ = false;   ///< Options::prompt_batch was 0
+    /// auto_rows_ where the prompt's buffers are not lent (HIP): the base batch's stay where they are, and a wider read
+    /// gets buffers of its own (rows_wide_), allocated for the read and freed after it (widen_rows(), narrow_rows()).
+    bool rows_malloc_ = false;
+    uint8_t* rows_wide_ = nullptr;
+    float* scratch_base_ = nullptr;   ///< rows_malloc_: the scratch while the wide buffers are in use
     // read()'s calls between two layers: r_ holds two calls' rows, and with more calls than that the others'
     // wait in host memory, copied out and in beside the card's work on the call between
     struct Call {
