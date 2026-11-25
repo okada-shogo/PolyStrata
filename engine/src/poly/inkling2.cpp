@@ -1045,7 +1045,7 @@ void Inkling2::assign_scratch() {
     if (ds_file_) {   // the drafter's: a call's features and mixes, and a block's rows
         const size_t E = (size_t) n_embd_, hq = (size_t) n_head_ * head_dim_, kv = (size_t) n_kv_ * head_dim_,
                      B = (size_t) ds_block_, V = (size_t) n_vocab_, R = (size_t) ds_rank_;
-        ds_tap_ = fbuf(4 * n * E);
+        ds_tap_ = ds_home_ = fbuf(kDsTaps * n * E);
         ds_mix_ = fbuf(3 * n * E);
         ds_k_ = fbuf(std::max(n, B) * kv);
         ds_v_ = fbuf(std::max(n, B) * kv);
@@ -2058,14 +2058,19 @@ size_t Inkling2::extra_bytes() const {
 }
 
 // On a layer split the next card goes on from these and r_: what crosses is the stream, the four blocks' starts the
-// mixes read and the loop's bank (64.5 KB a token at Inkling 2 Mini's width).
-float* Inkling2::carried(int i) { return i < kBlocks ? bl_[i] : i == kBlocks ? bank_ : bank_out_; }
+// mixes read and the loop's bank (64.5 KB a token at Inkling 2 Mini's width).  The drafter's taps after them are
+// read()'s groups' only: the drafter runs on one card.
+float* Inkling2::carried(int i) {
+    if (i >= kBlocks + 2) return ds_tap_ + (size_t) (i - kBlocks - 2) * rows_ * n_embd_;
+    return i < kBlocks ? bl_[i] : i == kBlocks ? bank_ : bank_out_;
+}
 
 void Inkling2::carry_at(float* at) {
     const auto place = [&](int i) { return at ? at + (size_t) i * rows_ * n_embd_ : home_[i]; };
     for (int i = 0; i < kBlocks; ++i) bl_[i] = place(i);
     bank_ = place(kBlocks);
     bank_out_ = place(kBlocks + 1);
+    if (ds_file_) ds_tap_ = at ? at + (size_t) (kBlocks + 2) * rows_ * n_embd_ : ds_home_;
 }
 
 void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) { save_slots(il, -1, pos, dst); }
