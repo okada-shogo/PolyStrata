@@ -3,7 +3,8 @@
 Back to [README.md](../../README.md)
 
 **Inkling 2 Mini** by Thinking Machines: a file of 9 to 18 GB. It is experimental here. It has run on Linux with an
-RTX 5090, on Windows with an 8 GB laptop card and on a Mac with an M5 Ultra (a beta there). It
+RTX 5090 or an AMD RX 9070 XT (also on Windows and WSL2), on Windows with an 8 GB laptop card and on a Mac with an
+M5 Ultra (a beta there). It
 reads pictures too. Its 24 layers of weights run as 48: the twelve in the middle run three
 times for every token. Forty of the 48 look back 1,024 tokens only, so a long conversation takes little VRAM:
 32,768 bytes a token.
@@ -287,25 +288,36 @@ rows took 3.4 s.
 
 | | |
 | --- | --- |
-| **Graphics card** | One **NVIDIA** card with **8 GB of VRAM or more**. It has run on an RTX 5090 (32 GB) and on an RTX 4070 Laptop (8 GB). About 3.7 GB are taken before any expert at a 32K context. Or an **Apple Silicon Mac** (beta): it has run on an M5 Ultra. |
+| **Graphics card** | One **NVIDIA** card with **8 GB of VRAM or more**. It has run on an RTX 5090 (32 GB) and on an RTX 4070 Laptop (8 GB). About 3.7 GB are taken before any expert at a 32K context. Or an **AMD RDNA3 / RDNA4 card** (RX 7000 / 9000; see the AMD notes below), or an **Apple Silicon Mac** (beta): it has run on an M5 Ultra. |
 | **RAM** | About **21, 17 or 13 GB** beside an 8 GB card for UD-Q4_K_XL, UD-Q3_K_XL and UD-Q2_K_XL, the installer's estimate. A 32 GB card holds any of them whole. On a Mac, setup takes UD-Q3_K_XL from 32 GB of unified memory and UD-Q2_K_XL below that. |
 | **Disk** | 9.1 to 17.6 GB for the model file. |
-| **System** | Linux or Windows 10 / 11, and a current NVIDIA driver; or macOS 15 or newer. |
+| **System** | Linux or Windows 10 / 11, and a current NVIDIA driver (ROCm for an AMD card); or macOS 15 or newer. |
 
-**AMD (HIP), experimental, not ready:** the engine builds for RDNA3 and RDNA4 (gfx1100, gfx1200, gfx1201). It has run
-on an RX 7900 XT (gfx1100) and an RX 9070 XT (gfx1201), ROCm 7.2.4, in containers that reach the card through
-librocdxg: the HIP tests pass (16 of 16) and so does the Inkling 2 kernel test. Two failures of the first runs are
-fixed: the first prompt never finished on any AMD card, and with some experts in RAM the RX 9070 XT crashed. With
-every expert on the CPU the answers match an RTX 2070 Super's: on the RX 7900 XT the same most likely token at 61 to
-64 of 64 steps after a 302-token prompt, and at 15 to 16 of 16 after 2,048 tokens. On RDNA4 the prompt's FP16 products
-go through hipBLASLt, which rounds them differently: after one 2,048-token prompt that is unusually sensitive, the RX
-9070 XT's answers differed from CUDA's more than the RX 7900 XT's, and with `ROCBLAS_USE_HIPBLASLT=0` as much as the
-RX 7900 XT's; after 302 and 8,192 tokens they match CUDA's. With some experts in RAM a decode token is routed on
-the card, which hands the experts it lacks to the CPU through the doorbell, as on NVIDIA: no wait for the host at
-each layer. The card's routing rounds a little differently from the host's; `STRATA_POLY_BELL=0` routes on the host
-as before. Use an NVIDIA card or a Mac for now.
+**AMD (HIP):** the engine builds for RDNA3 and RDNA4 (gfx1100, gfx1200, gfx1201). It has run on an RX 9070 XT (gfx1201) on
+native Linux (Fedora, ROCm 7.2.4), on native Windows (TheRock's ROCm) and under WSL2 (ROCm 7.2.4 with librocdxg), and on an
+RX 7900 XT (gfx1100) in containers. Users have also run it on an RX 9060 XT on Linux (#309) and an RX 9070 XT on Windows
+(#323). The HIP tests pass (16 of 16) and so does the Inkling 2 kernel test. With every expert on the CPU the answers match
+an RTX 2070 Super's: on the RX 7900 XT the same most likely token at 61 to 64 of 64 steps after a 302-token prompt, and at
+15 to 16 of 16 after 2,048 tokens. On RDNA4 the prompt's FP16 products go through hipBLASLt, which rounds them differently:
+after one 2,048-token prompt that is unusually sensitive, the RX 9070 XT's answers differed from CUDA's more than the RX
+7900 XT's, and with `ROCBLAS_USE_HIPBLASLT=0` as much as the RX 7900 XT's; after 302 and 8,192 tokens they match CUDA's. With some experts in RAM a decode
+token is routed on the card, which hands the experts it lacks to the CPU through the doorbell, as on NVIDIA: no wait for
+the host at each layer. The card's routing rounds a little differently from the host's; `STRATA_POLY_BELL=0` routes on
+the host as before.
 
-Not run yet: an AMD card on native Linux or Windows, `--expert-gpu` on two cards (built but not run), `--layer-split`
+Notes for AMD cards:
+
+- **rocBLAS must use hipBLASLt.** On RDNA4 the prompt's expert products call rocBLAS, and they are only fast when rocBLAS
+  hands them to hipBLASLt. Arch's `rocblas` package (CachyOS uses it too) is built without hipBLASLt, so prompts are much
+  slower there (`ROCBLAS_USE_HIPBLASLT=0` has the same effect). Use ROCm's own packages.
+- **ROCm 10.2 is as fast as 7.2.4** on native Linux; ROCm 10 itself is not slower.
+- **WSL2 works,** with two caveats: host syncs cost more than on native Linux, so decode is slower there, and shrinking the
+  expert cache can stall for a few seconds.
+- **16 GB cards:** setup adds `--attn-requant q5_0 --loop-bf16 --tail-skip 4` whenever the card cannot hold every expert,
+  on any OS. `--tail-skip` skips experts, so it changes the answers. `./setup.sh --family inkling --inkling-small-card off`
+  leaves them out (see above), or remove the three flags from the run config.
+
+Not run yet: `--expert-gpu` on two cards (built but not run), `--layer-split`
 on two unequal cards (below; it has run on two RTX 2070 Super), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL on a Mac.
 Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on the CPU. The
 DSpark drafter (`dspark-*.gguf`) loads by default on an NVIDIA or AMD card when it lies next to the model and at least
