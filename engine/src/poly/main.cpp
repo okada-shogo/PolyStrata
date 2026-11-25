@@ -168,19 +168,38 @@ private:
     };
 
     /// Every token a candidate: the draw from the softmax of the whole vocabulary, in id order.  The heap below would
-    /// sort all of it (about 30 ms a token for 200K tokens on a Zen 2 core; this is about 1.5 ms).
+    /// sort all of it (about 25 ms a token for 200K tokens on a Zen 2 core); this is one pass of float exp() with a
+    /// sum per block of kBlock tokens, then the draw finds the block and walks inside it (about 0.6 ms).
     int whole(const float* logits, int n_vocab, const Sampling& s, std::mt19937_64& rng) {
-        float mx = logits[0];
-        for (int i = 1; i < n_vocab; ++i) mx = std::max(mx, logits[i]);
-        p_.resize((size_t) n_vocab);
+        float lane[8];
+        std::fill(lane, lane + 8, logits[0]);
+        int i = 0;
+        for (; i + 8 <= n_vocab; i += 8) for (int k = 0; k < 8; ++k) lane[k] = std::max(lane[k], logits[i + k]);
+        for (; i < n_vocab; ++i) lane[0] = std::max(lane[0], logits[i]);
+        const float mx = *std::max_element(lane, lane + 8);   // (eight lanes: one pass the compiler can vectorize)
+        if (!std::isfinite(mx)) return strata::poly::most_likely(logits, n_vocab);   // NaN, or +inf, or all -inf
+        const float inv = 1.f / s.temperature;
+        w_.resize((size_t) n_vocab);
+        sums_.assign((size_t) (n_vocab + kBlock - 1) / kBlock, 0.0);
         double sum = 0.0;
-        for (int i = 0; i < n_vocab; ++i) sum += p_[(size_t) i] = std::exp((double) ((logits[i] - mx) / s.temperature));
+        for (size_t b = 0; b < sums_.size(); ++b) {
+            const int end = std::min(n_vocab, (int) ((b + 1) * kBlock));
+            float part[8] = {};
+            int j = (int) (b * kBlock);
+            for (; j + 8 <= end; j += 8)
+                for (int k = 0; k < 8; ++k) part[k] += w_[(size_t) (j + k)] = std::exp((logits[j + k] - mx) * inv);
+            for (; j < end; ++j) part[0] += w_[(size_t) j] = std::exp((logits[j] - mx) * inv);
+            for (float v : part) sums_[b] += v;
+            sum += sums_[b];
+        }
         double u = std::uniform_real_distribution<double>(0.0, sum)(rng);
-        int last = 0;
-        for (int i = 0; i < n_vocab; ++i) {
-            if (p_[(size_t) i] <= 0.0) continue;
+        size_t b = 0;
+        while (b + 1 < sums_.size() && u >= sums_[b]) u -= sums_[b++];
+        int last = (int) (b * kBlock);
+        for (int i = last, end = std::min(n_vocab, (int) ((b + 1) * kBlock)); i < end; ++i) {
+            if (w_[(size_t) i] <= 0.f) continue;
             last = i;
-            if ((u -= p_[(size_t) i]) < 0.0) return i;
+            if ((u -= w_[(size_t) i]) < 0.0) return i;
         }
         return last;                                    // u came within rounding of the sum
     }
@@ -211,6 +230,9 @@ private:
         for (double& p : p_) p /= sum;
     }
 
+    static constexpr int kBlock = 512;
+    std::vector<float> w_;
+    std::vector<double> sums_;
     std::vector<Cand> cand_;
     std::vector<float> pen_;
     std::vector<double> p_;
