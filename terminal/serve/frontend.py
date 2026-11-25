@@ -159,12 +159,16 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 
 
 _EFFORT_QWEN = dict(EFFORT)
+# Inkling 2's template has its own levels (none 0.0, minimal 0.1, low 0.2, medium 0.7, high 0.9, xhigh and max 0.99)
+# and takes a number from 0 to 0.99 as well: each word goes to the template as it is.
+_EFFORT_INKLING = {"none": None, "off": None, "disabled": None, "false": None, "minimal": "minimal", "low": "low",
+                   "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max", "maximum": "max"}
 _FAMILY: str | None = None
 
 
 def use_family(family: str | None) -> None:
-    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table, or Hy4-Flash's
-    (its template knows no_think, high and max: serve/hy4_dialect.py)."""
+    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table, Hy4-Flash's
+    (its template knows no_think, high and max: serve/hy4_dialect.py) or Inkling 2's."""
     global _FAMILY
     _FAMILY = family
     EFFORT.clear()
@@ -172,7 +176,7 @@ def use_family(family: str | None) -> None:
         from serve import hy4_dialect
         EFFORT.update(hy4_dialect.EFFORT)
         return
-    EFFORT.update(_EFFORT_QWEN)
+    EFFORT.update(_EFFORT_INKLING if family == "inkling" else _EFFORT_QWEN)
 
 
 def effort_kwargs(value) -> dict:
@@ -185,8 +189,20 @@ def effort_kwargs(value) -> dict:
         from serve import hy4_dialect
         mode = hy4_dialect.normalize_effort(value)
         return {"enable_thinking": False} if mode == "no_think" else {"reasoning_effort": mode}
+    if _FAMILY == "inkling" and not isinstance(value, bool):
+        try:
+            level = float(value)
+        except (TypeError, ValueError):
+            level = None
+        if level is not None:
+            if not 0.0 <= level <= 0.99:
+                raise ValueError(f"reasoning effort {value!r}: Inkling 2 takes a number from 0 to 0.99")
+            return {"enable_thinking": False} if level == 0.0 else {"reasoning_effort": level}
     key = str(value).strip().lower()
     if key not in EFFORT:
+        if _FAMILY == "inkling":
+            raise ValueError(f"unknown reasoning effort {value!r}: use none, minimal, low, medium, high, xhigh, max "
+                             "or a number from 0 to 0.99")
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
     level = EFFORT[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}

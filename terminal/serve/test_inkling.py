@@ -657,5 +657,83 @@ class TopKTest(unittest.TestCase):
                 self.assertEqual(StrataEngine.sampling_keys({"top_k": tk}), strata)
 
 
+class EffortWordsTest(unittest.TestCase):
+    """A client's reasoning effort reaches Inkling 2's template in the template's own words and numbers."""
+
+    def setUp(self):
+        import serve.frontend as F
+        self.F = F
+        F.use_family("inkling")
+        self.addCleanup(F.use_family, None)
+
+    def test_words_and_numbers(self):
+        for given, kwargs in (("minimal", {"reasoning_effort": "minimal"}), ("low", {"reasoning_effort": "low"}),
+                              ("medium", {"reasoning_effort": "medium"}), ("high", {"reasoning_effort": "high"}),
+                              ("xhigh", {"reasoning_effort": "xhigh"}), ("max", {"reasoning_effort": "max"}),
+                              ("none", {"enable_thinking": False}), (0.1, {"reasoning_effort": 0.1}),
+                              ("0.2", {"reasoning_effort": 0.2}), (0, {"enable_thinking": False}),
+                              (False, {"enable_thinking": False})):
+            with self.subTest(given=given):
+                self.assertEqual(self.F.effort_kwargs(given), kwargs)
+
+    def test_out_of_range_and_unknown_are_refused(self):
+        for given in (1.0, -0.1, "ludicrous"):
+            with self.subTest(given=given), self.assertRaises(ValueError):
+                self.F.effort_kwargs(given)
+
+    def test_qwen_table_is_unchanged(self):
+        self.F.use_family(None)
+        self.assertEqual(self.F.effort_kwargs("high"), {"reasoning_effort": "xhigh"})
+        self.assertEqual(self.F.effort_kwargs("minimal"), {"enable_thinking": False})
+        with self.assertRaises(ValueError):
+            self.F.effort_kwargs(0.1)
+
+
+class EffortsMatchTheModelTemplate(unittest.TestCase):
+    """Each effort a client can send renders the same prompt as the model's own template given the same effort."""
+    USER = [{"role": "user", "content": "Hi"}]
+
+    def setUp(self):
+        import serve.frontend as F
+        F.use_family("inkling")
+        self.addCleanup(F.use_family, None)
+        self.tok = FullInklingTokens()
+        self.svc = Service(MockEngine(self.tok, "hi"), self.tok, model_template())
+        self.official = model_template()
+
+    def test_every_word_and_number(self):
+        for given in ("minimal", "low", "medium", "high", "xhigh", "max", 0.1, 0.5, 0.7, 0.99, "0.3"):
+            for how in ({"reasoning_effort": given}, {"chat_template_kwargs": {"reasoning_effort": given}},
+                        {"reasoning": {"effort": given}}):
+                with self.subTest(given=given, how=how):
+                    ours = self.svc.render_prompt(*openai_to_messages({"messages": self.USER, **how}))
+                    effort = float(given) if isinstance(given, str) and given[0].isdigit() else given
+                    self.assertEqual(ours, self.official.render(self.USER, reasoning_effort=effort))
+
+    def test_default_is_the_templates(self):
+        self.assertEqual(self.svc.render_prompt(*openai_to_messages({"messages": self.USER})),
+                         self.official.render(self.USER))
+
+    def test_off_is_the_template_at_zero_with_the_text_block_open(self):
+        for how in ({"reasoning_effort": "none"}, {"reasoning_effort": 0}, {"reasoning_effort": False},
+                    {"chat_template_kwargs": {"enable_thinking": False}}):
+            with self.subTest(how=how):
+                ours = self.svc.render_prompt(*openai_to_messages({"messages": self.USER, **how}))
+                self.assertEqual(ours, self.official.render(self.USER, reasoning_effort="none") + INK_TEXT_OPEN)
+
+    def test_bad_efforts_are_a_400_that_names_the_levels(self):
+        for given in (1.0, 0.995, -0.1, "ludicrous", float("nan")):
+            with self.subTest(given=given), self.assertRaises(ValueError) as e:
+                openai_to_messages({"messages": self.USER, "reasoning_effort": given})
+            self.assertIn("0.99", str(e.exception))
+
+    def test_budget_tokens_map_to_low_medium_high(self):
+        for budget, shown in ((1000, "0.2"), (4000, "0.7"), (20000, "0.9")):
+            with self.subTest(budget=budget):
+                m, t, k = anthropic_to_messages({"messages": self.USER, "thinking": {"type": "enabled",
+                                                                                      "budget_tokens": budget}})
+                self.assertIn(f"Thinking effort level: {shown}<", self.svc.render_prompt(m, t, k))
+
+
 if __name__ == "__main__":
     unittest.main()

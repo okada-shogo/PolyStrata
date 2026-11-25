@@ -58,7 +58,10 @@ The model has 24 layers of weights and runs 48: the twelve in the middle three t
 attention caches of its own. Forty of the 48 read the last 1,024 tokens only and keep a ring of that many rows; the
 other eight read the whole context, 32,768 bytes of VRAM a token. A reply is a list of typed blocks (thinking,
 text, a tool call), which the server turns into the same reasoning, content and tool calls as for the other models.
-A request that asks for no thinking has its prompt end inside the text block.
+A request that asks for no thinking has its prompt end inside the text block. Its template has its own thinking levels,
+which `reasoning_effort` (or `chat_template_kwargs`) passes on as they are: `none`, `minimal` (0.1), `low` (0.2),
+`medium` (0.7), `high` (0.9, the default), `xhigh` and `max` (0.99), or a number from 0 to 0.99. `none` or 0 turns
+thinking off. Anthropic's `budget_tokens` maps to `low` (under 2K), `medium` (under 8K) or `high`.
 
 It has run on Linux with an RTX 5090: chat, streaming, separate reasoning, a tool call and its answer, and a
 conversation continued from the cache. On Windows UD-Q3_K_XL was installed by setup and ran the README's benchmark
