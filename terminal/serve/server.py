@@ -453,13 +453,19 @@ WARM_MIN_TOKENS = 2048           # a shorter prompt start is quick to read again
 BEFORE_LOAD_TIMEOUT_S = 120.0  # #1997: how long the before_load command may run (the config's before_load_timeout_s)
 
 
+# A request that names no effort: "low" (0.2) rather than the template's 0.9.  On GSM8K, HumanEval-free IFEval and
+# long-context probes (190 items, RX 9070 XT, IQ4_NL) it scored the same within noise at half the tokens or less, and
+# at greedy decoding its thinking looped on 2 of 60 IFEval prompts instead of 8.
+INKLING_DEFAULT_EFFORT = "low"
+
+
 def inkling_template_kwargs(kwargs: dict) -> dict:
     """Inkling 2's template has one switch, reasoning_effort (a name or a number from 0 to 0.99), written in a system
     message ahead of the conversation; an effort it does not know would stop the render.  Thinking off is "none"."""
     effort = kwargs.get("reasoning_effort")
     known = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
     level = "none" if kwargs.get("enable_thinking") is False else \
-        effort if effort in known or isinstance(effort, (int, float)) else "high"
+        effort if effort in known or isinstance(effort, (int, float)) else INKLING_DEFAULT_EFFORT
     rest = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
     return {**rest, "reasoning_effort": level}
 
