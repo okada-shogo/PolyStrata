@@ -70,6 +70,7 @@ struct Options {
     /// another program that takes some (between requests, and while the engine waits for one: main.cpp's idle watch)
     /// and takes it again when it is free, the experts it gave up first; the VRAM command resizes it the same way
     bool vram_elastic = false;
+    int vram_watch_ms = -1;       ///< --vram-elastic-watch-ms: the idle watch's period; 0 off; below 0: STRATA_VRAM_WATCH_MS or 2000
     bool vram_pool = false;       ///< one pool of VRAM claimed at load, kept for the whole run: the expert cache and the
                                   ///< attention caches trade pieces of it and nothing is given back to the card; the
                                   ///< reserve above is then the margin left outside it (needs VMM)
@@ -447,6 +448,7 @@ public:
     void elastic_resize(int mib);
     bool elastic() const { return opt_.vram_elastic && vmm_ && !pool_on_; }
     bool elastic_asked() const { return opt_.vram_elastic; }
+    int vram_watch_ms() const { return opt_.vram_watch_ms; }
     /// At a request's start, the engine at the furthest point of its `end` tokens it could come back to: the
     /// attention caches give back the rows past `end` that the request before did not reach either.  One long
     /// request leaves them grown, and the expert cache would stay that much smaller for every request after it.

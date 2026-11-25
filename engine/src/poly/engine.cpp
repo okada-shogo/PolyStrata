@@ -1251,7 +1251,7 @@ void Engine::vmm_unmap(Mapped& m, size_t bytes) {
     // --vram-elastic: whether released VRAM comes back without its addresses (below), decided once from an expert-cache
     // shrink of a whole piece or more.  -1 undecided, 0 it does, 1 it does not
     static int readdress = [] {
-        const char* v = std::getenv("STRATA_VRAM_ELASTIC_READDRESS");
+        const char* v = std::getenv("STRATA_VMM_READDRESS");
         if (v && v[0]) return v[0] == '0' ? 0 : 1;
         return wsl_dxg() ? 0 : -1;
     }();
@@ -1281,7 +1281,7 @@ void Engine::vmm_unmap(Mapped& m, size_t bytes) {
     // --vram-elastic: whether this driver keeps released VRAM while the addresses stay is read once, at the first
     // expert-cache shrink of a piece or more (undecided until then: the cycle below, as without the flag): librocdxg (WSL2) gives it back at the release (an RX 9060 XT's 64 of 64 MiB, ROCm
     // 7.2.4), so there the kept pieces are not unmapped and mapped again for every shrink.  Never under WSL2 (/dev/dxg
-    // without /dev/kfd); STRATA_VRAM_ELASTIC_READDRESS=0|1 sets it.
+    // without /dev/kfd); STRATA_VMM_READDRESS=0|1 sets it.
     if (elastic()) {
         if (measure) {
             const size_t want = free0 + (had - m.mapped) / 8 * 7;
