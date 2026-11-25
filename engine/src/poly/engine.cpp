@@ -1362,6 +1362,7 @@ Engine::~Engine() {
     for (void* e : gather_ev_)
         if (e) cudaEventDestroy((cudaEvent_t) e);
     for (void* p : dev_allocs_) cudaFree(p);
+    if (rows_wide_) cudaFree(rows_wide_);   // a read that never ended (rows_malloc_)
     for (Kv& k : kv_) vmm_free(k);
     for (Seq& q : seqs_) {
         for (Kv& k : q.kv) vmm_free(k);
@@ -3563,7 +3564,9 @@ void Engine::auto_batch() {
 #if defined(STRATA_GPU_METAL)
     return;
 #endif
-    if (split_ || draft_ || block_guess_ || !opt_.gpu_experts) return;
+    // (A model's own block guesses, Inkling 2's DSpark drafter, go with it: the drafter keeps nothing in the scratch
+    // from one call to the next, and its blocks are calls of a few tokens.)
+    if (split_ || draft_ || (block_guess_ && !own_blocks()) || !opt_.gpu_experts) return;
     // Calls that follow the read on CUDA only: elsewhere (ROCm on Linux gives VRAM back only with its addresses, and
     // ROCm on Windows is untested) one batch for the run
 #if defined(STRATA_VMM_RELEASE_WITH_ADDRESSES) || defined(STRATA_USE_HIP)
@@ -3617,6 +3620,25 @@ void Engine::auto_batch() {
                             seqs * rows_bytes(b);
         if (free_b >= all + kv + cost + margin) break;
     }
+#if defined(STRATA_USE_HIP)
+    // HIP, where the prompt's buffers are not lent (alloc()): a long read's calls get buffers of their own for the
+    // read, out of free VRAM and, with experts outside VRAM, out of the expert cache (rows_malloc_, widen_rows())
+    // Not under WSL2 (the card through /dev/dxg, no /dev/kfd): there each cut of the cache unmapped, reserved again and
+    // mapped again every piece it kept, about 4 s (RX 9070 XT: an 8K prompt 711 tok/s in calls of 1,024, 576 this
+    // way); on native amdgpu the cut took 27-48 ms and the refill 165 ms for 3.8 GiB.  Nor on Windows (untested).
+#if defined(_WIN32)
+    const bool native = false;
+#else
+    const bool native = access("/dev/kfd", F_OK) == 0;
+#endif
+    if (b == rows_ && native && vmm_ && opt_.batch == 0 && opt_.window < kStageRows) {
+        auto_rows_ = rows_malloc_ = true;
+        cap_rows_ = cap;
+        std::fprintf(stderr, "strata-poly: prompt batch auto: %d tokens a call, up to %d for a long read\n", rows_,
+                     cap);
+        return;
+    }
+#endif
     std::fprintf(stderr, "strata-poly: prompt batch auto: %d tokens a call%s\n", b,
                  b > rows_ ? ", every expert fits beside it" : "");
     rows_ = b;
@@ -3627,6 +3649,10 @@ void Engine::auto_batch() {
 int Engine::pick_rows(int want) const {
     int b = base_rows_;
     while (2 * b <= cap_rows_ && 2 * b - 2 * b / 16 <= want) b *= 2;
+    // HIP (rows_malloc_): the cut and the refill cost a second or more, which calls of 2,048 do not win back (RX 9070 XT
+    // under WSL2 with #302's unmap, IQ4_NL: a 2K prompt 1,191 tok/s in calls of 1,024, 669 in calls of 2,048); 4,096
+    // or none
+    if (rows_malloc_ && b < 4 * base_rows_) b = base_rows_;
     return b;
 }
 
@@ -3664,13 +3690,17 @@ Engine::PromptLayout Engine::prompt_layout(int rows) const {
     l.work_bytes = (l.work_floats * sizeof(float) + 255) / 256 * 256 + (l.work_halves * 2 + 255) / 256 * 256;
     size_t k = 0;   // rows_floats_'s step
     for (int b = base_rows_; b < rows; b *= 2) ++k;
+    // rows_malloc_: a wider read's buffers (rows_wide_) have their scratch, xq_ and q8_ among them; base_rows_' are
+    // alloc()'s, as without auto
+    const bool wide = rows_malloc_ && rows > base_rows_, batch_xq = auto_rows_ && (!rows_malloc_ || wide);
     const size_t sizes[12] = {rr * 2 * n_ff_exp_ * sizeof(float), rr * n_ff_exp_ * sizeof(float),
                               rr * n_embd_ * sizeof(float), rr * sizeof(float),
                               Mmq::q8_bytes((int64_t) rr, n_embd_), Mmq::q8_bytes((int64_t) rr, n_ff_exp_),
                               mixed_tiles_ ? Mmq::q8_bytes((int64_t) rr, n_embd_) : 0, Mmq::q8_bytes(rows, q_max_),
-                              two_scratch_ ? rows_floats_.at(k) * sizeof(float) : 0, prompt_lends_ ? 0 : l.work_bytes,
-                              auto_rows_ ? (size_t) rows * kernels::native_q8_1_bytes(n_embd_) : 0,
-                              auto_rows_ ? (size_t) rows * kernels::native_q8_1_bytes((q_max_ + 255) / 256 * 256) : 0};
+                              two_scratch_ || wide ? rows_floats_.at(k) * sizeof(float) : 0,
+                              prompt_lends_ ? 0 : l.work_bytes,
+                              batch_xq ? (size_t) rows * kernels::native_q8_1_bytes(n_embd_) : 0,
+                              batch_xq ? (size_t) rows * kernels::native_q8_1_bytes((q_max_ + 255) / 256 * 256) : 0};
     for (int i = 0; i < 12; ++i) {
         l.at[i] = l.total;
         l.total += (sizes[i] + 255) / 256 * 256;
@@ -3689,7 +3719,7 @@ void Engine::place_prompt(const PromptLayout& l) {
     if (mixed_tiles_) mqu_ = base + l.at[6];
     mqx_ = base + l.at[7];
     if (two_scratch_) scratch_batch_ = (float*) (base + l.at[8]);
-    if (auto_rows_) {
+    if (auto_rows_ && !rows_malloc_) {
         xq_batch_ = base + l.at[10];
         q8_batch_ = base + l.at[11];
     }
@@ -3709,6 +3739,83 @@ void Engine::place_prompt(const PromptLayout& l) {
 bool Engine::widen_rows(int rows, int want) {
     if (up_) ck(cudaStreamSynchronize(cs(up_)), "a prompt's buffers");
     ck(cudaStreamSynchronize(cs(st_)), "a prompt's buffers");
+    if (rows_malloc_) {
+        // HIP: the read's buffers and the rings it reads into, allocated now and freed by narrow_rows().  Nothing is
+        // asked of the card past what it says is free less the margin: under WSL a card asked for more than it has
+        // does not refuse (it moved memory to RAM, or hung).
+        const size_t margin = std::max((size_t(std::max(reserve_mib_, 0)) << 20) / 4, size_t(512) << 20);
+        // A read after a wide one without end_read() between them (a prompt read in pieces) keeps the calls it has
+        if (rows_wide_) return false;
+        size_t cut = 0;   // what the steps took from the expert cache so far: given back once, if none of them fits
+        // The free VRAM by the bytes given back: ROCm counts them a moment later (native amdgpu, an RX 9070 XT: 3,884 MiB
+        // free 31 ms after a 3,840 MiB cut, 4,203 MiB 5 ms later), and a query right after the cut found too little.
+        size_t counted = 0;
+        double cut_ms = 0;
+        for (; rows > rows_; rows /= 2) {
+            // (pick_rows(): 4,096 or none; 2,048 only on the cut already made for 4,096, where 4,096 did not fit)
+            if (rows < 4 * base_rows_ && cut == 0) break;
+            const PromptLayout l = prompt_layout(rows);
+            const size_t more = l.total + 256 + rows_bytes(rows);
+            size_t free_b = 0, total_b = 0;
+            ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+            free_b = std::max(free_b, counted);
+            size_t keep = margin;
+            if (all_cached() || !exp_ || freeze_experts_) {   // the rows cover() maps for the read stay free too (a frozen
+                                                               // cache does not give them up)
+                const int64_t kv_rows = kv_rows_for(pos_ + want);
+                for (const Kv& k : kv_) {
+                    const size_t b = std::min(up_to((size_t) ((kv_rows + k.per - 1) / k.per) * k.bytes, grain_), k.reserved);
+                    if (b > k.mapped) keep += b - k.mapped;
+                }
+            }
+            if (free_b < more + keep) {
+                const size_t short_by = more + keep - free_b;
+                if (!exp_ || all_cached() || freeze_experts_ || cut + short_by > (arena_.mapped + cut) / 4 * 3) continue;
+                const size_t mapped = arena_.mapped;
+                const auto t0 = std::chrono::steady_clock::now();
+                shrink_cache(short_by);
+                const size_t got = mapped - arena_.mapped;
+                cut += got;
+                counted = free_b + got;
+                free_b = counted;
+                cut_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (free_b < more + keep) continue;
+            }
+            void* p = nullptr;
+            if (cudaMalloc(&p, l.total + 256) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            const int was = rows_;
+            rows_ = rows;
+            try {
+                resize_rows(was);
+            } catch (const std::runtime_error&) {
+                rows_ = was;
+                ck(cudaFree(p), "a prompt's buffers");
+                continue;
+            }
+            rows_wide_ = (uint8_t*) p;
+            rows_cut_ = cut;
+            if (!pool_on_) budget_ -= std::min(budget_, cut);
+            prompt_base_ = rows_wide_;
+            place_prompt(l);
+            scratch_base_ = scratch_;   // the batch's scratch, xq_ and q8_ in the read's buffers
+            scratch_ = (float*) (rows_wide_ + l.at[8]);
+            buf_rows_ = rows_;
+            scratch_at_ = 0;
+            shared_scratch();
+            assign_scratch();
+            xq_ = rows_wide_ + l.at[10];
+            q8_ = rows_wide_ + l.at[11];
+            prompt_scratch_ = true;   // no recording made or replayed with these buffers
+            std::fprintf(stderr, "strata-poly: a read of %d tokens in calls of %d (%zu MiB for the read, %zu MiB of it "
+                                 "from the expert cache in %.0f ms)\n", want, rows, more >> 20, cut >> 20, cut_ms);
+            return true;
+        }
+        if (cut > 0) grow_cache(cut, false);
+        return false;
+    }
     const size_t grain = pool_on_ ? pg_ : grain_;
     const PromptLayout had = prompt_layout(rows_);
     for (; rows > rows_; rows /= 2) {
@@ -3722,7 +3829,7 @@ bool Engine::widen_rows(int rows, int want) {
         if (pool_on_) free_b = vpool_bytes();
         const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
         size_t keep = quarter;   // with every expert cached, the rows cover() maps for the read stay free too
-        if (all_cached() || !exp_) {
+        if (all_cached() || !exp_ || freeze_experts_) {   // (a frozen cache does not give cover() its rows)
             const int64_t kv_rows = kv_rows_for(pos_ + want);
             for (const Kv& k : kv_) {
                 const size_t b = std::min(up_to((size_t) ((kv_rows + k.per - 1) / k.per) * k.bytes, grain), k.reserved);
@@ -3769,6 +3876,31 @@ void Engine::narrow_rows() {
     const int was = rows_;
     rows_ = base_rows_;
     resize_rows(was);
+    if (rows_malloc_) {   // alloc()'s buffers again, and the read's freed
+        prompt_base_ = prompt_base0_;
+        place_prompt(prompt_layout(rows_));
+        scratch_ = scratch_base_;
+        buf_rows_ = rows_;
+        scratch_at_ = 0;
+        shared_scratch();
+        assign_scratch();
+        xq_ = xq_few_;
+        q8_ = q8_few_;
+        prompt_scratch_ = false;
+        ck(cudaStreamSynchronize(cs(st_)), "a prompt's buffers");
+        ck(cudaFree(rows_wide_), "a prompt's buffers");
+        rows_wide_ = nullptr;
+        if (!pool_on_) budget_ += rows_cut_;
+        if (exp_ && rows_cut_ > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            grow_cache(rows_cut_, false);
+            ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
+            std::fprintf(stderr, "strata-poly: the expert cache took back %zu MiB in %.0f ms\n", rows_cut_ >> 20,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        rows_cut_ = 0;
+        return;
+    }
     const PromptLayout l = prompt_layout(rows_);
     ck(cudaStreamSynchronize(cs(st_)), "a prompt's buffers");
     vmm_unmap(prompt_map_, l.total);
@@ -4374,8 +4506,8 @@ void Engine::load(const Options& o) {
     // Options::prompt_batch 0: the batch alloc() settles on, from 1,024
     auto_asked_ = opt_.prompt_batch == 0;
     if (auto_asked_) opt_.prompt_batch = 1024;
-    if (opt_.prompt_batch > 4096 && !auto_rows())
-        throw std::runtime_error("a prompt batch of this model is 1 to 4096 tokens");
+    // calls of more than 4,096 tokens only where auto takes them (CUDA, every expert in VRAM)
+    if (opt_.prompt_batch > 4096) throw std::runtime_error("a prompt batch is 1 to 4096 tokens, or auto");
     if (opt_.stage_mib < 0) throw std::runtime_error("the staging buffer must be at least 1 MiB (0: the default)");
     if (opt_.stage_ahead < 0) throw std::runtime_error("the batch size to stage ahead from cannot be negative");
     if (opt_.expert_swaps < -1 || opt_.expert_swaps > 256)
@@ -4910,7 +5042,7 @@ void Engine::use_scratch(bool batch) {
     shared_scratch();
     assign_scratch();
     prompt_scratch_ = batch;
-    if (auto_rows_) {
+    if (auto_rows_ && !rows_malloc_) {
         xq_ = batch ? xq_batch_ : xq_few_;
         q8_ = batch ? q8_batch_ : q8_few_;
     }
@@ -5012,7 +5144,7 @@ void Engine::alloc() {
 #endif
     two_scratch_ = scratch_layouts() && mmq_ && vmm_ && !split_ && rows_ >= kStageRows &&
                    std::max(opt_.window, most_step) < kStageRows && lends;
-    if (auto_rows_ && !two_scratch_) {   // the calls keep one batch (the window layers' rings have addresses for more)
+    if (auto_rows_ && !two_scratch_ && !rows_malloc_) {   // one batch (the window layers' rings have addresses for more)
         auto_rows_ = false;
         cap_rows_ = rows_;
         rows_floats_.resize(1);
@@ -5034,7 +5166,7 @@ void Engine::alloc() {
     q_max_ = q_max;
     mixed_tiles_ = mixed_tiles;
     // auto_rows_: a call of a few tokens has xq_ and q8_ of its own, and a batch's are in the prompt's buffers
-    const size_t nx = auto_rows_ ? (size_t) kStageRows : n, nc = (size_t) cap_rows_;
+    const size_t nx = auto_rows_ && !rows_malloc_ ? (size_t) kStageRows : n, nc = (size_t) cap_rows_;
     xq_ = dmalloc(nx * kernels::native_q8_1_bytes(n_embd_), "scratch");
     q8_ = dmalloc(nx * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
     xq_few_ = xq_;
@@ -5074,7 +5206,7 @@ void Engine::alloc() {
         } else {
             base = (uint8_t*) dmalloc(lay.total, "scratch");
         }
-        prompt_base_ = base;
+        prompt_base_ = prompt_base0_ = base;
 #if !defined(STRATA_GPU_METAL)
         // What the products take beside their arguments (prompt_layout()).  Made by the products themselves, it came
         // out of the reserve the expert cache leaves, while a prompt was read: with less than that free, the first
@@ -5089,7 +5221,7 @@ void Engine::alloc() {
 #endif
         place_prompt(lay);
         if (two_scratch_) use_scratch(false);
-        if (auto_rows_)
+        if (auto_rows_ && !rows_malloc_)
             std::fprintf(stderr, "strata-poly: prompt batch auto: %d tokens a call, up to %d for a long read (the "
                                  "prompt's buffers %zu MiB, %zu MiB at %d)\n",
                          rows_, cap_rows_, lay.total >> 20, prompt_layout(cap_rows_).total >> 20, cap_rows_);
@@ -9516,13 +9648,13 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     if (n < (n_co > 0 ? 0 : 1) || all > read_rows_)
         throw std::logic_error("read takes 1 to max_read() tokens, co-reads among them");
     lock_idle_.store(false, std::memory_order_relaxed);
-    if (all >= kStageRows) take_prompt(all);
     for (const Image& im : images_)
         if (im.at < pos_ + n && im.at + im.n > pos_)
             throw std::logic_error("read takes no rows of a picture: eval() does, a picture a call");
     for (int k = 0; k < n_marks; ++k)
         if (marks[k].at <= (k ? marks[k - 1].at : 0) || marks[k].at >= n)
             throw std::logic_error("read: the marks rise, above 0 and below the tokens read");
+    if (all >= kStageRows) take_prompt(all);
 
     // the calls: up to max_rows() tokens each, and none across a mark; then each co-read's, from its row 0
     calls_.clear();

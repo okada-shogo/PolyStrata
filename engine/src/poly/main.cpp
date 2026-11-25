@@ -2245,12 +2245,15 @@ int main(int argc, char** argv) {
             const std::string v = val();
             if (v.rfind("auto", 0) == 0) {   // auto, or auto:N for at most N tokens a call
                 o.prompt_batch = 0;
-                o.prompt_batch_max = v.size() > 5 && v[4] == ':' ? std::atoi(v.c_str() + 5) : 0;
-                if (v.size() > 4 && (v[4] != ':' || o.prompt_batch_max < 1))
+                char* end = nullptr;
+                o.prompt_batch_max = v.size() > 5 && v[4] == ':' ? (int) std::strtol(v.c_str() + 5, &end, 10) : 0;
+                if (v.size() > 4 && (v[4] != ':' || o.prompt_batch_max < 1 || (end && *end)))
                     throw std::runtime_error("--prompt-batch takes N, auto or auto:N");
             } else {
-                o.prompt_batch = std::atoi(v.c_str());
-                if (o.prompt_batch < 1) throw std::runtime_error("--prompt-batch takes N, auto or auto:N");
+                char* end = nullptr;
+                o.prompt_batch = (int) std::strtol(v.c_str(), &end, 10);
+                if (o.prompt_batch < 1 || end == v.c_str() || *end)
+                    throw std::runtime_error("--prompt-batch takes N, auto or auto:N");
             }
         }
         else if (a == "--stage-mib") o.stage_mib = std::atoi(val());

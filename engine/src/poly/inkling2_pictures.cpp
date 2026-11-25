@@ -17,9 +17,9 @@ int64_t Inkling2::whole(int64_t at, int64_t m) const {
         if (at >= im.at + im.n) continue;
         if (at < im.at) return std::min(m, im.at - at);
         if (at != im.at) throw std::logic_error("a sequence cannot go on from the middle of a picture");
-        if (im.n > rows_)
+        if (im.n > max_rows())
             throw std::runtime_error("a picture of " + std::to_string(im.n) + " rows is more than a prompt batch (" +
-                                     std::to_string(rows_) + "): raise --prompt-batch or lower the picture's tokens");
+                                     std::to_string(max_rows()) + "): raise --prompt-batch or lower the picture's tokens");
         return im.n;
     }
     return m;

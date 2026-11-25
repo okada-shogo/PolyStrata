@@ -948,6 +948,7 @@ protected:
     int q_max_ = 0;
     bool mixed_tiles_ = false;
     uint8_t* prompt_base_ = nullptr;   ///< where the prompt's buffers start (prompt_map_, or one allocation)
+    uint8_t* prompt_base0_ = nullptr;  ///< alloc()'s (prompt_base_ is rows_wide_ while a wide read has its own)
     void* xq_few_ = nullptr;   ///< auto_rows_: xq_ and q8_ for a call of a few tokens; a batch's are in prompt_map_
     void* q8_few_ = nullptr;
     void* xq_batch_ = nullptr;
@@ -1182,6 +1183,11 @@ protected:
     int base_rows_ = 1, cap_rows_ = 1;
     bool auto_rows_ = false;
     bool auto_asked_ = false;   ///< Options::prompt_batch was 0
+    /// auto_rows_ where the prompt's buffers are not lent (HIP): the base batch's stay where they are, and a wider read
+    /// gets buffers of its own (rows_wide_), allocated for the read and freed after it (widen_rows(), narrow_rows()).
+    bool rows_malloc_ = false;
+    uint8_t* rows_wide_ = nullptr;
+    float* scratch_base_ = nullptr;   ///< rows_malloc_: the scratch while the wide buffers are in use
     // read()'s calls between two layers: r_ holds two calls' rows, and with more calls than that the others'
     // wait in host memory, copied out and in beside the card's work on the call between
     struct Call {
