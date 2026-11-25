@@ -69,10 +69,12 @@ need no flags either:
 ```
 
 `--threads` is the physical cores minus one. On a 16 GB card add the DSpark drafter
-([dspark-Inkling-2-Mini-Q8_0.gguf](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/dspark-Inkling-2-Mini-Q8_0.gguf), 400 MB):
+([dspark-Inkling-2-Mini-Q8_0_Old.gguf](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/dspark-Inkling-2-Mini-Q8_0_Old.gguf), 402,278,560 bytes).
+The repository's root `dspark-Inkling-2-Mini-Q8_0.gguf` is since 2026-11-23 a different layout (llama.cpp #32218's,
+503,889,952 bytes), which this engine does not read:
 
 ```
-  --draft-model dspark-Inkling-2-Mini-Q8_0.gguf
+  --draft-model dspark-Inkling-2-Mini-Q8_0_Old.gguf
 ```
 
 On our RX 9070 XT (with an earlier combined build, without #306) it wrote 121-124 tok/s on IQ4_NL and 143-155 on
