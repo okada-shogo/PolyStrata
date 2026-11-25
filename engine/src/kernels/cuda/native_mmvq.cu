@@ -2119,12 +2119,80 @@ template<> constexpr bool kSlotsLanesFaster<Q5KTraits> = false;
 template<> constexpr bool kSlotsLanesFaster<Q6KTraits> = false;
 #endif
 
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+// native_mmvq_slots_lanes_kernel with R rows a warp and, with SX, the block's activations copied to shared memory once
+// (for activations of up to kLanesX bytes): a lane computes each of its rows' terms as the lanes kernel computes them
+// and sums them in the same order, the same bits; the rows' loads are in flight together.  For the narrow down
+// products on RDNA4: an RX 9070 XT read 8 cached IQ4_NL experts' 1,152-value rows at 349 GB/s a warp a row and 389 two
+// rows a warp, and Q8_0's at 404 and 431 with the activations staged; the 2,304-value rows were slower either way.
+// From PR #200's engine (3bc4042c8).
+constexpr int kLanesX = 2592;   // 2,304 values: 72 Q8_1 blocks of 36 bytes
+
+template<typename F, typename S, int R, bool SX>
+__launch_bounds__(WARPS * WARP)
+__global__ void native_mmvq_slots_lanes_rows_kernel(S slots, int n_in, int n_out) {
+    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
+    const int lane = int(threadIdx.x), blocks_per_row = n_in / F::DIV;
+    const int row0 = (int(blockIdx.x) * WARPS + int(threadIdx.y)) * R;
+    const Q81Block* x = static_cast<const Q81Block*>(at.x);
+    if constexpr (SX) {
+        __shared__ __align__(16) unsigned char xs[kLanesX];
+        const int bytes = blocks_per_row * F::KBY * int(sizeof(Q81Block));
+        const int tid = WARP * int(threadIdx.y) + lane;
+        for (int i = tid * 4; i < bytes; i += WARPS * WARP * 4)
+            *reinterpret_cast<uint32_t*>(xs + i) = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const unsigned char*>(x) + i);
+        __syncthreads();
+        x = reinterpret_cast<const Q81Block*>(xs);
+    }
+    if (row0 >= n_out) return;
+    const auto* w = static_cast<const typename F::Block*>(at.w) + std::size_t(row0) * blocks_per_row;
+    float tmp[R][WARPS] = {};
+    for (int base = 0; base < blocks_per_row; base += F::BPI) {
+#pragma unroll
+        for (int v = 0; v < WARPS; ++v) {
+            const int tid = WARP * v + lane, kbx = base + tid / F::T, kqs = F::kqs(tid);
+            if (kbx < blocks_per_row) {
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+                    if (row0 + r < n_out)
+                        tmp[r][v] += F::apply(F::load(w + std::size_t(r) * blocks_per_row + kbx, kqs), x + kbx * F::KBY, kqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int v = 1; v < WARPS; ++v) tmp[r][0] += tmp[r][v];
+        tmp[r][0] = warp_sum(tmp[r][0]);
+        if (lane == 0 && row0 + r < n_out) at.y[row0 + r] = tmp[r][0];
+    }
+}
+
+// The narrow rows' variant of a format on HIP: rows a warp, and the activations staged (0: the lanes kernel)
+template<typename F> constexpr int kLanesRows = 0;
+template<> constexpr int kLanesRows<SmallTraits<IQ4NLBlock, 4>> = 2;
+template<> constexpr int kLanesRows<SmallTraits<Q80Block, 8>> = 1;
+template<typename F> constexpr bool kLanesSX = std::is_same_v<F, SmallTraits<Q80Block, 8>>;
+constexpr int kLanesNarrow = 36;   // blocks of a narrow row: an expert's 1,152 values
+#endif
+
 template<typename F, typename S>
 void launch_slots(const S& slots, int count, int n_in, int n_out, cudaStream_t s) {
     const dim3 threads(WARP, WARPS);
 #if !defined(STRATA_HIP_GFX906)
     if constexpr (kSlotsLanesFaster<F>) {
         if (slots.lanes) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+            if constexpr (kLanesRows<F> > 0) {
+                if (n_in % F::DIV == 0 && n_in / F::DIV <= kLanesNarrow &&
+                    n_in / F::DIV * F::KBY * int(sizeof(Q81Block)) <= kLanesX) {
+                    constexpr int R = kLanesRows<F>;
+                    const dim3 blocks(unsigned((std::size_t(n_out) + WARPS * R - 1) / (WARPS * R)), unsigned(count));
+                    native_mmvq_slots_lanes_rows_kernel<F, S, R, kLanesSX<F>><<<blocks, threads, 0, s>>>(slots, n_in, n_out);
+                    return;
+                }
+            }
+#endif
             const dim3 blocks(unsigned((std::size_t(n_out) + WARPS - 1) / WARPS), unsigned(count));
             native_mmvq_slots_lanes_kernel<F, S><<<blocks, threads, 0, s>>>(slots, n_in, n_out);
             return;
