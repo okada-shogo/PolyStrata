@@ -75,6 +75,8 @@ class ModelCardSampling(unittest.TestCase):
         self.assertEqual(model_card_sampling("qwen35moe", True)["presence_penalty"], 1.5)
         self.assertEqual(model_card_sampling("hy4flash", True), {"temperature": 0.9, "top_p": 1.0})
         self.assertEqual(model_card_sampling("hy4flash", False), {"temperature": 0.9, "top_p": 1.0})
+        self.assertEqual(model_card_sampling("inkling2", True), {"temperature": 1.0, "top_p": 1.0, "top_k": 0})
+        self.assertEqual(model_card_sampling("inkling2", False), model_card_sampling("inkling2_loop", False))
         self.assertEqual(model_card_sampling(None, True), {})
         self.assertEqual(model_card_sampling("unknown", False), {})
 
@@ -164,6 +166,47 @@ class ModelCardSampling(unittest.TestCase):
         k = self.keys(temperature=0)
         self.assertNotIn("temperature", k)
         self.assertNotIn("penalty_present", k)
+
+    def test_inkling_card_sampling(self):
+        # Inkling 2 Mini's generation_config.json: temperature 1.0, nothing else; top_k 0 is "off" (the engine's
+        # widest list, 64).  Run as strata-poly, whose config has no "arch": the tokenizer names the family.
+        self.svc.model_arch = None
+        self.assertEqual(self.keys(), "")                                   # not Inkling: no card
+        self.svc.call_format = "inkling"
+        try:
+            self.assertEqual(self.svc.card_arch(), "inkling2")
+            for body in ({}, {"reasoning_effort": "low"}):
+                k = self.keys(**body)
+                self.assertIn("temperature=1.0", k)
+                self.assertIn("top_k=64", k)
+                self.assertNotIn("top_p", k)                                # 1.0 is off
+                self.assertNotIn("min_p", k)
+                self.assertNotIn("penalty", k)
+            self.assertIn("temperature=0.6", self.keys(temperature=0.6))   # the request wins
+            self.assertIn("top_k=20", self.keys(top_k=20))
+            self.assertNotIn("temperature", self.keys(temperature=0))      # greedy stays greedy
+            self.svc.sampling_defaults = {"temperature": 0}
+            self.assertNotIn("temperature", self.keys())
+            self.svc.sampling_defaults = {}
+            self.svc.model_arch = "inkling2_loop"                           # a config that does name the family
+            self.assertIn("temperature=1.0", self.keys())
+        finally:
+            self.svc.call_format = "function"
+
+    def test_inkling_sampled_with_a_drafter(self):
+        # Inkling's engine keeps a draft only when it is the token it draws, so a draft model (or an --mtp flag)
+        # does not turn the card off, unlike the Strata project's greedy-only MTP drafts (#3354)
+        self.svc.model_arch = None
+        self.svc.call_format = "inkling"
+        self.svc.has_mtp = True
+        try:
+            self.assertIn("temperature=1.0", self.keys())
+            self.assertNotIn("temperature", self.keys(temperature=0))
+            self.svc.model_arch = "qwen35moe"                               # another family: the MTP rule as before
+            self.svc.call_format = "function"
+            self.assertEqual(self.keys(), "")
+        finally:
+            self.svc.call_format = "function"
 
     def test_request_asks_sampling(self):
         self.assertFalse(request_asks_sampling())

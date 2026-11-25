@@ -621,7 +621,19 @@ MODEL_CARD_SAMPLING = {
     # Hy4-Flash (HY-4-Flash-200B): HuggingFace model card defaults when request/config omits sampling
     "hy4flash": {"thinking": {"temperature": 0.9, "top_p": 1.0},
                  "instruct": {"temperature": 0.9, "top_p": 1.0}},
+    # Inkling 2 Mini: its generation_config.json (do_sample, temperature 1.0 and nothing else: top_p 1.0, no top-k,
+    # min_p 0, no penalty), the same in both thinking states.  top_k 0 is "off" (see StrataEngine.sampling_keys).
+    # The strata-poly config has no "arch": Service.card_arch() names this entry from the tokenizer.  Greedy is what
+    # an Inkling request got before this, and it loops on some prompts.
+    "inkling2": {"thinking": {"temperature": 1.0, "top_p": 1.0, "top_k": 0},
+                 "instruct": {"temperature": 1.0, "top_p": 1.0, "top_k": 0}},
 }
+MODEL_CARD_SAMPLING["inkling2_loop"] = MODEL_CARD_SAMPLING["inkling2"]   # the GGUF's two architecture names
+
+# The families whose engine keeps a draft only when it is the token the sampler draws at that place, so drafting
+# stays exact under sampling and the card's sampling may run with it.  The Strata project's MTP drafts run for
+# greedy requests only (#3354), so they are not listed.
+SAMPLED_DRAFT_ARCHS = ("inkling2", "inkling2_loop")
 
 
 # The card's penalties: a greedy request must not get them (see model_card_sampling)

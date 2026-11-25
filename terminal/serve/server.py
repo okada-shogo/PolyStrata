@@ -257,6 +257,7 @@ from serve.server_parts.http_api import (  # noqa: F401  (moved unchanged, file 
     FAMILY_MODEL_NAMES,
     FAULTHANDLER_OFF,
     MODEL_CARD_SAMPLING,
+    SAMPLED_DRAFT_ARCHS,
     READER_NEEDS_MIB,
     SAMPLING_ALIASES,
     SHARED_KEYS,
@@ -4838,6 +4839,11 @@ class Service:
                          "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
         return data
 
+    def card_arch(self):
+        """The family whose model card gives the default sampling: the config's "arch" (the Strata project's
+        families), else Inkling 2 by its tokenizer (the strata-poly configs have no "arch"), else None."""
+        return self.model_arch or ("inkling2" if getattr(self, "call_format", None) == "inkling" else None)
+
     @property
     def has_mtp(self) -> bool:
         """True when the underlying engine has MTP (Multi-Token Prediction) drafting enabled."""
@@ -6363,9 +6369,13 @@ class Service:
         # apps; the request's own fields win over all of them
         # #3354: when MTP drafting is active (has_mtp) and the request does not explicitly ask for sampling,
         # omitted sampling parameters remain greedy so MTP drafts are not silently disabled by model card defaults.
-        mtp_greedy = self.has_mtp and not request_asks_sampling(sampling, self.shared, self.sampling_defaults)
+        # Inkling 2 is left out of that rule: its engine checks a draft against the token it draws, so sampling
+        # costs it some accepted drafts, not the drafts (SAMPLED_DRAFT_ARCHS).
+        arch = self.card_arch()
+        mtp_greedy = (self.has_mtp and arch not in SAMPLED_DRAFT_ARCHS
+                      and not request_asks_sampling(sampling, self.shared, self.sampling_defaults))
         card = {} if mtp_greedy else model_card_sampling(
-            self.model_arch, thinking,
+            arch, thinking,
             greedy=asks_greedy(sampling, self.shared, self.sampling_defaults),
         )
         defaults = {**card, **self.sampling_defaults, **self.shared}
@@ -8422,8 +8432,9 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            card_defaults = {} if (svc.has_mtp and not request_asks_sampling(svc.shared, svc.sampling_defaults)) else \
-                model_card_sampling(svc.model_arch, True, greedy=asks_greedy(svc.shared, svc.sampling_defaults))
+            card_defaults = {} if (svc.has_mtp and svc.card_arch() not in SAMPLED_DRAFT_ARCHS
+                                   and not request_asks_sampling(svc.shared, svc.sampling_defaults)) else \
+                model_card_sampling(svc.card_arch(), True, greedy=asks_greedy(svc.shared, svc.sampling_defaults))
             defaults = {**card_defaults,
                         **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
