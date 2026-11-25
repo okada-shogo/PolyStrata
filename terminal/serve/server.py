@@ -257,6 +257,7 @@ from serve.server_parts.http_api import (  # noqa: F401  (moved unchanged, file 
     FAMILY_MODEL_NAMES,
     FAULTHANDLER_OFF,
     MODEL_CARD_SAMPLING,
+    SAMPLED_DRAFT_ARCHS,
     READER_NEEDS_MIB,
     SAMPLING_ALIASES,
     SHARED_KEYS,
@@ -837,6 +838,7 @@ class StrataEngine:
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than PolyStrata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
         self.hy4_engine = hy4_kind.is_hy4_exe(exe)     # the Hy4-Flash engine (serve/hy4_kind.py): one request at a time, no logprobs, no logit bias
+        self.poly_engine = Path(str(exe)).stem.lower() in ("strata-poly", "strata-glm")   # samples from the whole vocabulary
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
         self.model_path = paths.get("--native") or paths.get("--model") or paths.get("--pack", "pack/full")
@@ -1430,7 +1432,7 @@ class StrataEngine:
         return f" pen_from={orig_len - 1}"
 
     @staticmethod
-    def sampling_keys(sampling: dict, *, hy4: bool = False) -> str:
+    def sampling_keys(sampling: dict, *, hy4: bool = False, any_top_k: bool = False) -> str:
         keys = ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
@@ -1440,8 +1442,9 @@ class StrataEngine:
             keys += f" top_p={float(tp)!r}"
         tk = sampling.get("top_k")
         if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
-            # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+            # the Strata engines' sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64;
+            # strata-poly (any_top_k) takes any number, 0 for the whole vocabulary, as llama.cpp does
+            keys += f" top_k={tk if any_top_k or 1 <= tk <= 64 else 64}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
@@ -2126,7 +2129,8 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         hold = (sampling or {}).get(HOLD_KEY)           # the thinking budget's hold (P2b): the reasoning tokens left when this pass starts, and </think>'s id
-        keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}, hy4=getattr(self, "hy4_engine", False))   # (the hold's key goes on per leg: leg_keys below)
+        keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}, hy4=getattr(self, "hy4_engine", False),
+                                   any_top_k=getattr(self, "poly_engine", False))   # (the hold's key goes on per leg: leg_keys below)
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2684,7 +2688,7 @@ class StrataEngine:
         carry = NO_LINE                  # a line read for a token's LP line, held until it is used
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         hy4 = getattr(self, 'hy4_engine', False)
-        keys = self.sampling_keys(sampling or {}, hy4=hy4) + ("" if hy4 else self.turn_key(ids))
+        keys = self.sampling_keys(sampling or {}, hy4=hy4, any_top_k=getattr(self, "poly_engine", False)) + ("" if hy4 else self.turn_key(ids))
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
             if embeddings or int(max_new) != 0:
@@ -4838,6 +4842,11 @@ class Service:
                          "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
         return data
 
+    def card_arch(self):
+        """The family whose model card gives the default sampling: the config's "arch" (the Strata project's
+        families), else Inkling 2 by its tokenizer (the strata-poly configs have no "arch"), else None."""
+        return self.model_arch or ("inkling2" if getattr(self, "call_format", None) == "inkling" else None)
+
     @property
     def has_mtp(self) -> bool:
         """True when the underlying engine has MTP (Multi-Token Prediction) drafting enabled."""
@@ -6363,9 +6372,13 @@ class Service:
         # apps; the request's own fields win over all of them
         # #3354: when MTP drafting is active (has_mtp) and the request does not explicitly ask for sampling,
         # omitted sampling parameters remain greedy so MTP drafts are not silently disabled by model card defaults.
-        mtp_greedy = self.has_mtp and not request_asks_sampling(sampling, self.shared, self.sampling_defaults)
+        # Inkling 2 is left out of that rule: its engine checks a draft against the token it draws, so sampling
+        # costs it some accepted drafts, not the drafts (SAMPLED_DRAFT_ARCHS).
+        arch = self.card_arch()
+        mtp_greedy = (self.has_mtp and arch not in SAMPLED_DRAFT_ARCHS
+                      and not request_asks_sampling(sampling, self.shared, self.sampling_defaults))
         card = {} if mtp_greedy else model_card_sampling(
-            self.model_arch, thinking,
+            arch, thinking,
             greedy=asks_greedy(sampling, self.shared, self.sampling_defaults),
         )
         defaults = {**card, **self.sampling_defaults, **self.shared}
@@ -8422,8 +8435,9 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            card_defaults = {} if (svc.has_mtp and not request_asks_sampling(svc.shared, svc.sampling_defaults)) else \
-                model_card_sampling(svc.model_arch, True, greedy=asks_greedy(svc.shared, svc.sampling_defaults))
+            card_defaults = {} if (svc.has_mtp and svc.card_arch() not in SAMPLED_DRAFT_ARCHS
+                                   and not request_asks_sampling(svc.shared, svc.sampling_defaults)) else \
+                model_card_sampling(svc.card_arch(), True, greedy=asks_greedy(svc.shared, svc.sampling_defaults))
             defaults = {**card_defaults,
                         **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}

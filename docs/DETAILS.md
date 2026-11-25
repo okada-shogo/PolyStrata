@@ -636,7 +636,7 @@ key, MCP and program keys are not editable there.
   comes back with a backspace. Off by default.
 - `logit_bias` and token/bias pair lists work on CUDA, HIP and Metal engines, also with continuous batching (`--batch` / `--parallel`: each slot keeps its own bias) ([LOGIT_BIAS.md](LOGIT_BIAS.md)).
 - Stop strings (`stop`, `stop_sequences`), `temperature`, `top_p`, `top_k`, `min_p` and `seed` are honored per request.
-  `top_k` keeps at most 64 candidates. Penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`,
+  `top_k` keeps at most 64 candidates on the Strata engines; strata-poly (Inkling 2 and the other PolyStrata models) takes any number, and 0 draws from the whole vocabulary. Penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`,
   `penalty_last_n`; llama.cpp's `repeat_penalty` and `repeat_last_n` work too) apply to every token the speculative check
   verifies, as if decoded one at a time, and make a request 1-11% slower because more drafts are rejected.
   `penalty_last_n` (64 when a penalty is set and the request gives none) is a window over the tokens of the current answer: the

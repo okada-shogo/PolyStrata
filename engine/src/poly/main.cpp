@@ -126,6 +126,7 @@ public:
             logits = pen_.data();
         }
         if (s.temperature <= 0.f) return strata::poly::most_likely(logits, n_vocab);
+        if ((s.top_k <= 0 || s.top_k >= n_vocab) && s.top_p >= 1.f && s.min_p <= 0.f) return whole(logits, n_vocab, s, rng);
 
         // The k best, the best first and of equals the lower id.  A token is a candidate only when it beats the
         // worst of the k so far, which is the heap's first; most of a vocabulary never does.
@@ -174,6 +175,43 @@ private:
         int id;
     };
 
+    /// Every token a candidate: the draw from the softmax of the whole vocabulary, in id order.  The heap below would
+    /// sort all of it (about 25 ms a token for 200K tokens on a Zen 2 core); this is one pass of float exp() with a
+    /// sum per block of kBlock tokens, then the draw finds the block and walks inside it (about 0.6 ms).
+    int whole(const float* logits, int n_vocab, const Sampling& s, std::mt19937_64& rng) {
+        float lane[8];
+        std::fill(lane, lane + 8, logits[0]);
+        int i = 0;
+        for (; i + 8 <= n_vocab; i += 8) for (int k = 0; k < 8; ++k) lane[k] = std::max(lane[k], logits[i + k]);
+        for (; i < n_vocab; ++i) lane[0] = std::max(lane[0], logits[i]);
+        const float mx = *std::max_element(lane, lane + 8);   // (eight lanes: one pass the compiler can vectorize)
+        if (!std::isfinite(mx)) return strata::poly::most_likely(logits, n_vocab);   // NaN, or +inf, or all -inf
+        const float inv = 1.f / s.temperature;
+        w_.resize((size_t) n_vocab);
+        sums_.assign((size_t) (n_vocab + kBlock - 1) / kBlock, 0.0);
+        double sum = 0.0;
+        for (size_t b = 0; b < sums_.size(); ++b) {
+            const int end = std::min(n_vocab, (int) ((b + 1) * kBlock));
+            float part[8] = {};
+            int j = (int) (b * kBlock);
+            for (; j + 8 <= end; j += 8)
+                for (int k = 0; k < 8; ++k) part[k] += w_[(size_t) (j + k)] = std::exp((logits[j + k] - mx) * inv);
+            for (; j < end; ++j) part[0] += w_[(size_t) j] = std::exp((logits[j] - mx) * inv);
+            for (float v : part) sums_[b] += v;
+            sum += sums_[b];
+        }
+        double u = std::uniform_real_distribution<double>(0.0, sum)(rng);
+        size_t b = 0;
+        while (b + 1 < sums_.size() && u >= sums_[b]) u -= sums_[b++];
+        int last = (int) (b * kBlock);
+        for (int i = last, end = std::min(n_vocab, (int) ((b + 1) * kBlock)); i < end; ++i) {
+            if (w_[(size_t) i] <= 0.f) continue;
+            last = i;
+            if ((u -= w_[(size_t) i]) < 0.0) return i;
+        }
+        return last;                                    // u came within rounding of the sum
+    }
+
     static bool penalizes(const Sampling& s) {
         return s.penalty_last_n != 0 &&
                (s.penalty_repeat != 1.f || s.penalty_freq != 0.f || s.penalty_present != 0.f);
@@ -200,6 +238,9 @@ private:
         for (double& p : p_) p /= sum;
     }
 
+    static constexpr int kBlock = 512;
+    std::vector<float> w_;
+    std::vector<double> sums_;
     std::vector<Cand> cand_;
     std::vector<float> pen_;
     std::vector<double> p_;

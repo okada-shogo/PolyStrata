@@ -577,8 +577,9 @@ class Pictures(unittest.TestCase):
 
     def service(self, d, n=(3, 2)):
         class Asked(MockEngine):
+            poly_engine = True                          # a strata-poly engine: top_k 0 stays 0
             def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-                self.asked = (StrataEngine.sampling_keys(sampling), embeddings)
+                self.asked = (StrataEngine.sampling_keys(sampling, any_top_k=self.poly_engine), embeddings)
                 yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
         tok = subset_tokenizer()
@@ -598,7 +599,8 @@ class Pictures(unittest.TestCase):
             self.assertEqual((ids.count(200054), svc.embeddings.pad), (5, 200054))
             rows = svc.embeddings.path
             list(svc.run(ids, False, None, 8, {}, threading.Event()))
-            self.assertEqual(svc.engine.asked, (" image_pad=200054", rows))
+            # no sampling asked: Inkling 2's card (temperature 1.0, top_k 0 = the whole vocabulary on strata-poly)
+            self.assertEqual(svc.engine.asked, (" temperature=1.0 top_k=0 image_pad=200054", rows))
 
     def test_two_pictures_back_to_back(self):
         with tempfile.TemporaryDirectory() as d:
@@ -642,6 +644,17 @@ class Pictures(unittest.TestCase):
             with self.assertRaises(Exception) as e:
                 svc.prepare(msgs, None, {})
             self.assertIn("only supported for user and tool messages", str(e.exception))
+
+
+class TopKTest(unittest.TestCase):
+    """strata-poly samples from the whole vocabulary: top_k 0 and wide lists reach it; the Strata engines keep 64."""
+
+    def test_top_k(self):
+        for tk, poly, strata in ((0, " top_k=0", " top_k=64"), (100, " top_k=100", " top_k=64"),
+                                 (20, " top_k=20", " top_k=20")):
+            with self.subTest(top_k=tk):
+                self.assertEqual(StrataEngine.sampling_keys({"top_k": tk}, any_top_k=True), poly)
+                self.assertEqual(StrataEngine.sampling_keys({"top_k": tk}), strata)
 
 
 if __name__ == "__main__":
