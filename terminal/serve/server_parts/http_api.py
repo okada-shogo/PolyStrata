@@ -367,9 +367,9 @@ def clean_shared_defaults(d, hy4: bool = False) -> dict:
             if not number or not 0 < value <= 1:
                 raise ValueError("top_p: 0 < top_p <= 1")
         elif key == "top_k":
-            # as a request's top_k: 0 is off, and the engine keeps at most 64 candidates (Service.run)
+            # as a request's top_k: 0 is off; the Strata engines keep at most 64 candidates, strata-poly any number (Service.run)
             if not number or value != int(value) or value < 0:
-                raise ValueError("top_k: a whole number, 0 for off (the engine keeps at most 64)")
+                raise ValueError("top_k: a whole number, 0 for off (the Strata engines keep at most 64)")
             value = int(value)
         elif key in ("seed", "max_tokens"):
             if not number or value != int(value) or value <= 0:
@@ -526,10 +526,10 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             out[key] = float(value)
         elif key == "top_k":
             # 0 is off, as in a request and in the model cards (Inkling 2 Mini's recommended sampling has top_k 0):
-            # the engine's sampled path then keeps its widest list, 64 candidates
+            # the Strata engines' sampled path then keeps its widest list, 64 candidates; strata-poly samples the whole vocabulary
             if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[strata] config sampling.top_k={value!r}: a whole number, 0 for off (the engine "
-                                 "keeps at most 64)")
+                raise SystemExit(f"[strata] config sampling.top_k={value!r}: a whole number, 0 for off (the Strata "
+                                 "engines keep at most 64)")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
@@ -574,7 +574,7 @@ def check_request_sampling(req) -> None:
     replaced the configured default in run()'s merge and sampling_keys dropped it, so the reply was greedy.  Only
     types are checked: a number (int or float, never bool) for temperature, top_p, min_p and the three penalties; an
     integer (never bool or float) for top_k, penalty_last_n and seed.  Ranges behave as before (a temperature <= 0 is
-    greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), and an absent or null field is not checked."""
+    greedy, top_k 0 or above 64 is clamped on the Strata engines, a seed <= 0 is unset), and an absent or null field is not checked."""
     if isinstance(req, dict):      # #1819: llama.cpp's names; the OpenAI-style field wins when both are sent
         if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
             req["repetition_penalty"] = req["repeat_penalty"]
