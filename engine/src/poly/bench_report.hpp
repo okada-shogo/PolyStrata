@@ -45,6 +45,15 @@ struct DotRate {
 struct Probes {
     double h2d_pinned_gbs = 0, h2d_pageable_gbs = 0, d2h_pinned_gbs = 0, gpu_mem_gbs = 0, ram_read_gbs = 0;
     int ram_threads = 0;
+    double launch_us = 0;        // an empty kernel launched back to back
+    double graph_node_us = 0;    // a node of a replayed recording of empty kernels
+    double small_us = 0;         // a small dependent kernel (4 KiB in, 4 KiB out) back to back: a kernel's floor
+    double small_node_us = 0;    // the same as a node of a replayed recording
+    double wide_node_us = 0;     // a replayed node of a kernel across the whole card (2 blocks a CU, a float a thread)
+    double sync_us = 0;          // a host round trip: an empty kernel and the host waiting for its event
+    double copy_sync_us = 0;     // a 1 KiB copy to the host, waited for (a router's scores)
+    double read_gbs = 0;         // a read-only kernel over 512 MiB of the card's memory
+    double fma_gflops = 0;       // fp32 multiply-adds
     std::vector<DotRate> dots;
     double seconds = 0;
 };
@@ -78,6 +87,7 @@ struct Finding {
 struct Report {
     std::string engine_version = "dev", commit = "unknown", tier = "quick";
     std::string prompt_source = "random tokens of the vocabulary";
+    bool launches_wrapped = false;   // direct launches counted (prof::launches_wrapped()); else only replays
     Model model;
     std::vector<std::pair<std::string, std::string>> settings;   // the engine's arguments, paths taken out
     std::vector<std::pair<std::string, std::string>> env;        // STRATA_* settings, paths taken out
@@ -109,6 +119,28 @@ std::string scrub(std::string text, const std::vector<std::string>& secrets);
 /// The explain section: each phase against what the probes measured.
 std::vector<Finding> explain(const Report& r);
 
+/// The diagnosis of one phase (decode: the one-token-a-call answers; prompt: the longest read): each family's time,
+/// launches, bytes and verdict, the whole token's (or call's) verdict, its roofline and what would recover the most.
+struct FamilyVerdict {
+    int fam = 0;
+    double ms = 0, launches = 0, launch_ms = 0, gb = 0, gbs = 0, read_share = 0, avg_kernel_us = 0;
+    bool tiny = false;
+    std::string verdict;
+};
+struct Diagnosis {
+    std::string phase, unit;   // "decode" / "prompt NNNN", "a token" / "the call"
+    bool ok = false;
+    double total_ms = 0, launches = 0, direct = 0, nodes = 0, launch_ms = 0, gpu_gb = 0, ideal_ms = 0;
+    double wait_cpu_ms = 0, wait_upload_ms = 0, host_gap_ms = 0;
+    double round_trips = 0, round_trip_ms = 0;   // the host's waits for router scores, and the GPU's idle meanwhile
+    bool warm_cache = false;                     // the hit rate is above what real text gives (bench text)
+    double hit_rate = -1, cpu_gb = 0, pcie_gb = 0;
+    std::vector<FamilyVerdict> families;
+    std::string verdict;
+    std::vector<std::pair<double, std::string>> recover;   // ms, what would recover it; the largest first, at most 3
+};
+std::vector<Diagnosis> diagnose(const Report& r);
+
 /// The commit the engine was built from (git describe at configure time), or "unknown".
 const char* build_commit();
 
@@ -118,7 +150,9 @@ std::string to_markdown(const Report& r);
 /// A request's profile written alone (STRATA_PROFILE=1 in normal use): hardware without probes, and the profile.
 std::string session_json(const Report& r, const prof::Profile& p);
 
-// ---- bench_probe.cpp (needs the card) ----
+// ---- bench_probe.cpp, bench_kernels.cu (need the card) ----
+/// The kernel probes: launch latency, a replay's cost a node, a read-only kernel's bandwidth, fp32 FMA; ~1 s.
+void probe_kernels(Probes& p, int device);
 Gpu gpu_info(int device);
 Host host_info();
 /// The copies and memory reads, ~10 s; before the model is loaded.  `log` gets a line a probe (may be null).

@@ -942,6 +942,7 @@ struct Engine::Timeline {
         int fam;
         bool pooled;          ///< the pool's, given back once read
         uint64_t launches;    ///< prof::launch_counter() when it was recorded
+        uint64_t nodes;       ///< prof::graph_node_counter() then
     };
     struct Side {
         cudaEvent_t a = nullptr, b = nullptr;
@@ -957,6 +958,7 @@ struct Engine::Timeline {
         Clock::time_point t0, t1;
         Stats s0, s1;
         double bytes = 0;
+        double dense_b = 0, router_b = 0, kv_b = 0, gpu_b = 0, cpu_b = 0;   ///< the byte model's (prof_bytes_of())
     };
     std::mutex mu;
     std::vector<cudaEvent_t> pool;
@@ -1037,6 +1039,7 @@ struct Engine::Timeline {
             for (size_t i = 0; i + 1 < c.marks.size(); ++i) {
                 a.fam_ms[c.marks[i].fam] += between(c.marks[i].ev, c.marks[i + 1].ev);
                 a.fam_launches[c.marks[i].fam] += (double) (c.marks[i + 1].launches - c.marks[i].launches);
+                a.fam_graph_nodes[c.marks[i].fam] += (double) (c.marks[i + 1].nodes - c.marks[i].nodes);
             }
             if (c.gap && last) {
                 a.fam_ms[prof::kHostGap] += between(last, c.marks.front().ev);
@@ -1047,9 +1050,18 @@ struct Engine::Timeline {
             a.calls = 1;
             a.cpu_ms = c.s1.cpu_ms - c.s0.cpu_ms;
             a.route_wait_ms = c.s1.route_wait_ms - c.s0.route_wait_ms;
-            a.cpu_experts = c.s1.cpu_experts - c.s0.cpu_experts;
-            a.gpu_experts = c.s1.gpu_experts - c.s0.gpu_experts;
+            a.route_waits = (double) (c.s1.route_waits - c.s0.route_waits);
+            // a prompt batch counts its experts once a layer visit (Stats::batch_*): what it found in VRAM against
+            // what it copied in or left to the CPU
+            a.cpu_experts = c.s1.cpu_experts - c.s0.cpu_experts + c.s1.batch_cpu_experts - c.s0.batch_cpu_experts;
+            a.gpu_experts = c.s1.gpu_experts - c.s0.gpu_experts + c.s1.batch_hit_experts - c.s0.batch_hit_experts;
+            a.staged_experts = (double) (c.s1.batch_staged_experts - c.s0.batch_staged_experts);
             a.upload_bytes = c.bytes;
+            a.fam_bytes[prof::kDense] += c.dense_b;
+            a.fam_bytes[prof::kRouting] += c.router_b;
+            a.fam_bytes[prof::kAttention] += c.kv_b;
+            a.fam_bytes[prof::kExpertsGpu] += c.gpu_b;
+            a.cpu_expert_bytes = c.cpu_b;
             for (const Side& s : c.sides)
                 if (s.a && s.b) {
                     a.side_ms += between(s.a, s.b);
@@ -1071,11 +1083,12 @@ struct Engine::Timeline {
         if (!cur->marks.empty() && cur->marks.back().fam == f) return;   // the same family goes on
         cudaEvent_t e = take();
         ck(cudaEventRecord(e, cs(st)), "the profiler's events");
-        cur->marks.push_back({e, f, true, prof::launch_counter()});
+        cur->marks.push_back({e, f, true, prof::launch_counter(), prof::graph_node_counter()});
     }
 };
 
 void Engine::enable_profile(int every) {
+    prof_prepare();
     if (!tl_) tl_ = std::make_unique<Timeline>();
     prof::launch_counting().store(true, std::memory_order_relaxed);
     tl_->prof.every = std::max(every, 1);
@@ -1134,9 +1147,11 @@ void Engine::prof_end_on() {
     // the end is always a fresh event of the pool: the next call's gap is measured from it
     cudaEvent_t e = t.take();
     ck(cudaEventRecord(e, cs(st_)), "the profiler's events");
-    c.marks.push_back({e, prof::kHostGap, true, prof::launch_counter()});
+    c.marks.push_back({e, prof::kHostGap, true, prof::launch_counter(), prof::graph_node_counter()});
     c.t1 = Clock::now();
     c.s1 = stats();
+    const CallBytes cb = prof_bytes_of(c.pos, c.n, c.s0, c.s1);
+    c.dense_b = cb.dense, c.router_b = cb.router, c.kv_b = cb.kv, c.gpu_b = cb.gpu, c.cpu_b = cb.cpu;
     t.pending.push_back(std::move(c));
     t.cur.reset();
     t.next_gap = true;
@@ -1167,7 +1182,10 @@ void Engine::launch_graph(void* exec, int fam, const char* what) {
         if (t.cur && t.cur->split) t.mark(fam, st_);
         // a replay hands the card its recording's kernels: they count as launches of the family it is marked as
         const auto it = t.kernels_of.find(exec);
-        if (it != t.kernels_of.end()) prof::launch_count().fetch_add(it->second, std::memory_order_relaxed);
+        if (it != t.kernels_of.end()) {
+            prof::launch_count().fetch_add(it->second, std::memory_order_relaxed);
+            prof::graph_node_count().fetch_add(it->second, std::memory_order_relaxed);
+        }
     }
     ck(cudaGraphLaunch((cudaGraphExec_t) exec, cs(st_)), what);
 }
@@ -1225,6 +1243,57 @@ void Engine::pside_end(int, void*, double) {}
 void Engine::prof_bytes(double) {}
 void Engine::prof_kept(int) {}
 #endif
+
+// The profiler's byte model: the dense matrices the engine uploads, by layer ("blk.N." in the name) or not (the output
+// head, the norms), so that a call's dense reads are each layer's bytes once a visit of it, and the rest once.
+void Engine::note_dense(const std::string& name, size_t bytes) {
+    int il = -1;
+    if (name.rfind("blk.", 0) == 0) il = std::atoi(name.c_str() + 4);
+    if (il < 0 || il > 100000) {
+        dense_other_b_ += (double) bytes;
+        return;
+    }
+    std::vector<double>& to = name.find("ffn_gate_inp") != std::string::npos ? router_layer_b_ : dense_layer_b_;
+    if ((int) to.size() <= il) to.resize((size_t) il + 1, 0.0);
+    to[(size_t) il] += (double) bytes;
+}
+
+void Engine::prof_prepare() {
+    if (prof_visits_ >= 0) return;
+    prof_visits_ = prof_moe_visits_ = 0;
+    prof_dense_call_ = dense_other_b_;
+    prof_router_call_ = 0;
+    for (int il = lo_; il < hi_; il = next_layer(il)) {   // (a full walk: a looped core's pass is back at 0 after it)
+        ++prof_visits_;
+        if (layers_[(size_t) il].moe) ++prof_moe_visits_;
+        if (il < (int) dense_layer_b_.size()) prof_dense_call_ += dense_layer_b_[(size_t) il];
+        if (il < (int) router_layer_b_.size()) prof_router_call_ += router_layer_b_[(size_t) il];
+    }
+    // an expert's bytes: the mean over the MoE layers (a file may quantize layers apart)
+    double sum = 0;
+    int n = 0;
+    for (const Layer& L : layers_)
+        if (L.moe) sum += (double) (L.gu_bytes + L.u_bytes + L.d_bytes), ++n;
+    prof_expert_b_ = n ? sum / n : 0.0;
+    (void) kv_read_bytes(0, 0);   // the architecture's own visits, now (Inkling2::kv_read_bytes())
+}
+
+// A call of n tokens from pos: the dense weights it reads (each matrix once a visit, whatever n is; the router's apart),
+// the KV rows its attention reads (kv_read_bytes()), and the routed experts on the card and on the CPU: an expert a
+// token and visit for a few tokens, each of a visit's experts once for a prompt batch (Stats::batch_*).
+Engine::CallBytes Engine::prof_bytes_of(int64_t pos, int n, const Stats& s0, const Stats& s1) {
+    CallBytes c;
+    if (n <= 0 || prof_visits_ < 0) return c;
+    c.dense = prof_dense_call_;
+    c.router = prof_router_call_;
+    c.kv = kv_read_bytes(pos, n);
+    const double gpu = (double) (s1.gpu_experts - s0.gpu_experts + s1.batch_hit_experts - s0.batch_hit_experts +
+                                 s1.batch_staged_experts - s0.batch_staged_experts);
+    const double cpu = (double) (s1.cpu_experts - s0.cpu_experts + s1.batch_cpu_experts - s0.batch_cpu_experts);
+    c.gpu = gpu * prof_expert_b_;
+    c.cpu = cpu * prof_expert_b_;
+    return c;
+}
 
 Engine::ExpertShape Engine::expert_shape() const {
     ExpertShape x;
@@ -2721,6 +2790,7 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
                                                                              : strata::quant::quantize_q4_0_ref;
         dense_at_ += pad(out) + kTail;
         if (!dense_) return d;
+        note_dense(t->name, out);
         if (dense_at_ > dense_bytes_) throw std::logic_error("the dense arena is too small for " + t->name);
         // a few thousand rows at a time, to floats and to Q4_0, on threads of their own: the engine's are not
         // started yet
@@ -2752,6 +2822,7 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
     const Dev d{dense_ ? dense_ + dense_at_ : nullptr, type, (int) n_in, (int) n_out};
     dense_at_ += pad(out) + kTail;
     if (!dense_) return d;
+    note_dense(t->name, out);
     if (dense_at_ > dense_bytes_) throw std::logic_error("the dense arena is too small for " + t->name);
     if (as_is) {
         h2d(d.p, home(*t).data(*t), bytes);
@@ -5484,6 +5555,10 @@ const Stats& Engine::stats() const {
         all_stats_.ahead_used += s.ahead_used;
         all_stats_.cpu_ms += s.cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
+        all_stats_.route_waits += s.route_waits;
+        all_stats_.batch_hit_experts += s.batch_hit_experts;
+        all_stats_.batch_staged_experts += s.batch_staged_experts;
+        all_stats_.batch_cpu_experts += s.batch_cpu_experts;
     }
     return all_stats_;
 }
@@ -6230,6 +6305,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
     Clock::time_point t0 = Clock::now();
     ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
     stats_.route_wait_ms += ms_since(t0);
+    ++stats_.route_waits;   // a host round trip: the card's scores to the host, its experts back
     if (block_pass_) route_block(il, h_rl_, n);
     if (pool_ && prompt_rows_ >= 4096 && !block_pass_) {
         rekeep();
@@ -7545,6 +7621,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
     if (ahead && !early && !pre && !freeze_experts_) route_ms_ = ms_since(t0);
     stats_.route_wait_ms += ms_since(t0);
+    ++stats_.route_waits;
 
     const size_t cb_row = (size_t) n_expert_ + 1;
     const int32_t* d_tok = tab_;
@@ -7725,6 +7802,9 @@ void Engine::moe_rows(Layer& L, int il, int n) {
 
     const int rc = bounds[n_cached];   // the rows of the cached experts
     stats_.batch_cached += rc;
+    stats_.batch_hit_experts += n_cached;
+    stats_.batch_staged_experts += n_group - n_cached;
+    stats_.batch_cpu_experts += n_cpu;
     stats_.batch_staged += rg - rc;
 
     const float limit = clamp_exp_[(size_t) il];
@@ -9389,6 +9469,9 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     if (n_co > 0 && !co_reads()) throw std::logic_error("read: co-reads are one card's, where a read is several calls");
     OnCard prof_card(device_, split_);   // the profiler's events go on this card's stream
     const ProfCall prof_call(*this, n);
+    // the host's setup before the read's first launch (the attention caches' growth, the prompt's buffers and staging
+    // taken back from the expert cache): the stream idles meanwhile, so it is not the copies' time
+    pmark(prof::kHostSetup);
     // (a read of no tokens of its own takes co-reads: a request whose prompt the conversation holds but its last token)
     if (n < (n_co > 0 ? 0 : 1) || all > read_rows_)
         throw std::logic_error("read takes 1 to max_read() tokens, co-reads among them");
@@ -9481,6 +9564,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     if (n_co == 0 &&
         (n_calls == 1 || !mmq_ || all_cached() || all < opt_.stage_ahead || !(reads_by_layer() || groups))) {
         turn = share_to(n_layer_);   // eval() takes the calls through the cards after this one
+        pmark(prof::kCopyH2D);   // the first call's embeddings, as a call's own start marks them
         // On several cards the next one takes a call on a thread of its own, while this one runs the call after
         // it.  Each card runs the calls as eval() does, in the same order.
         Behind behind;
@@ -9550,7 +9634,10 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     ck(cudaStreamSynchronize(cs(st_)), "read");
     lock_settle();
     if (n_swap_ > 0) follow(0);
-    if (groups) return read_groups(marks, n_marks, turn, n);
+    if (groups) {
+        pmark(prof::kCopyH2D);
+        return read_groups(marks, n_marks, turn, n);
+    }
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row, r_bytes = r_row * sizeof(float);
     const size_t part = (size_t) std::max(streams(), draft_ ? 3 : 1) * rows_ * e_row;   // a call's rows of r_
     float* const r0 = r_;
@@ -9562,6 +9649,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         h_res_rows_ = std::min(read_rows_, (all + 4095) / 4096 * 4096);
         h_res_ = (float*) hmalloc((size_t) h_res_rows_ * r_bytes, "pinned memory");
     }
+    pmark(prof::kCopyH2D);
     const auto home = [&](int p) { return h_res_ + (size_t) packs_[(size_t) p].at * r_row; };
     const auto half = [&](int p) { return r0 + (size_t) (host ? p % 2 : p) * part; };
     // pack p's rows back into its half of r_, behind whatever the stream has there of the half's last pack

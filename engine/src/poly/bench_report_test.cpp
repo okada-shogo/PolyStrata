@@ -251,6 +251,170 @@ void test_scrub_values_only() {
     set_env("HOME", "/home/zq_tester_9");
 }
 
+// A synthetic launch-bound card (not a measured one): ~1,580 kernels a 25 ms token at an 8.5 us floor each (~13 ms),
+// experts a quarter of the time: the report must say launch-bound on its own.
+void test_diagnosis_launch_bound() {
+    B::Report r = sample();
+    r.runs.clear();
+    r.probes.launch_us = 8.5;
+    r.probes.graph_node_us = 8.2;
+    r.probes.small_us = 8.5, r.probes.small_node_us = 8.2;
+    r.probes.read_gbs = 560;
+    r.launches_wrapped = true;
+    B::Run run;
+    run.name = "prompt 2048, one token a call";
+    run.single = true;
+    run.produced = 129;
+    run.decode_ms = 25.0 * 128;
+    P::Acc unsplit;   // a replayed token: 25 ms, 1,580 kernels of recordings
+    unsplit.fam_ms[P::kUnsplit] = 25;
+    unsplit.fam_launches[P::kUnsplit] = 1580;
+    unsplit.fam_graph_nodes[P::kUnsplit] = 1580;
+    unsplit.fam_bytes[P::kDense] = 0.9e9;
+    unsplit.fam_bytes[P::kExpertsGpu] = 0.5e9;
+    unsplit.tokens = 1, unsplit.calls = 1, unsplit.wall_ms = 25;
+    unsplit.gpu_experts = 300, unsplit.cpu_experts = 84;
+    P::Acc split;     // a split token, launched kernel by kernel: the families
+    split.fam_ms[P::kExpertsGpu] = 7;
+    split.fam_launches[P::kExpertsGpu] = 400;
+    split.fam_bytes[P::kExpertsGpu] = 0.5e9;
+    split.fam_ms[P::kDense] = 6;
+    split.fam_launches[P::kDense] = 300;
+    split.fam_bytes[P::kDense] = 0.9e9;
+    split.fam_ms[P::kNorms] = 8;
+    split.fam_launches[P::kNorms] = 700;
+    split.fam_ms[P::kAttention] = 3;
+    split.fam_launches[P::kAttention] = 180;
+    split.fam_ms[P::kWaitCpu] = 1;
+    split.tokens = 1, split.calls = 1, split.wall_ms = 25;
+    for (int i = 0; i < 128; ++i) run.profile.add_call(P::kDecode, 2048 + i, i % 16 == 0, i % 16 == 0 ? split : unsplit);
+    r.runs.push_back(run);
+    const auto d = B::diagnose(r);
+    CHECK(!d.empty() && d[0].verdict.rfind("launch-bound", 0) == 0);
+    if (!d.empty()) {
+        CHECK(d[0].launch_ms > 10 && d[0].launch_ms < 16);
+        CHECK(!d[0].recover.empty() && has(d[0].recover[0].second, "fewer launches"));
+        bool norms_launch = false;
+        for (const auto& v : d[0].families)
+            if (v.fam == P::kNorms) norms_launch = has(v.verdict, "launch-bound") && v.tiny;
+        CHECK(norms_launch);
+        std::fprintf(stderr, "  diagnosis: %s\n", d[0].verdict.c_str());
+    }
+    const std::string md = B::to_markdown(r);
+    CHECK(has(md, "## Diagnosis") && has(md, "launch-bound"));
+}
+
+// The RX 9070 XT measured under WSL2 (IQ4_NL, reserve 700): a small kernel's floor 3.1 us (2.2 us across the card),
+// 1,491 kernels a 24.1 ms token (~4.6 ms), 48 host round trips with the card idle ~5 ms, 4.3 GB at 594 GB/s (7.3 ms):
+// not launch-bound; the round trips come first among what to recover.
+void test_diagnosis_rx9070xt_measured() {
+    B::Report r = sample();
+    r.runs.clear();
+    r.probes.launch_us = 1.5, r.probes.graph_node_us = 1.4;
+    r.probes.small_us = 3.1, r.probes.small_node_us = 3.1, r.probes.wide_node_us = 2.2;
+    r.probes.read_gbs = 594;
+    r.launches_wrapped = true;
+    B::Run run;
+    run.name = "prompt 2048, one token a call";
+    run.single = true;
+    P::Acc unsplit;
+    unsplit.fam_ms[P::kUnsplit] = 24.1;
+    unsplit.fam_launches[P::kUnsplit] = 1491;
+    unsplit.fam_graph_nodes[P::kUnsplit] = 1246;
+    unsplit.fam_bytes[P::kDense] = 2.217e9;
+    unsplit.fam_bytes[P::kRouting] = 0.028e9;
+    unsplit.fam_bytes[P::kAttention] = 0.132e9;
+    unsplit.fam_bytes[P::kExpertsGpu] = 1.95e9;
+    unsplit.tokens = 1, unsplit.calls = 1, unsplit.wall_ms = 24.1, unsplit.route_waits = 48;
+    unsplit.gpu_experts = 381, unsplit.cpu_experts = 3;
+    P::Acc split;
+    const struct { int f; double ms, n, gb; } fams[] = {
+        {P::kAttention, 2.8, 192, 0.132}, {P::kKvStore, 1.8, 384, 0}, {P::kDense, 5.9, 231, 2.217},
+        {P::kNorms, 4.2, 343, 0},         {P::kRouting, 5.2, 96, 0.028}, {P::kExpertsGpu, 6.3, 240, 1.95},
+        {P::kCopyH2D, 0.2, 5, 0},         {P::kWaitCpu, 0.3, 0, 0}};
+    for (const auto& x : fams) split.fam_ms[x.f] = x.ms, split.fam_launches[x.f] = x.n, split.fam_bytes[x.f] = x.gb * 1e9;
+    split.tokens = 1, split.calls = 1, split.wall_ms = 27, split.route_waits = 48;
+    for (int i = 0; i < 128; ++i) run.profile.add_call(P::kDecode, 2048 + i, i % 16 == 0, i % 16 == 0 ? split : unsplit);
+    r.runs.push_back(run);
+    const auto d = B::diagnose(r);
+    CHECK(!d.empty() && d[0].verdict.rfind("launch-bound", 0) != 0);
+    if (!d.empty()) {
+        CHECK(d[0].launch_ms > 4 && d[0].launch_ms < 5);
+        CHECK(d[0].round_trips == 48 && d[0].round_trip_ms > 4);
+        CHECK(!d[0].recover.empty() && has(d[0].recover[0].second, "host round trips"));
+        std::fprintf(stderr, "  diagnosis: %s\n", d[0].verdict.c_str());
+    }
+}
+
+// A card with everything in VRAM, replayed nodes at 1.5 us, a token of 2.2 GB at 300 GB/s probed: it must say
+// bandwidth-bound, not launch-bound.  And kernels twice a launch long are not launch-bound (the launches hide).
+void test_diagnosis_bandwidth_and_hidden_launches() {
+    B::Report r = sample();
+    r.runs.clear();
+    r.probes.launch_us = 4.0;
+    r.probes.graph_node_us = 1.5;
+    r.probes.read_gbs = 300;   // 2.2 GB a token at 300 GB/s: 7.3 of 11 ms
+    r.launches_wrapped = true;
+    B::Run run;
+    run.name = "prompt 2048, one token a call";
+    run.single = true;
+    P::Acc unsplit;
+    unsplit.fam_ms[P::kUnsplit] = 11;
+    unsplit.fam_launches[P::kUnsplit] = 900;
+    unsplit.fam_graph_nodes[P::kUnsplit] = 900;
+    unsplit.fam_bytes[P::kDense] = 1.2e9;
+    unsplit.fam_bytes[P::kExpertsGpu] = 1.0e9;
+    unsplit.tokens = 1, unsplit.calls = 1, unsplit.wall_ms = 11;
+    unsplit.gpu_experts = 384;
+    P::Acc split;
+    split.fam_ms[P::kExpertsGpu] = 6;     // 200 launches of 30 us: the kernels hide the launches
+    split.fam_launches[P::kExpertsGpu] = 200;
+    split.fam_bytes[P::kExpertsGpu] = 1.0e9;
+    split.fam_ms[P::kDense] = 5;
+    split.fam_launches[P::kDense] = 300;  // 16.7 us a launch against 4 us: not launch-bound
+    split.fam_bytes[P::kDense] = 1.2e9;
+    split.tokens = 1, split.calls = 1, split.wall_ms = 13;
+    for (int i = 0; i < 128; ++i) run.profile.add_call(P::kDecode, 2048 + i, i % 16 == 0, i % 16 == 0 ? split : unsplit);
+    r.runs.push_back(run);
+    const auto d = B::diagnose(r);
+    CHECK(!d.empty() && d[0].verdict.rfind("bandwidth-bound", 0) == 0);
+    for (const auto& v : d.empty() ? std::vector<B::FamilyVerdict>{} : d[0].families)
+        CHECK(v.verdict.find("launch-bound") == std::string::npos);
+    if (!d.empty()) std::fprintf(stderr, "  diagnosis: %s\n", d[0].verdict.c_str());
+}
+
+// A prompt: experts counted once a visit (in VRAM, copied in), the KV rows a tile of queries at a time
+void test_diagnosis_prompt() {
+    B::Report r = sample();
+    r.probes.launch_us = 4.0;
+    r.probes.graph_node_us = 1.5;
+    r.probes.read_gbs = 400;
+    r.launches_wrapped = true;
+    P::Acc a;
+    a.fam_ms[P::kExpertsGpu] = 2000;
+    a.fam_launches[P::kExpertsGpu] = 20000;
+    a.fam_ms[P::kWaitUpload] = 300;
+    a.fam_bytes[P::kExpertsGpu] = 3.0e9;
+    a.fam_bytes[P::kDense] = 0.9e9;
+    a.fam_ms[P::kDense] = 300;
+    a.fam_launches[P::kDense] = 2000;
+    a.gpu_experts = 400, a.staged_experts = 2000, a.cpu_experts = 0;
+    a.tokens = 2048, a.calls = 2, a.wall_ms = 2600;
+    r.runs[0].profile = P::Profile{};
+    r.runs[0].read = 2048;
+    r.runs[0].profile.add_call(P::kPrompt, 0, true, a);
+    const auto d = B::diagnose(r);
+    bool found = false;
+    for (const auto& g : d)
+        if (g.phase.rfind("prompt", 0) == 0) {
+            found = true;
+            CHECK(g.hit_rate > 0.16 && g.hit_rate < 0.17);   // 400 of 2,400 a visit from VRAM
+            CHECK(g.verdict.rfind("launch-bound", 0) != 0);
+            std::fprintf(stderr, "  prompt diagnosis: %s\n", g.verdict.c_str());
+        }
+    CHECK(found);
+}
+
 }  // namespace
 
 int main() {
@@ -260,6 +424,10 @@ int main() {
     test_explain();
     test_report_privacy();
     test_scrub_values_only();
+    test_diagnosis_launch_bound();
+    test_diagnosis_rx9070xt_measured();
+    test_diagnosis_bandwidth_and_hidden_launches();
+    test_diagnosis_prompt();
     if (failed) {
         std::fprintf(stderr, "bench_report_test: %d checks failed\n", failed);
         return 1;

@@ -43,6 +43,7 @@ enum Fam : int {
     kWaitUpload,      ///< the stream waits for experts on their way into VRAM (and the host's staging of them)
     kWaitCpu,         ///< the stream waits for the CPU's experts
     kHostGap,         ///< the stream has nothing to do: the host's work between two calls
+    kHostSetup,       ///< the stream idles while the host sets a read up (caches grown, staging taken back, buffers)
     kGraph,           ///< a recording replayed inside a split call (a batch step's, a block of guesses'): not split
     kUnsplit,         ///< an answer's token between its start and end events, not split (see above)
     kFams
@@ -53,7 +54,7 @@ enum Phase : int { kPrompt = 0, kDecode = 1, kPhases };
 inline const char* fam_key(int f) {
     static const char* const k[kFams] = {"attention", "kv_store",    "dense",    "norms",       "routing",
                                          "experts_gpu", "copy_h2d",  "copy_d2h", "wait_upload", "wait_cpu",
-                                         "host_gap",  "graph",       "unsplit"};
+                                         "host_gap",  "host_setup",  "graph",    "unsplit"};
     return f >= 0 && f < kFams ? k[f] : "?";
 }
 
@@ -69,13 +70,14 @@ inline const char* fam_title(int f) {
                                          "GPU waits for expert uploads",
                                          "GPU waits for CPU experts",
                                          "GPU idle, host between calls",
+                                         "GPU idle, host setting up a read",
                                          "recorded launches, not split",
                                          "not split (sampled out)"};
     return f >= 0 && f < kFams ? t[f] : "?";
 }
 
 /// The families that are the card waiting, not working.
-inline bool fam_idle(int f) { return f == kWaitUpload || f == kWaitCpu || f == kHostGap; }
+inline bool fam_idle(int f) { return f == kWaitUpload || f == kWaitCpu || f == kHostGap || f == kHostSetup; }
 
 inline const char* phase_key(int p) { return p == kPrompt ? "prompt" : "decode"; }
 
@@ -83,11 +85,17 @@ inline const char* phase_key(int p) { return p == kPrompt ? "prompt" : "decode";
 struct Acc {
     double fam_ms[kFams] = {};
     double fam_launches[kFams] = {};   ///< kernel launches in each family (see launch_counter())
+    double fam_graph_nodes[kFams] = {}; ///< of them, kernels of replayed recordings (the rest: direct launches)
+    double fam_bytes[kFams] = {};       ///< bytes the family reads, by the engine's byte model (dense weights, KV
+                                        ///< rows, experts on the card); 0 where it has none
+    double cpu_expert_bytes = 0;        ///< the CPU experts' weights read from RAM
     double wall_ms = 0;         ///< host clock from each call's start to its end, and the gaps between calls
     int64_t tokens = 0, calls = 0;
     double cpu_ms = 0;          ///< CPU experts (Stats::cpu_ms)
     double route_wait_ms = 0;   ///< the host waiting for the router's copy (Stats::route_wait_ms)
+    double route_waits = 0;     ///< how many times (a host round trip each: the scores to the host, the experts back)
     int64_t cpu_experts = 0, gpu_experts = 0;
+    double staged_experts = 0;   ///< a prompt batch's experts copied into VRAM for it (once a visit)
     double upload_bytes = 0;    ///< experts copied into VRAM in the stream (wait_upload's bytes)
     double side_ms = 0, side_bytes = 0;   ///< copies of experts on the upload stream, beside the work
 
@@ -102,13 +110,19 @@ struct Acc {
         return s;
     }
     void add(const Acc& o) {
-        for (int f = 0; f < kFams; ++f) fam_ms[f] += o.fam_ms[f], fam_launches[f] += o.fam_launches[f];
+        for (int f = 0; f < kFams; ++f) {
+            fam_ms[f] += o.fam_ms[f], fam_launches[f] += o.fam_launches[f];
+            fam_graph_nodes[f] += o.fam_graph_nodes[f], fam_bytes[f] += o.fam_bytes[f];
+        }
+        cpu_expert_bytes += o.cpu_expert_bytes;
         wall_ms += o.wall_ms;
         tokens += o.tokens;
         calls += o.calls;
         cpu_ms += o.cpu_ms;
         route_wait_ms += o.route_wait_ms;
+        route_waits += o.route_waits;
         cpu_experts += o.cpu_experts;
+        staged_experts += o.staged_experts;
         gpu_experts += o.gpu_experts;
         upload_bytes += o.upload_bytes;
         side_ms += o.side_ms;
@@ -134,7 +148,13 @@ inline std::atomic<bool>& launch_wrapper_linked() {
     static std::atomic<bool> on{false};
     return on;
 }
+/// Of launch_count(), the nodes of replayed recordings.
+inline std::atomic<uint64_t>& graph_node_count() {
+    static std::atomic<uint64_t> n{0};
+    return n;
+}
 inline uint64_t launch_counter() { return launch_count().load(std::memory_order_relaxed); }
+inline uint64_t graph_node_counter() { return graph_node_count().load(std::memory_order_relaxed); }
 /// True where direct launches are counted (the wrapper is linked), false where only recordings' nodes are.
 inline bool launches_wrapped() { return launch_wrapper_linked().load(std::memory_order_relaxed); }
 
@@ -252,6 +272,7 @@ inline void acc_json(Json& j, const char* key, const Acc& a) {
     j.num("tok_s", a.wall_ms > 0 ? 1000.0 * (double) a.tokens / a.wall_ms : 0.0, 2);
     j.num("cpu_experts_ms", a.cpu_ms, 2);
     j.num("router_wait_ms", a.route_wait_ms, 2);
+    j.num("host_round_trips", a.route_waits, 0);
     j.integer("cpu_experts", a.cpu_experts);
     j.integer("gpu_experts", a.gpu_experts);
     j.num("upload_gb", a.upload_bytes / 1e9, 4);
@@ -269,6 +290,15 @@ inline void acc_json(Json& j, const char* key, const Acc& a) {
     for (int f = 0; f < kFams; ++f)
         if (a.fam_launches[f] > 0) j.num(fam_key(f), a.fam_launches[f], 0);
     j.close();
+    j.open("graph_nodes_by_family");
+    for (int f = 0; f < kFams; ++f)
+        if (a.fam_graph_nodes[f] > 0) j.num(fam_key(f), a.fam_graph_nodes[f], 0);
+    j.close();
+    j.open("gb_by_family");
+    for (int f = 0; f < kFams; ++f)
+        if (a.fam_bytes[f] > 0) j.num(fam_key(f), a.fam_bytes[f] / 1e9, 4);
+    j.close();
+    j.num("cpu_expert_gb", a.cpu_expert_bytes / 1e9, 4);
     j.open("ms_per_token");
     for (int f = 0; f < kFams; ++f)
         if (a.fam_ms[f] > 0) j.num(fam_key(f), a.fam_ms[f] / tok, 4);

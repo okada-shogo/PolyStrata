@@ -2319,6 +2319,11 @@ int main(int argc, char** argv) {
         strata::poly::bench::probe_hardware(probes, 0, [](const char* what) {
             std::fprintf(stderr, "strata-poly: bench: %s\n", what);
         });
+        strata::poly::bench::probe_kernels(probes, 0);
+        std::fprintf(stderr, "strata-poly: bench: probe kernels done: launch %.1f us, a replayed node %.1f us, read %.0f GB/s, "
+                             "small kernel %.1f us (replayed %.1f, card-wide %.1f), round trip %.1f us, copy+wait %.1f us, fp32 %.0f GFLOP/s\n",
+                     probes.launch_us, probes.graph_node_us, probes.read_gbs, probes.small_us, probes.small_node_us,
+                     probes.wide_node_us, probes.sync_us, probes.copy_sync_us, probes.fma_gflops);
     }
 #endif
     if (o.batch < 0 || o.batch > 16 || check < 0 || check > o.batch || (check > 0 && (int) ids.size() <= check)) {
@@ -2442,6 +2447,7 @@ int main(int argc, char** argv) {
             base.probe_s = probes.seconds;
             base.load_s = load_s;
             base.tier = bench_long ? "long" : "quick";
+            base.launches_wrapped = strata::poly::prof::launches_wrapped();
             std::vector<std::pair<int, int>> types;
             const Engine::ExpertShape x = engine.expert_shape();
             if (x.gu_type >= 0) types = {{x.gu_type, x.n_embd}, {x.d_type, x.n_ff}};

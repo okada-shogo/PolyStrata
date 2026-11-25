@@ -233,6 +233,8 @@ private:
     bool kv8_ = false;         ///< the attention caches in FP8 E4M3 (load_geometry()); else fp16
     bool kvq8_ = false;        ///< the attention caches in Q8_0 (load_geometry(), --kv q8_0)
     bool int8_dot_ = false;    ///< STRATA_KV_INT8: long rows' scores by __dp4a on the Q8_0 caches (InkAttn::int8_dot)
+    double kv_read_bytes(int64_t pos, int n) override;
+    int prof_full_visits_ = -1, prof_swa_visits_ = 0;
     size_t kv_row() const {
         return kv8_    ? ink_kv8_row(n_kv_, head_dim_)
                : kvq8_ ? ink_kvq8_row(n_kv_, head_dim_)
