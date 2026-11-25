@@ -35948,7 +35948,7 @@
    "last_date": "2026-11-23",
    "status": "opt-in",
    "owner": "poly",
-   "note": "[reviewed] Inkling 2 on CUDA sm_80+: =int8 runs the IQ1_S experts' prompt products (UD-Q2_K_XL's gate|up in 6 layers) on the int8 tensor-core kernel (i8_mma.cuh, activations int8 with a scale per 32 values), about 7% faster prompt reading on an RTX 3090; unset or =fp16 keeps the FP16 kernel. Opt-in: on a 302-token prompt it added 3.4x the KL per matrix of the int8 formats main runs by default (one prompt, 64 steps); could become the default after a wider KL run (engine/src/poly/inkling2.cpp)",
+   "note": "[reviewed] Inkling 2 on CUDA sm_80+: =int8 runs the IQ1_S experts' prompt products (UD-Q2_K_XL's gate|up in 6 layers) on the int8 tensor-core kernel (i8_mma.cuh, activations int8 with a scale per 32 values), about 7% faster prompt reading on an RTX 3090; unset or =fp16 keeps the FP16 kernel. Opt-in: on a 302-token prompt it added 3.4x the KL per matrix of the int8 formats main runs by default (one prompt, 64 steps); could become the default after a wider KL run. On AMD (HIP, RDNA3/RDNA4) it is the default with the int8 kernel (=fp16 turns it off): over 9 texts x 160 tokens on an RX 9070 XT it moved top-1 and KL as much as the int8 kernel moves the other types (engine/src/poly/inkling2.cpp)",
    "retire_after": "",
    "retired_in": ""
   },
