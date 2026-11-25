@@ -645,5 +645,16 @@ class Pictures(unittest.TestCase):
             self.assertIn("only supported for user and tool messages", str(e.exception))
 
 
+class TopKTest(unittest.TestCase):
+    """strata-poly samples from the whole vocabulary: top_k 0 and wide lists reach it; the Strata engines keep 64."""
+
+    def test_top_k(self):
+        for tk, poly, strata in ((0, " top_k=0", " top_k=64"), (100, " top_k=100", " top_k=64"),
+                                 (20, " top_k=20", " top_k=20")):
+            with self.subTest(top_k=tk):
+                self.assertEqual(StrataEngine.sampling_keys({"top_k": tk}, any_top_k=True), poly)
+                self.assertEqual(StrataEngine.sampling_keys({"top_k": tk}), strata)
+
+
 if __name__ == "__main__":
     unittest.main()
