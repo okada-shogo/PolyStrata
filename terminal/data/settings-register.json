@@ -34449,36 +34449,6 @@
    "retired_in": ""
   },
   {
-   "name": "STRATA_POLY_HIP_INT8",
-   "backends": [
-    "cuda-hip"
-   ],
-   "reads": [
-    {
-     "file": "engine/src/poly/mmq_own.cu",
-     "line": 301,
-     "backend": "cuda-hip",
-     "fn": "getenv"
-    }
-   ],
-   "parse": "flag",
-   "default_state": "on",
-   "code_default": null,
-   "engine_sets": [],
-   "engine_defaults": [],
-   "launch_files": [],
-   "launch_sets": [],
-   "launch_reads": [],
-   "doc_mentions": [],
-   "status": "default",
-   "owner": "poly",
-   "note": "strata-poly's prompt products on the int8 kernel (i8_mma.cuh) on AMD's RDNA3/RDNA4 matrix cores (WMMA iu8): on unless 0/off (unset, 1/true/yes/on: on); 0: the FP16 tiles and the per-expert dequantize + rocBLAS loop as in 0.2.20-poly.4. NVFP4 goes with it unless STRATA_PREFILL_NVFP4 names a mode (engine/src/poly/mmq_own.cu)",
-   "retire_after": "",
-   "retired_in": "",
-   "first_date": "2026-11-24",
-   "last_date": "2026-11-24"
-  },
-  {
    "name": "STRATA_POLY_MIRROR",
    "backends": [
     "cuda"

@@ -273,9 +273,12 @@ void Inkling2::load_geometry() {
 #if !defined(STRATA_GPU_METAL)
     // Turing's prompt products on the int8 kernel that Ampere and newer take by default (i8_mma.cuh), only with
     // --prompt-int8: on Turing it gave the same most likely token as the halves at 560 of 576 steps (97.2%), under
-    // the 97.8% a default change needs, so the halves and cuBLAS stay Turing's default (STRATA_PF_I8MMA=0 turns the
-    // kernel off on every card)
-    kernels::gemm_iq_i8_turing(opt_.prompt_int8 == 1);
+    // the 97.8% a default change needs, so the halves and cuBLAS stay Turing's default.  On AMD's RDNA3 / RDNA4 the
+    // kernel is the default and --no-prompt-int8 turns it off.  STRATA_PF_I8MMA=0 turns the kernel off on every card.
+#if defined(STRATA_USE_HIP)
+    if (opt_.prompt_int8 >= 0)   // on AMD the int8 kernel is the default: only --no-prompt-int8 (or --prompt-int8) says
+#endif
+        kernels::gemm_iq_i8_turing(opt_.prompt_int8 == 1);
     // STRATA_PREFILL_IQ1S=int8: IQ1_S (UD-Q2_K_XL's gate|up in 6 layers) on the int8 prompt kernel, as the file's
     // other types are on Ampere and newer (i8_mma.cuh: activations int8 a 32 values).  Opt-in: on a 302-token prompt
     // it cost more KL a matrix than those types do.  Unset or =fp16: the FP16 kernel, as before.  Other models never

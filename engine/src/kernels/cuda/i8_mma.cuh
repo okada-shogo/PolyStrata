@@ -1140,8 +1140,13 @@ struct I8mCard {
     size_t shared = 0, shared_sm = 0;   // a block's most, a multiprocessor's
 };
 
-// gemm_iq_i8_turing(): the kernel also on Turing's code (sm_75), whose products a model asks for
+// gemm_iq_i8_turing(): the kernel also where it is off by default, which a model asks for: Turing's code (sm_75).  On
+// HIP (RDNA3 / RDNA4) it is on by default, and --no-prompt-int8 turns it off
+#if defined(__HIPCC__)
+std::atomic<bool> i8m_turing{true};
+#else
 std::atomic<bool> i8m_turing{false};
+#endif
 
 // the current card: int8 tensor cores in the code it runs (Ampere's, or Turing's when asked), and the shared memory
 // it gives a block
@@ -1166,7 +1171,7 @@ I8mCard i8m_card() {
         known[dev] = c;
     }
     I8mCard c = known[dev];
-    c.on = c.arch != 0;
+    c.on = c.arch != 0 && i8m_turing.load(std::memory_order_relaxed);
     return c;
 #else
     if (!known[dev].read) {
