@@ -1,5 +1,5 @@
 // src/poly/slots_lanes_test.cu - the cached experts' slots launches of native_mmvq.cu's formats with MmvqSlots::lanes
-// (Inkling 2, CUDA: native_mmvq_slots_lanes_kernel, a warp a row) against the same launches without it, to the bit:
+// (Inkling 2: native_mmvq_slots_lanes_kernel, a warp a row) against the same launches without it, to the bit:
 // random blocks of IQ4_NL, Q8_0, Q2_0, MXFP4, Q4_0, Q5_0, Q2_K..Q6_K and IQ4_XS, 1 to 32 matrices a launch, row counts
 // that leave a block's last warps short, n_in from 1 block to 4096 values (both of the block kernel's row layouts),
 // through the host's list (MmvqSlots) and the card's picks (MmvqIds); every slot's output is followed by canaries

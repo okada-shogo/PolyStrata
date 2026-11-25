@@ -2079,7 +2079,7 @@ __global__ void native_mmvq_slots_warp_kernel(S slots, int n_in, int n_out) {
     }
 }
 
-#if !defined(__HIPCC__)   // CUDA only: measured on CUDA; the HIP launches stay as they were
+#if !defined(STRATA_HIP_GFX906)   // a warp of 32 lanes: not gfx906 (wave64)
 // native_mmvq_slots_kernel<F, ROWS> with a warp a row (MmvqSlots::lanes): lane l does the work of the block's threads
 // l, 32 + l, 64 + l and 96 + l, each into its own sum, and adds them in the order the block adds its warps' partials -
 // the same terms in the same order, so the same bits, with no shared memory or barrier and no thread idle for a K
@@ -2122,7 +2122,7 @@ template<> constexpr bool kSlotsLanesFaster<Q6KTraits> = false;
 template<typename F, typename S>
 void launch_slots(const S& slots, int count, int n_in, int n_out, cudaStream_t s) {
     const dim3 threads(WARP, WARPS);
-#if !defined(__HIPCC__)
+#if !defined(STRATA_HIP_GFX906)
     if constexpr (kSlotsLanesFaster<F>) {
         if (slots.lanes) {
             const dim3 blocks(unsigned((std::size_t(n_out) + WARPS - 1) / WARPS), unsigned(count));
