@@ -69,14 +69,17 @@ class AnthropicToolResults(unittest.TestCase):
             block.pop("id")
         for block in legacy[2]["content"]:
             block.pop("tool_use_id")
-        self.assertEqual(without_ids(normalized(ordered)), normalized(legacy))
+        # #7051: with ids each result also gets its tool_use's name; without ids there is nothing to name it from
+        named = without_ids(normalized(ordered))
+        self.assertEqual([m.pop("name") for m in named[2:]], ["Grep", "Grep"])
+        self.assertEqual(named, normalized(legacy))
         self.assertEqual([m["content"] for m in normalized(ordered)[2:]], ["RESULT_FROM_SLOW", "RESULT_FROM_FAST"])
 
     def test_ids_never_reach_the_template(self):
         for raw in (history(), in_call_order()):
             messages = normalized(raw)
             messages = without_ids(messages)       # (the ids PolyStrata keeps for GLM's and Gemma 4's templates; nothing else)
-            self.assertTrue(all(set(m) == {"role", "content"} for m in messages[2:]))
+            self.assertTrue(all(set(m) <= {"role", "content", "name"} for m in messages[2:]))
             self.assertTrue(all(set(c) == {"function"} for c in messages[1]["tool_calls"]))
 
     def test_ambiguous_or_incomplete_ids_preserve_received_order(self):
