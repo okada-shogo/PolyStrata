@@ -524,10 +524,11 @@ before it installs a model.
   The engine now waits after it maps a piece (`Engine::vmm_settle()`: an ordinary allocation, which the kernel does
   wait for). `STRATA_VMM_SETTLE=0` leaves the wait out. An engine from before that runs there with
   `--vram-reserve-mib 512`, which keeps the cache from growing.
-- Under WSL2 (ROCm 7.2.4 with librocdxg: `/dev/dxg` and no `/dev/kfd`) ROCm refuses `hipMemSetAccess` on a piece
-  mapped after a larger one in the same reservation, so every piece of a reservation is made one size there (the
-  expert cache had lost its last 64 MiB piece, and an attention cache grown to its end failed).
-  `STRATA_VMM_EQUAL_PIECES=1` or `=0` turns that on or off on any Linux HIP build.
+- On Linux, under WSL2 (ROCm 7.2.4 with librocdxg) and on native ROCm (amdgpu) alike, ROCm refuses
+  `hipMemSetAccess` on a piece mapped after a larger one in the same reservation, so every piece of a reservation is
+  made one size (under WSL2 the expert cache had lost its last 64 MiB piece; on native Fedora with an RX 9070 XT a
+  32K prompt with `--max-context 34816` stopped with `no VRAM for the attention cache (4 MiB more)`).
+  `STRATA_VMM_EQUAL_PIECES=0` turns that off.
 - hipBLASLt loads a product type's kernels at its first call. On Windows (RX 9070 XT, ROCm 10.2.0a20260930) the
   first single-precision product of a prompt took 4 s on one CPU thread with the card idle, inside the first prompt
   of every strata-poly process. strata-poly now makes one small product of each kind the prompt uses (halves into

@@ -1016,13 +1016,12 @@ void Engine::mind_memory() {
 }
 
 #ifdef STRATA_VMM_EQUAL_PIECES
-// Whether a reservation's pieces must all be of one size (hip_compat/cuda.h): under WSL2, where ROCm reaches the card
-// through librocdxg (/dev/dxg, and no /dev/kfd).  STRATA_VMM_EQUAL_PIECES=1 or 0 says it for any Linux HIP build.
+// Whether a reservation's pieces must all be of one size (hip_compat/cuda.h): on every Linux HIP build, under WSL2
+// (librocdxg) and on native ROCm (amdgpu) alike.  STRATA_VMM_EQUAL_PIECES=0 turns it off.
 static bool vmm_equal_pieces() {
     static const bool on = [] {
-        if (const char* v = std::getenv("STRATA_VMM_EQUAL_PIECES"); v && v[0]) return v[0] != '0';
-        std::error_code ec;
-        return std::filesystem::exists("/dev/dxg", ec) && !std::filesystem::exists("/dev/kfd", ec);
+        const char* v = std::getenv("STRATA_VMM_EQUAL_PIECES");
+        return !(v && v[0] == '0');
     }();
     return on;
 }

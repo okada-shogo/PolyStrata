@@ -51808,7 +51808,7 @@
    "last_date": null,
    "status": "research",
    "owner": "poly",
-   "note": "[reviewed] HIP on Linux (STRATA_VMM_EQUAL_PIECES builds): every piece of a VRAM reservation is one size; on by default under WSL2 (/dev/dxg without /dev/kfd), where ROCm 7.2.4 with librocdxg refuses hipMemSetAccess on a piece mapped after a larger one; =1 or =0 forces it on or off (engine/src/poly/engine.cpp:948, docs/AMD_HIP.md:518)",
+   "note": "[reviewed] HIP on Linux (STRATA_VMM_EQUAL_PIECES builds): every piece of a VRAM reservation is one size; on by default (under WSL2 and on native ROCm alike, ROCm 7.2.4 refuses hipMemSetAccess on a piece mapped after a larger one); =0 turns it off (engine/src/poly/engine.cpp:1021, docs/AMD_HIP.md:527)",
    "retire_after": "",
    "retired_in": ""
   },
