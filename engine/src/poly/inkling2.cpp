@@ -1948,12 +1948,13 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
 void Inkling2::zha_load() {
     const std::string path = zha_file();
     if (path.empty()) return;
-#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
-    throw std::runtime_error("STRATA_INK_ZHA: the ZHA index runs on NVIDIA cards only");
+#if defined(STRATA_GPU_METAL)
+    throw std::runtime_error("STRATA_INK_ZHA: the ZHA index runs on NVIDIA and AMD cards only");
 #else
     const auto need = [](bool ok, const char* what) {
         if (!ok) throw std::runtime_error(what);
     };
+#if !defined(STRATA_USE_HIP)   // AMD: the prompt's kernels without tensor cores (inkling2_zha.cu)
     {
         int dev = 0, major = 0, minor = 0;
         const bool known = cudaGetDevice(&dev) == cudaSuccess &&
@@ -1961,6 +1962,7 @@ void Inkling2::zha_load() {
                            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
         need(known && major * 10 + minor >= 75, "STRATA_INK_ZHA: the ZHA index needs an NVIDIA card from Turing on");
     }
+#endif
     need(opt_.layer_split.empty() && opt_.expert_gpu < 0, "STRATA_INK_ZHA: the ZHA index runs on one card");
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("STRATA_INK_ZHA: cannot open " + path);

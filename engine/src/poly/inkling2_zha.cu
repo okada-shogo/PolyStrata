@@ -2,35 +2,12 @@
 // summaries of 64-key chunks, their scores, the chunks a token reads exactly, the tail through the summaries, and the
 // answer's chunk cache in VRAM.  The method: "ZHA" (Zyphra Hierarchical Attention), arXiv 2610.42112.
 //
-// The kernels use mma.sync and cp.async: NVIDIA only (compute capability 7.5 and up; the load refuses the index
-// elsewhere).  A HIP build gets entry points that say so.
+// The prompt's kernels use mma.sync and cp.async on NVIDIA (compute capability 7.5 and up; the load refuses the
+// index below that).  A HIP build (AMD) runs plain FMA versions of those three kernels (zha_*_scalar_kernel), which
+// round where the tensor-core ones do; every other kernel is the same code on both.
 #include "inkling2_zha.hpp"
 
 #include <stdexcept>
-
-#if defined(__HIPCC__) || defined(STRATA_USE_HIP)
-
-namespace strata::poly::ink {
-namespace {
-[[noreturn]] void nvidia_only() { throw std::runtime_error("the ZHA index (STRATA_INK_ZHA) runs on NVIDIA cards only"); }
-}  // namespace
-void store_q4(const float*, int8_t*, uint16_t*, int, long long, int, long long, void*) { nvidia_only(); }
-void q4_to_q8(const int8_t*, const uint16_t*, long long, int8_t*, uint16_t*, long long, long long, int, int, void*) {
-    nvidia_only();
-}
-void zha_cache_clear(ZhaCache&, int, int, void*) { nvidia_only(); }
-void zha_build(const float*, const ZhaKv&, long long, int, int, int, int, int, int, uint16_t*, uint16_t*, float*, void*,
-               size_t) {
-    nvidia_only();
-}
-void zha_attend(void*, const Zha&, const float*, const ZhaKv&, const ZhaKv&, long long, const uint16_t*, const uint16_t*,
-                const float*, int, int, long long, int, int, int, const float*, const float*, int, int, const float*,
-                const ZhaWork&, float*, void*, ZhaCache*, bool, int) {
-    nvidia_only();
-}
-}  // namespace strata::poly::ink
-
-#else
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -845,6 +822,10 @@ __global__ void __launch_bounds__(128) zha_exact_dec_kernel(const float* __restr
     cmap += (size_t) g * max_chunks;
     float m = -INFINITY, l = 0.f, acc[4] = {0.f, 0.f, 0.f, 0.f};
     for (int it = i0 + w; it < i1; it += 4) {
+#if defined(__HIPCC__)
+        // keeps AMD's compiler from lifting the loop's reads of qs out of it (the registers spill)
+        __asm__ volatile("" ::: "memory");
+#endif
         int c;
         bool from_ring;
         if (it < nl) {
@@ -1070,6 +1051,10 @@ __global__ void __launch_bounds__(128) zha_exact_dec_group_kernel(const float* _
         for (int i = 0; i < DPL; ++i) acc16[p][i] = 0.f;
     }
     for (int it = i0 + w; it < i1; it += 4) {
+#if defined(__HIPCC__)
+        // keeps AMD's compiler from lifting the loop's reads of qs out of it (the registers spill)
+        __asm__ volatile("" ::: "memory");
+#endif
         int c;
         bool from_ring;
         if (it < nl) {
@@ -1334,7 +1319,7 @@ __global__ void zha_join_group_kernel(const float* __restrict__ part, int segs, 
 }
 
 // ---- the exact keys of a prompt batch on the tensor cores ----------------------------------------------------
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750) || defined(__HIPCC__)
 #define ZHA_MMA 0
 #else
 #define ZHA_MMA 1
@@ -1932,6 +1917,310 @@ zha_tail_mma_kernel(const float* __restrict__ score, const uint8_t* __restrict__
 #endif
 }
 
+#if defined(__HIPCC__)
+// ---- the same three prompt kernels without tensor cores (HIP) ------------------------------------------------
+// The grids, tiles and outputs of zha_exact_kernel, zha_score_kernel and zha_tail_mma_kernel; a thread a token, a head
+// and a quarter of the 128 dims (blocks of kZhaTokens * 4 * per threads, the 4 lanes of a token side by side).  The
+// rounding is the tensor cores': the queries, the keys, the values and the weights in fp16, the sums in fp32; only the
+// order of the sums differs.
+constexpr int kZhaQuarter = kZhaDim / 4;
+constexpr int kZhaScalarThreads = kZhaTokens * 4 * 3;   // groups of up to 3 heads
+
+__device__ __forceinline__ float zha_r16(float x) { return __half2float(__float2half_rn(x)); }
+
+// The thread's quarter of a token's query, times scale, rounded to fp16 (0 for a dead row).
+__device__ __forceinline__ void zha_q_quarter(const float* q, bool live, size_t at, float scale, float (&qf)[kZhaQuarter]) {
+#pragma unroll
+    for (int i = 0; i < kZhaQuarter; ++i) qf[i] = live ? zha_r16(q[at + i] * scale) : 0.f;
+}
+
+// The dot of the quarter with an fp16 row's quarter, summed over the token's 4 lanes.
+__device__ __forceinline__ float zha_dot_quarter(const float (&qf)[kZhaQuarter], const __half* row) {
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < kZhaQuarter; i += 8) {
+        const uint4 u = *reinterpret_cast<const uint4*>(row + i);
+        const __half2* h = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float2 f = __half22float2(h[e]);
+            s += qf[i + 2 * e] * f.x + qf[i + 2 * e + 1] * f.y;
+        }
+    }
+    s += __shfl_xor_sync(0xffffffffu, s, 1);
+    s += __shfl_xor_sync(0xffffffffu, s, 2);
+    return s;
+}
+
+// o += w * an fp16 row's quarter.
+__device__ __forceinline__ void zha_acc_quarter(float (&o)[kZhaQuarter], float w, const __half* row) {
+#pragma unroll
+    for (int i = 0; i < kZhaQuarter; i += 8) {
+        const uint4 u = *reinterpret_cast<const uint4*>(row + i);
+        const __half2* h = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float2 f = __half22float2(h[e]);
+            o[i + 2 * e] += w * f.x, o[i + 2 * e + 1] += w * f.y;
+        }
+    }
+}
+
+// Chunk c's keys and values into the fp16 tiles, straight from the ring (Q8_0, from chunk c_ring on) or the staging
+// buffer (4-bit): zha_raw_issue() and zha_raw_dequant() in one step, 8 values a thread at a time.
+__device__ __forceinline__ void zha_tile_load(int c, const ZhaKv& stage, const int* cmap, const ZhaKv& ring,
+                                              long long n_ring, int g, int C, int c_ring, __half (*ks)[kZhaRow],
+                                              __half (*vs)[kZhaRow]) {
+    const bool q8 = c >= c_ring;
+    const long long r0 = q8 ? ((long long) c * C) % n_ring : 0;
+    const size_t slot = q8 ? 0 : (size_t) cmap[c];
+    for (int i = threadIdx.x; i < 64 * (kZhaDim / 8); i += blockDim.x) {
+        const int r = i / (kZhaDim / 8), d = 8 * (i % (kZhaDim / 8));
+        float xk[8], xv[8];
+        if (q8) {
+            const size_t at = (size_t) (r0 + r) * (size_t) ring.row + (size_t) g * kZhaDim;
+            const float dk = __half2float(__ushort_as_half(ring.ks[at / 32 + d / 32]));
+            const float dv = __half2float(__ushort_as_half(ring.vs[at / 32 + d / 32]));
+            const uint2 a = *reinterpret_cast<const uint2*>(ring.kc + at + d);
+            const uint2 b = *reinterpret_cast<const uint2*>(ring.vc + at + d);
+            const int8_t* pa = reinterpret_cast<const int8_t*>(&a);
+            const int8_t* pb = reinterpret_cast<const int8_t*>(&b);
+            for (int e = 0; e < 8; ++e) xk[e] = pa[e] * dk, xv[e] = pb[e] * dv;
+        } else {
+            const size_t key = slot * C + r;
+            const float dk = __half2float(__ushort_as_half(stage.ks[key * 4 + d / 32]));
+            const float dv = __half2float(__ushort_as_half(stage.vs[key * 4 + d / 32]));
+            const uint32_t a = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(stage.kc) + key * 64 + d / 2);
+            const uint32_t b = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(stage.vc) + key * 64 + d / 2);
+            for (int e = 0; e < 8; ++e) {
+                xk[e] = (float) ((int) ((a >> (4 * e)) & 15) - 8) * dk;
+                xv[e] = (float) ((int) ((b >> (4 * e)) & 15) - 8) * dv;
+            }
+        }
+        for (int e = 0; e < 8; e += 2) {
+            *reinterpret_cast<__half2*>(&ks[r][d + e]) = __floats2half2_rn(xk[e], xk[e + 1]);
+            *reinterpret_cast<__half2*>(&vs[r][d + e]) = __floats2half2_rn(xv[e], xv[e + 1]);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(kZhaScalarThreads)
+zha_exact_scalar_kernel(const float* __restrict__ q, ZhaKv stage, const int* __restrict__ cmap, ZhaKv ring,
+                        long long n_ring, const uint8_t* __restrict__ sel, int sel_heads, size_t hs, int max_chunks,
+                        long long pos, int rows, int n_head, int g, int per, int C, int recent,
+                        const float* __restrict__ bias, int extent, float* __restrict__ part, int segs,
+                        const uint32_t* __restrict__ bits, int words) {
+    __shared__ __align__(16) __half ks[kZhaKeys][kZhaRow];
+    __shared__ __align__(16) __half vs[kZhaKeys][kZhaRow];
+    __shared__ uint32_t want[32];
+    __shared__ int lst[1024], nlst;
+    constexpr float LOG2E = 1.44269504f;
+    const int t0 = blockIdx.x * kZhaTokens, qd = threadIdx.x & 3, tl = (threadIdx.x >> 2) % kZhaTokens;
+    const int p = threadIdx.x / (4 * kZhaTokens), tok = t0 + tl, head = g * per + p;
+    const bool live = p < per && tok < rows;
+    float qf[kZhaQuarter];
+    zha_q_quarter(q, live, ((size_t) tok * n_head + head) * kZhaDim + kZhaQuarter * qd,
+                  rsqrtf((float) kZhaDim) * LOG2E, qf);
+    const long long own = pos + tok;
+    long long fr;
+    zha_far(own, C, recent, &fr);
+    const uint8_t* srow = sel + (sel_heads > 1 ? (size_t) min(p, per - 1) * hs : 0) + (size_t) min(tok, rows - 1) * max_chunks;
+    const int t_last = min(t0 + kZhaTokens, rows) - 1;
+    long long fr_first, fr_last;
+    zha_far(pos + t0, C, recent, &fr_first);
+    const int nf_last = zha_far(pos + t_last, C, recent, &fr_last);
+    const int c_ring = (int) (fr_first / C), c_end = (int) ((pos + t_last) / C) + 1;
+    const float* brow = bias + ((size_t) min(p, per - 1) * rows + min(tok, rows - 1)) * extent;
+    float o[kZhaQuarter], m = -INFINITY, l = 0.f;
+#pragma unroll
+    for (int i = 0; i < kZhaQuarter; ++i) o[i] = 0.f;
+    for (int w0 = 0; w0 < c_end; w0 += 1024) {
+        if (threadIdx.x < 32) {   // as zha_exact_kernel: the block's chunks of the window
+            const int wi = (w0 >> 5) + threadIdx.x;
+            uint32_t x = wi < words ? bits[(size_t) blockIdx.x * words + wi] : 0u;
+            for (int k = 0; k < 32; ++k) {
+                const int c = 32 * wi + k;
+                if (c >= c_end) x &= ~(1u << k);
+                else if (c == 0 || c >= c_ring) x |= 1u << k;
+                else if (c > nf_last) x &= ~(1u << k);
+            }
+            want[threadIdx.x] = x;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int n = 0, k = 0;
+            for (int b = 0; b < 32; ++b)
+                for (uint32_t bw = want[b]; bw; bw &= bw - 1, ++k)
+                    if (k % gridDim.y == blockIdx.y) lst[n++] = w0 + 32 * b + __ffs(bw) - 1;
+            nlst = n;
+        }
+        __syncthreads();
+        const int n_items = nlst;
+        for (int it = 0; it < n_items; ++it) {
+            const int c = lst[it];
+            zha_tile_load(c, stage, cmap, ring, n_ring, g, C, c_ring, ks, vs);
+            __syncthreads();
+            if (live && ((long long) c * C >= fr || c == 0 || srow[c])) {   // the 4 lanes of a token agree
+                float s[kZhaKeys], mx = -INFINITY;
+#pragma unroll
+                for (int k = 0; k < kZhaKeys; ++k) {
+                    const long long key = (long long) c * C + k;
+                    float v = zha_dot_quarter(qf, &ks[k][kZhaQuarter * qd]);
+                    if (key > own) v = -INFINITY;
+                    else if (own - key < extent) v += brow[own - key] * LOG2E;
+                    s[k] = v;
+                    mx = fmaxf(mx, v);
+                }
+                const float now = fmaxf(m, mx), base = now == -INFINITY ? 0.f : now, f = exp2f(m - base);
+                m = now;
+                l *= f;
+#pragma unroll
+                for (int i = 0; i < kZhaQuarter; ++i) o[i] *= f;
+#pragma unroll
+                for (int k = 0; k < kZhaKeys; ++k) {
+                    const float e = exp2f(s[k] - base);
+                    l += e;
+                    zha_acc_quarter(o, zha_r16(e), &vs[k][kZhaQuarter * qd]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if (!live) return;
+    float* pp = part + (((size_t) tok * per + p) * segs + blockIdx.y) * (kZhaDim + 2);
+#pragma unroll
+    for (int i = 0; i < kZhaQuarter; ++i) pp[kZhaQuarter * qd + i] = o[i];
+    if (qd == 0) {
+        pp[kZhaDim] = m == -INFINITY ? -INFINITY : m * 0.69314718f;
+        pp[kZhaDim + 1] = l;
+    }
+}
+
+template <int R>
+__global__ void __launch_bounds__(kZhaScalarThreads)
+zha_score_scalar_kernel(const float* __restrict__ q, const __half* __restrict__ khat, const float* __restrict__ bhat,
+                        int nch, int max_chunks, int rows, int n_head, int g, int per, float* __restrict__ score,
+                        uint8_t* __restrict__ rstar, size_t hs, size_t q8n, long long pos, int C, int recent,
+                        float* __restrict__ top) {
+    __shared__ __align__(16) __half ks[kZhaKeys][kZhaRow];
+    __shared__ float bs[kZhaKeys];
+    constexpr int CPT = kZhaKeys / R;
+    __shared__ float sbuf[3][kZhaTokens][CPT];
+    __shared__ uint8_t rbuf[3][kZhaTokens][CPT];
+    const int t0 = blockIdx.x * kZhaTokens, qd = threadIdx.x & 3, tl = (threadIdx.x >> 2) % kZhaTokens;
+    const int p = threadIdx.x / (4 * kZhaTokens), tok = t0 + tl, head = g * per + p;
+    const bool live = p < per && tok < rows;
+    float qf[kZhaQuarter];
+    zha_q_quarter(q, live, ((size_t) tok * n_head + head) * kZhaDim + kZhaQuarter * qd, rsqrtf((float) kZhaDim), qf);
+    const float* bg = bhat + (size_t) g * zq_cap(q8n, max_chunks) * R;
+    long long fr;
+    const int nft = top && live ? zha_far(pos + tok, C, recent, &fr) : 0;
+    float tmax = -INFINITY;
+    const int span = ((nch + gridDim.y - 1) / gridDim.y + CPT - 1) / CPT * CPT;
+    const int cb = blockIdx.y * span, ce = min(nch, cb + span);
+    for (int c0 = cb; c0 < ce; c0 += CPT) {
+        const int nr = min(CPT, ce - c0) * R;
+        for (int i = threadIdx.x; i < kZhaKeys * (kZhaDim / 8); i += blockDim.x) {
+            const int r = i / (kZhaDim / 8), d = 8 * (i % (kZhaDim / 8));
+            uint4 x = make_uint4(0, 0, 0, 0);
+            if (r < nr) x = zsum8h(khat, q8n, ((size_t) g * zq_cap(q8n, max_chunks) + c0) * R + r, d);
+            *reinterpret_cast<uint4*>(&ks[r][d]) = x;
+        }
+        for (int i = threadIdx.x; i < kZhaKeys; i += blockDim.x) bs[i] = i < nr ? bg[(size_t) c0 * R + i] : -INFINITY;
+        __syncthreads();
+        if (p < per)
+            for (int cc = 0; cc < CPT; ++cc) {
+                float best = -INFINITY;
+                int arg = 0;
+                for (int r = 0; r < R; ++r) {   // the largest reference, the first of equal ones
+                    const float v = zha_dot_quarter(qf, &ks[cc * R + r][kZhaQuarter * qd]) + bs[cc * R + r];
+                    if (r == 0 || v > best) best = v, arg = r;
+                }
+                const int c = c0 + cc;
+                if (!live || qd != 0 || c >= ce) continue;
+                if (c >= 1 && c <= nft) tmax = fmaxf(tmax, best);
+                sbuf[p][tl][cc] = best;
+                rbuf[p][tl][cc] = (uint8_t) arg;
+            }
+        __syncthreads();
+        const int nc = min(CPT, ce - c0), tn = min(kZhaTokens, rows - t0);
+        for (int i = threadIdx.x; i < per * kZhaTokens * CPT; i += blockDim.x) {
+            const int cc = i % CPT, t = (i / CPT) % kZhaTokens, pp = i / (CPT * kZhaTokens);
+            if (cc >= nc || t >= tn) continue;
+            const size_t at = (size_t) pp * hs + (size_t) (t0 + t) * max_chunks + c0 + cc;
+            score[at] = sbuf[pp][t][cc];
+            rstar[at] = rbuf[pp][t][cc];
+        }
+    }
+    if (top && live && qd == 0 && tmax != -INFINITY) zha_atomic_max(top + (size_t) p * rows + tok, tmax);
+}
+
+template <int R>
+__global__ void __launch_bounds__(kZhaScalarThreads)
+zha_tail_scalar_kernel(const float* __restrict__ score, const uint8_t* __restrict__ sel, const uint8_t* __restrict__ rstar,
+                       const __half* __restrict__ vhat, int max_chunks, long long pos, int rows, int g, int per, int C,
+                       int recent, size_t hs, int sel_heads, float* __restrict__ part, int segs, int seg, size_t q8n) {
+    __shared__ __align__(16) __half vs[kZhaKeys][kZhaRow];
+    constexpr int CPT = kZhaKeys / R;
+    const int t0 = blockIdx.x * kZhaTokens, qd = threadIdx.x & 3, tl = (threadIdx.x >> 2) % kZhaTokens;
+    const int p = threadIdx.x / (4 * kZhaTokens), tok = t0 + tl, pc = min(p, per - 1), t = min(tok, rows - 1);
+    const bool live = p < per && tok < rows;
+    long long fr;
+    const int nf = live ? zha_far(pos + tok, C, recent, &fr) : 0;
+    const float* sc = score + (size_t) pc * hs + (size_t) t * max_chunks;
+    const uint8_t* rs = rstar + (size_t) pc * hs + (size_t) t * max_chunks;
+    const uint8_t* se = sel + (sel_heads > 1 ? (size_t) pc * hs : 0) + (size_t) t * max_chunks;
+    long long frl;
+    const int nf_last = zha_far(pos + min(t0 + kZhaTokens, rows) - 1, C, recent, &frl);
+    float o[kZhaQuarter], m = -INFINITY, l = 0.f;
+#pragma unroll
+    for (int i = 0; i < kZhaQuarter; ++i) o[i] = 0.f;
+    const int span = ((nf_last + 1 + gridDim.y - 1) / gridDim.y + CPT - 1) / CPT * CPT;
+    const int cb = blockIdx.y * span, ce = min(nf_last + 1, cb + span);
+    for (int c0 = cb; c0 < ce; c0 += CPT) {
+        const int nr = min(CPT, ce - c0) * R;
+        for (int i = threadIdx.x; i < kZhaKeys * (kZhaDim / 8); i += blockDim.x) {
+            const int r = i / (kZhaDim / 8), d = 8 * (i % (kZhaDim / 8));
+            uint4 x = make_uint4(0, 0, 0, 0);
+            if (r < nr) x = zsum8h(vhat, q8n, ((size_t) g * zq_cap(q8n, max_chunks) + c0) * R + r, d);
+            *reinterpret_cast<uint4*>(&vs[r][d]) = x;
+        }
+        __syncthreads();
+        if (live) {
+            float wt[CPT], mx = -INFINITY;   // a chunk's weight (log units): its score, on its best reference's row
+            int ref[CPT];
+#pragma unroll
+            for (int cc = 0; cc < CPT; ++cc) {
+                const int c = c0 + cc;
+                wt[cc] = -INFINITY, ref[cc] = 0;
+                if (c >= 1 && c <= nf && !se[c]) wt[cc] = sc[c], ref[cc] = rs[c];
+                mx = fmaxf(mx, wt[cc]);
+            }
+            if (mx != -INFINITY) {
+                const float now = fmaxf(m, mx), base = now == -INFINITY ? 0.f : now, f = expf(m - base);
+                m = now;
+                l *= f;
+#pragma unroll
+                for (int i = 0; i < kZhaQuarter; ++i) o[i] *= f;
+#pragma unroll
+                for (int cc = 0; cc < CPT; ++cc) {
+                    if (wt[cc] == -INFINITY) continue;
+                    const float e = expf(wt[cc] - base);
+                    l += e;
+                    zha_acc_quarter(o, zha_r16(e), &vs[cc * R + ref[cc]][kZhaQuarter * qd]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    float* pp = part + (((size_t) tok * per + p) * segs + seg + blockIdx.y) * (kZhaDim + 2);
+#pragma unroll
+    for (int i = 0; i < kZhaQuarter; ++i) pp[kZhaQuarter * qd + i] = o[i];
+    if (qd == 0) pp[kZhaDim] = m, pp[kZhaDim + 1] = l;
+}
+#endif  // __HIPCC__
+
 // The cache's part of a step for KV head g: each chunk the step reads (cmap >= 0) the cache holds is stamped and
 // mapped (g * P + its place); the others are misses (aux: [hand, count, chunks...]).
 __global__ void zha_lookup_kernel(int* __restrict__ cmap, int nch, int g, int P, int max_chunks, int now,
@@ -2245,7 +2534,11 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
     if (z.C != kZhaKeys || z.R != 4 || !leaves.q4 || !ring.kc || ring.q4)
         throw std::logic_error("ink::zha_attend: chunks of 64, 4 references, 4-bit leaves and a Q8_0 ring");
     // a selection's chunks in shared memory: a score each (zha_pick_select_dec_kernel, zha_select_tile2/3_kernel)
+#if defined(__HIPCC__)
+    constexpr size_t kSmem = 56 * 1024;   // AMD: 64 KB of LDS a workgroup, the kernels' own arrays beside
+#else
     constexpr size_t kSmem = 64 * 1024 + 4096;
+#endif
     constexpr int kTile = 64;         // a prompt's tokens choose their chunks together, 64 at a time
     constexpr int kSegExact = 16;     // an answer's token: the exact keys in 16 segments,
     constexpr int kSegTail = 32;      // the tail in 32
@@ -2381,10 +2674,19 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
         float* top = sel3 ? pick : nullptr;   // pick's room: per x rows floats
         if (sel3 && cudaMemsetAsync(top, 0xFF, (size_t) per * rows * sizeof(float), cs(stream)) != cudaSuccess)
             throw std::runtime_error("ink::zha_attend: memset");
+#if defined(__HIPCC__)
+        if (fused && per > 3) throw std::logic_error("ink::zha_attend: groups of up to 3 heads");
+        if (fused)
+            zha_score_scalar_kernel<4><<<dim3(tblocks, std::min(split, std::max(1, nch / (kZhaKeys / 4)))),
+                                         kZhaScalarThreads, 0, cs(stream)>>>(q, (const __half*) khat, bhat, nch, max_chunks,
+                                                                             rows, n_head, g, per, sc, rs, hs, q8n, pos,
+                                                                             z.C, z.recent, top);
+#else
         if (fused)   // the chunk scores on the tensor cores, the largest reference in registers
             zha_score_kernel<4><<<dim3(tblocks, std::min(split, std::max(1, nch / (kZhaKeys / 4)))), kZhaWarps * 32, 0,
                                   cs(stream)>>>(q, (const __half*) khat, bhat, nch, max_chunks, rows, n_head, g, per, sc,
                                                 rs, hs, q8n, pos, z.C, z.recent, top);
+#endif
         // the selections: the group's one (or each head's, in a group of one); a prompt's in tiles of tokens
         int sels = per;
         if (sel3) {
@@ -2464,6 +2766,15 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
             }
             zha_bits_kernel<<<dim3(blocks, grid(words, 128)), 128, 0, cs(stream)>>>(wk.sel, sels, hs, rows, max_chunks,
                                                                                     bits, words, nullptr);
+#if defined(__HIPCC__)
+            if (per > 3) throw std::logic_error("ink::zha_attend: groups of up to 3 heads");
+            zha_exact_scalar_kernel<<<dim3(blocks, kExactSplit), kZhaScalarThreads, 0, cs(stream)>>>(
+                q, wk.stage, cmap, ring, n_ring, wk.sel, sels, hs, max_chunks, pos, rows, n_head, g, per, z.C,
+                z.recent, bias, extent, part, psegs, bits, words);
+            zha_tail_scalar_kernel<4><<<dim3(blocks, tsplit), kZhaScalarThreads, 0, cs(stream)>>>(
+                sc, wk.sel, rs, (const __half*) vhat, max_chunks, pos, rows, g, per, z.C, z.recent, hs, sels, part,
+                psegs, kExactSplit, q8n);
+#else
             static bool attr = false;
             if (!attr) {
                 cudaFuncSetAttribute(zha_exact_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * kZhaRaw);
@@ -2475,6 +2786,7 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
             zha_tail_mma_kernel<4><<<dim3(blocks, tsplit), kZhaWarps * 32, 0, cs(stream)>>>(
                 sc, wk.sel, rs, (const __half*) vhat, max_chunks, pos, rows, g, per, z.C, z.recent, hs, sels, part,
                 psegs, kExactSplit, q8n);
+#endif
             zha_join_group_kernel<<<dim3(rows, per), 32, 0, cs(stream)>>>(part, psegs, per, n_head, g * per, sinks, out);
             continue;
         }
@@ -2488,4 +2800,3 @@ void zha_attend(void* blas, const Zha& z, const float* q, const ZhaKv& leaves, c
 
 }  // namespace strata::poly::ink
 
-#endif  // NVIDIA

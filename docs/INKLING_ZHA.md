@@ -9,9 +9,13 @@ pinned RAM in 4 bits, and VRAM keeps a summary of every 64 keys. On an 8 GB card
 be read and answered.
 
 It is opt-in. Without `STRATA_INK_ZHA` nothing changes: the default path writes the same tokens as before (below,
-how that was checked). It runs on an NVIDIA card from Turing on (compute capability 7.5), on one card and one
-sequence at a time: with `--batch` above 1 the engine reads one sequence (as with `--kv q8_0`), and the load stops
-with a message with `--draft-model`, `--layer-split`, `--expert-gpu`, on AMD and on a Mac.
+how that was checked). It runs on an NVIDIA card from Turing on (compute capability 7.5) and on AMD cards (HIP build),
+on one card and one sequence at a time: with `--batch` above 1 the engine reads one sequence (as with `--kv q8_0`),
+and the load stops with a message with `--draft-model`, `--layer-split`, `--expert-gpu` and on a Mac.
+
+On AMD the prompt's three tensor-core kernels (the chunk scores, the exact keys, the tail) run as plain FMA kernels
+with the same rounding (queries, keys, values and weights in fp16, sums in fp32); only the order of the sums differs.
+`poly_zha_kernels_test` checks them, and the NVIDIA ones, against a CPU reference.
 
 The method is ZHA ("Zyphra Hierarchical Attention", [arXiv 2610.42112](https://arxiv.org/abs/2610.42112)), one level
 of it, with the paper's reference queries trained for this model.
@@ -104,5 +108,5 @@ same 64 tokens as that sequence alone.
 
 - The answers move: a token's far chunks it does not read exactly are estimated. At 32K tokens the next-token
   distributions differ from the full attention's by a mean KL of 0.0156 (above).
-- One sequence (`--batch` is not used); not with the drafter, `--layer-split` or `--expert-gpu`; NVIDIA only.
+- One sequence (`--batch` is not used); not with the drafter, `--layer-split` or `--expert-gpu`; not on a Mac.
 - The reference file is for Inkling 2 Mini, chunks of 64 and 4 references; the load refuses another shape.
