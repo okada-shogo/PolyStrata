@@ -280,12 +280,18 @@ void Inkling2::load_geometry() {
 #endif
         kernels::gemm_iq_i8_turing(opt_.prompt_int8 == 1);
     // STRATA_PREFILL_IQ1S=int8: IQ1_S (UD-Q2_K_XL's gate|up in 6 layers) on the int8 prompt kernel, as the file's
-    // other types are on Ampere and newer (i8_mma.cuh: activations int8 a 32 values).  Opt-in: on a 302-token prompt
-    // it cost more KL a matrix than those types do.  Unset or =fp16: the FP16 kernel, as before.  Other models never
-    // ask, so their IQ1_S products stay on the FP16 kernel.
+    // other types are on Ampere and newer (i8_mma.cuh: activations int8 a 32 values).  Opt-in on NVIDIA: on a
+    // 302-token prompt it cost more KL a matrix than those types do.  On AMD, where the int8 kernel is the default for
+    // every other type, it is the default too (=fp16: the FP16 path, which on RDNA4 is a dequantize and a rocBLAS call
+    // an expert): over 9 texts it moved top-1 and KL as much as the int8 kernel moves the other types.  Other models
+    // never ask, so their IQ1_S products stay on the FP16 kernel.
     {
         const char* v = std::getenv("STRATA_PREFILL_IQ1S");
+#if defined(STRATA_USE_HIP)
+        kernels::gemm_iq_i8_allow(19, opt_.prompt_int8 != 0 && !(v && std::string(v) == "fp16"));
+#else
         kernels::gemm_iq_i8_allow(19, v && std::string(v) == "int8");
+#endif
     }
     // MXFP4 (UD-Q2_K_XL's down in one layer) on the int8 prompt kernel, as the file's other types already are on
     // Ampere and newer (i8_mma.cuh: activations int8 a 32 values); STRATA_PREFILL_MXFP4=fp16 keeps it on the FP16
