@@ -1423,8 +1423,8 @@ protected:
     int32_t* d_ids_ = nullptr;                    ///< a batch's experts and weights when it routes on the card
     float* d_wts_ = nullptr;
     int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card
-    float* h_wts_ = nullptr;                      ///< pinned: their weights, for step()'s rows (bells(), --batch)
-    /// While moe() takes step()'s rows: their picks from the card (h_ids_, h_wts_), as a token alone routes there
+    float* h_wts_ = nullptr;                      ///< pinned: their weights, for step()'s and window()'s rows (bells())
+    /// While moe() takes several rows: their picks from the card (h_ids_, h_wts_), as a token alone routes there
     const int32_t* step_ids_ = nullptr;
     void** d_slots_ = nullptr;                    ///< every layer's L.slot on the card, n_expert_ a layer (moe_card())
     std::vector<void*> h_slots_;                  ///< what d_slots_ holds
@@ -1452,6 +1452,11 @@ protected:
     bool bell_ = false;                           ///< this call rings (run())
     bool bell_counts_ = false;                    ///< a call since follow() last read d_use_ rang: picks to read
     bool bell_on(int n) const;
+    // Where a token alone routes on the card (the doorbell), rows the host takes are routed there too (route_card(),
+    // step_ids_): the host's route() need not round the gates like the card's.  The first: whether a token alone is
+    // routed on the card at all; the second: whether layer L is (moe_card() would find its kernels).
+    bool picks_like_alone() const;
+    bool picks_like_alone(const Layer& L) const;
     void bell_serve();
     void bell_job();
     void bell_unwind();
