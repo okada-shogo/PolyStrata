@@ -1119,14 +1119,14 @@ int serve(Session& ss) {
         piece_t0 = Clock::now();
         return true;
     };
-    // --vram-elastic: while the engine waits for a line with no batch slot writing, every STRATA_VRAM_WATCH_MS (default
-    // 2000) the expert cache gives VRAM back to a program that took some, or takes it again (Engine::idle_vram()).
+    // --vram-elastic: while the engine waits for a line with no batch slot writing, every --vram-elastic-watch-ms
+    // (STRATA_VRAM_WATCH_MS; default 2000) the expert cache gives VRAM back to a program that took some, or takes it again (Engine::idle_vram()).
     // Never inside a request.  STRATA_VRAM_WATCH=0: only at a request's start, as without the watch.
     const int watch_ms = [&] {
         const char* v = std::getenv("STRATA_VRAM_WATCH");
         if (!engine.elastic() || (v && v[0] == '0')) return 0;
         const char* m = std::getenv("STRATA_VRAM_WATCH_MS");
-        const int ms = m && m[0] ? std::atoi(m) : 2000;
+        const int ms = engine.vram_watch_ms() >= 0 ? engine.vram_watch_ms() : m && m[0] ? std::atoi(m) : 2000;
         return ms <= 0 ? 0 : std::max(ms, 100);
     }();
     if (watch_ms > 0)
@@ -1914,7 +1914,9 @@ void usage() {
                  "  --vram-elastic         keep the whole reserve free while serving: the expert cache gives VRAM back\n"
                  "                         when another program takes some (also while idle, every 2 s) and takes it\n"
                  "                         again when it is free, the experts it gave up first (needs VMM; not with\n"
-                 "                         --vram-pool; STRATA_VRAM_WATCH=0: only at a request's start)\n"
+                 "                         --vram-pool)\n"
+                 "  --vram-elastic-watch-ms N  the idle check's period in ms (default 2000, 100 at least; 0: only at a\n"
+                 "                         request's start)\n"
                  "  --vram-pool            claim the card's VRAM once at load (what is free but for the reserve above,\n"
                  "                         which is then the margin left outside), keep it for the whole run and move\n"
                  "                         it between the expert cache and the attention caches as the context grows\n"
@@ -2167,6 +2169,7 @@ int main(int argc, char** argv) {
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--vram-pool") o.vram_pool = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
+        else if (a == "--vram-elastic-watch-ms") o.vram_watch_ms = std::max(0, std::atoi(val()));
         else if (a == "--expert-profile") o.profile = val();
         else if (a == "--pinned-session") pinned = val();
         else if (a == "--no-gpu-experts") o.gpu_experts = false;

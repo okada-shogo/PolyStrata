@@ -52173,6 +52173,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_VMM_READDRESS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 1254,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/VRAM_ELASTIC.md:45"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "rollback",
+   "owner": "",
+   "note": "HIP on Linux: whether VRAM given back keeps the process's addresses. With --vram-elastic: 1 keeps the unmap-and-map cycle of the kept pieces after a release, 0 skips it. Unset: skipped under WSL2 (librocdxg gives released VRAM back at once), decided at the first shrink on native amdgpu. Set it only to override that.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_VMM_SETTLE",
    "backends": [
     "cuda-hip"
@@ -52308,6 +52343,76 @@
    "status": "opt-in",
    "owner": "core",
    "note": "[auto] documented for users (docs/DETAILS.md:1541), 1 more",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_VRAM_WATCH",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/main.cpp",
+     "line": 1116,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/VRAM_ELASTIC.md:40"
+   ],
+   "first_commit": "faa1456a12",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "faa1456a12",
+   "last_date": "2026-11-24",
+   "status": "rollback",
+   "owner": "",
+   "note": "--vram-elastic: 0 turns the idle watch off, the cache then resizes only at a request's start. On unless =0.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_VRAM_WATCH_MS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/main.cpp",
+     "line": 1118,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "2000",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/VRAM_ELASTIC.md:40"
+   ],
+   "first_commit": "faa1456a12",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "faa1456a12",
+   "last_date": "2026-11-24",
+   "status": "opt-in",
+   "owner": "",
+   "note": "--vram-elastic: the idle watch's period in ms (default 2000, 100 at least, 0 off); --vram-elastic-watch-ms N does the same and wins.",
    "retire_after": "",
    "retired_in": ""
   },
