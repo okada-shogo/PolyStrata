@@ -12,10 +12,12 @@
 #include <cuda.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -352,6 +354,158 @@ void Inkling2::ds_open() {
     for (int l = 0; l < layers; ++l) ds_[(size_t) l].swa = swa->items[(size_t) l].u != 0;
 }
 
+bool Inkling2::ds_mat_type(uint32_t type) { return type == kTypeBF16 || type == 8u; }
+
+// The drafter next to the model that strata-poly weighs for its default (Engine::drafter_beside(), main.cpp): of the
+// files named dspark*.gguf in the model's folder that are DSpark drafters (architecture dflash) with matrices
+// ds_load() takes, the smallest, which leaves the expert cache the most.  A file that cannot be read is passed over.
+std::string Inkling2::drafter_beside(const std::string& model) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path dir = fs::absolute(fs::path(model), ec).parent_path();
+    std::string best;
+    uint64_t best_size = 0;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::string name = it->path().filename().string();
+        for (char& c : name) c = (char) std::tolower((unsigned char) c);
+        std::error_code e2;
+        if (name.rfind("dspark", 0) != 0 || name.size() < 5 || name.compare(name.size() - 5, 5, ".gguf") != 0 ||
+            !it->is_regular_file(e2))
+            continue;
+        try {
+            const Shards f(it->path().string());   // a later part of a split file throws: only its first is taken
+            const MetaValue* arch = f.get("general.architecture");
+            const TensorInfo *w1 = f.find("markov_w1.weight"), *joint = f.find("joint_proj.weight");
+            bool ok = arch && arch->s == "dflash" && w1 && w1->type == kTypeBF16 && joint && joint->type == kTypeBF16;
+            f.each([&](const TensorInfo& t) {
+                if (t.name.rfind("blk.", 0) == 0 && t.type != kTypeF32 && !ds_mat_type(t.type)) ok = false;
+            });
+            const uint64_t size = f.bytes();
+            if (ok && (best.empty() || size < best_size)) {
+                best = it->path().string();
+                best_size = size;
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    return best;
+}
+
+// The VRAM the drafter in f takes once loaded, as ds_load() and assign_scratch() allocate it: its tensors (hidden_out
+// as fp32 in place of its BF16; joint_proj in three parts of the same bytes), the fold and its bias, the pick's
+// screen, the caches of its layers and the scratch of a prompt batch's call (with the drafter the scratch has the one
+// layout, for rows_ tokens).  Kept in step with those two by hand: a few MiB off moves draft_fit()'s estimate by about
+// one expert in 4 MiB.
+size_t Inkling2::ds_bytes(const Shards& f) const {
+    const auto u = [&](const char* k) -> uint64_t {
+        const MetaValue* v = f.get(std::string("dflash.") + k);
+        return v && v->is_num() ? (uint64_t) v->u : 0;
+    };
+    const uint64_t E = (uint64_t) n_embd_, hq = (uint64_t) n_head_ * head_dim_, kv = (uint64_t) n_kv_ * head_dim_,
+                   V = (uint64_t) n_vocab_, R = u("dspark.markov_rank"), ff = u("feed_forward_length"),
+                   B = u("block_size"), win = u("attention.sliding_window"), n = (uint64_t) rows_,
+                   rows = (uint64_t) ds_screen_rows(n_unpadded_);
+    size_t b = 0;
+    f.each([&](const TensorInfo& t) { b += tensor_payload_bytes(t); });
+    b += R * E * 2;                                  // hidden_out's fp32 rows (ds_wt_) over its BF16 in the file
+    b += V * (R / 32) * 34 + V * 4;                  // the fold and its bias (ds_fold())
+    b += (size_t) kDsRing * E * 4 + 64 + B * sizeof(Likeliest) + (2 * kDsRows + 1) * sizeof(long long);
+    if (output_.type == 8u && ds_screens(n_embd_, (int) R))
+        b += ds_screen_bytes(n_embd_, n_unpadded_) + ds_screen_bytes((int) R, n_unpadded_) + rows * 4;
+    const MetaValue* swa = f.get("dflash.attention.sliding_window_pattern");
+    for (uint64_t l = 0, layers = u("block_count"); l < layers; ++l) {
+        const bool w = swa && swa->type == MetaType::ARRAY && l < swa->items.size() && swa->items[(size_t) l].u != 0;
+        const uint64_t cap = w ? win + 64 : (uint64_t) opt_.max_context + 64;
+        b += 2 * cap * kv * sizeof(uint16_t) + (w ? cap * sizeof(long long) : 0);
+    }
+    // assign_scratch()'s ds_ buffers: floats, then the q8_1 rows and the screen's scratch in bytes
+    const uint64_t floats = 7 * n * E + 2 * std::max(n, B) * kv + 3 * B * E + 2 * B * hq + 2 * B * ff + B * V + 2 * V +
+                            ds_attend_floats(n_kv_) + 3 * B * R + 10 * R + E + B * rows;
+    b += floats * sizeof(float) + 2 * B * kernels::native_q8_1_bytes(n_embd_) +
+         kernels::native_q8_1_bytes((int) R) + ds_screen_scratch_bytes(n_unpadded_);
+    return b;
+}
+
+// The drafter weighed for strata-poly's default (main.cpp).  A window of guesses is checked in one call, and that
+// call is cheap only for the experts in VRAM: one on the CPU computes every token of the window apart, so with many
+// experts outside VRAM the checks cost more than the right guesses save, and the drafter's VRAM itself pushes more
+// of them out.  So the drafter loads when, with its VRAM taken from what the expert cache holds between prompts, at
+// least kDsShare of the model's routed experts stay on the card.  Between prompts the cache also has the buffers
+// only a prompt uses (lend_prompt()); with the drafter the prompt batch's scratch is not among them (one layout,
+// scores_apart()), so the drafter costs that scratch too, less the few tokens' layout and the scores it then does
+// without.  Measured with the Q8_0 drafter, the experts in VRAM after a prompt with it and its decode tok/s against
+// none, the mean over chat, code and prose texts of 302, 2,048 and 8,192 tokens:
+//   RTX 2070 Super 8 GB, IQ4_NL: 744 of 3072 (24%), 7% slower; prompts of 2K and 8K tokens 30-53% slower
+//   RTX 2070 8 GB, UD-Q2_K_XL: 1752 of 3072 (57%), 1% slower (chat and code 2-10% slower); prompts 20% slower
+//   RX 9070 XT 16 GB, IQ4_NL: 2181 of 3072 (71%), 15% faster (chat 2% slower); prompts 3% slower
+//   RX 9070 XT 16 GB, UD-Q2_K_XL: 3072 of 3072 (100%), 21% faster; prompts the same
+// kDsShare, two thirds, sits between 57% and 71%.
+DraftFit Inkling2::draft_fit(const std::string& file) const {
+    DraftFit r;
+    r.total = total_experts();
+#if defined(STRATA_GPU_METAL)
+    (void) file;
+    r.experts = r.with = cached_experts();
+    r.why = "not measured on Metal";
+#else
+    // between prompts: with what lend_prompt() gives the cache, at the experts' mean size
+    const double slot = cached_ > 0 ? (double) exp_at_ / cached_ : 0.0;
+    const size_t lent = prompt_lends_ && !freeze_experts_ && !all_cached() ? prompt_bytes_ + work_bytes_ : 0;
+    r.experts = r.with = std::min(r.total, cached_ + (slot > 0 ? (int) (lent / slot) : 0));
+    if (opt_.batch > 0) {
+        r.why = "--batch runs several sequences, the drafter one";
+        return r;
+    }
+    if (split_ || next_) {
+        r.why = "it runs on one card (no --layer-split)";
+        return r;
+    }
+    std::unique_ptr<Shards> f;
+    try {
+        f = std::make_unique<Shards>(file);
+    } catch (const std::exception& e) {
+        r.why = e.what();
+        return r;
+    }
+    const auto num = [&](const char* k) -> int64_t {
+        const MetaValue* v = f->get(std::string("dflash.") + k);
+        return v && v->is_num() ? (int64_t) v->u : -1;
+    };
+    const MetaValue* arch = f->get("general.architecture");
+    if (!arch || arch->s != "dflash" || num("embedding_length") != n_embd_ || num("vocab_size") != n_vocab_ ||
+        num("dspark.markov_rank") <= 0 || num("block_size") <= 0) {
+        r.why = "not a DSpark drafter of this model";
+        return r;
+    }
+    const size_t own = ds_bytes(*f);
+    r.mib = (int64_t) ((own + (size_t(1) << 20) - 1) >> 20);
+    // what else the engine with it keeps: the prompt batch's scratch for good, less the few tokens' layout (the
+    // scores are apart from both layouts here and inside its one scratch there); a window of its block, with a
+    // state copy and a row of logits for each guess (Engine::alloc()); a larger reserve where its file makes the RAM
+    // tight
+    size_t keeps = 0;
+    if (two_scratch_ && lent > 0)
+        keeps = batch_floats_ > few_floats_ ? (batch_floats_ - few_floats_) * sizeof(float) : 0;
+    const int B = opt_.window <= 1 ? (int) num("block_size") : std::min(opt_.window, (int) num("block_size")),
+              places = snaps_spread() ? std::min(B - 1, kSnapPlaces) : B - 1;
+    if (B > opt_.window) keeps += (size_t) (B - opt_.window) * n_vocab_ * sizeof(float);
+    if (places > snap_places_) keeps += (size_t) (places - snap_places_) * rec_n_ * sizeof(float);
+    const int reserve = reserve_with_mib(f->bytes());
+    // VRAM the cache left free beyond the reserve (every expert in VRAM), which the drafter takes first
+    const int64_t spare = std::max<int64_t>(0, vram_free_mib() - reserve_mib_),
+                  more = std::max<int64_t>(0, (int64_t) ((own + keeps) >> 20) + (reserve - reserve_mib_) - spare);
+    r.with = slot > 0 ? std::max(0, r.experts - (int) std::ceil((double) more * (1 << 20) / slot)) : 0;
+    const double share = r.total > 0 ? (double) r.with / r.total : 0.0;
+    r.on = share >= kDsShare;
+    char line[200];
+    std::snprintf(line, sizeof(line), "with it about %d of %d routed experts stay in VRAM between prompts (%.0f%%, %s "
+                  "%.0f%%; %d without it)", r.with, r.total, 100.0 * share, r.on ? "at least" : "under",
+                  100.0 * kDsShare, r.experts);
+    r.why = line;
+#endif
+    return r;
+}
+
 // The drafter's weights and caches to VRAM, once (before the expert cache takes the rest).
 void Inkling2::ds_load() {
     const Shards& f = *ds_file_;
@@ -371,7 +525,7 @@ void Inkling2::ds_load() {
     const auto mat = [&](const std::string& name, uint64_t n_in, uint64_t n_out) {
         const TensorInfo* t = f.find(name);
         const uint32_t type = t ? t->type : 0;
-        find(name, type == kTypeBF16 ? kTypeBF16 : 8u, n_in, n_out);   // BF16 or Q8_0
+        find(name, ds_mat_type(type) ? type : 8u, n_in, n_out);
         return Dev{to_dev(t), type, (int) n_in, (int) n_out};
     };
     const uint64_t E = (uint64_t) n_embd_, hq = (uint64_t) n_head_ * head_dim_, kv = (uint64_t) n_kv_ * head_dim_,
