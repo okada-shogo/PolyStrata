@@ -20,6 +20,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -557,6 +558,68 @@ class ServiceWithTheModelTemplate(unittest.TestCase):
                                      force=force)
         text = self.tok.decode(ids)
         self.assertTrue(text.endswith(f"<|message_user|><|content_text|>q{END}" + force), text[-120:])
+
+    def test_keep_start_captures_tools_and_system_before_thinking_effort(self):
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "strata-inkling.json"
+            cfg.write_text("{}", encoding="utf-8")
+            self.svc.config_path = str(cfg)
+            long_sys = "Static system prompt instruction block. " * 90
+            msgs = [{"role": "system", "content": long_sys}, {"role": "user", "content": "Hello"}]
+            ids = self.svc.encode_prompt(msgs, self.TOOLS, {})
+            with mock.patch.object(server, "WARM_MIN_TOKENS", 64):
+                self.svc.keep_start(ids)
+            kept_txt = self.tok.decode(self.svc.warm_ids)
+            self.assertIn("tool_declare", kept_txt)
+            self.assertIn(long_sys, kept_txt)
+            self.assertNotIn("Thinking effort level:", kept_txt)
+            self.assertNotIn("<|message_user|>", kept_txt)
+
+    def test_strata_pin_prefix_with_and_without_anchor(self):
+        static_sys = "You are Meta agent. Follow every rule carefully."
+        anchor = "\n<!-- LINGER_STATIC_PREFIX_END -->\n"
+        dynamic_tail = "Session date: 2026-11-25."
+        # Case A: anchor present in system prompt -> truncates right before anchor, keeps tool_declare + static_sys
+        req_anchored = {
+            "messages": [{"role": "system", "content": static_sys + anchor + dynamic_tail},
+                         {"role": "user", "content": "ping"}],
+            "tools": [{"type": "function", "function": self.TOOLS[0]}],
+            "strata_pin": {"name": "meta", "prefill_only": True, "anchor": anchor},
+        }
+        ids_a, _, max_a = self.svc.prepare(*openai_to_messages(req_anchored)[:3], 0, req=req_anchored)
+        self.assertEqual(max_a, 0)
+        pin_a = self.tok.decode(req_anchored["_strata_pin_resolved"]["prefix_ids"])
+        self.assertIn("tool_declare", pin_a)
+        self.assertIn(static_sys, pin_a)
+        self.assertNotIn("LINGER_STATIC_PREFIX_END", pin_a)
+        self.assertNotIn(dynamic_tail, pin_a)
+        self.assertNotIn("Thinking effort level:", pin_a)
+        self.assertNotIn("<|message_user|>", pin_a)
+
+        # Normal follow-up turn without anchor shares exact prefix even across different efforts
+        for eff in ("low", "high", "none"):
+            follow = {"messages": [{"role": "system", "content": static_sys + dynamic_tail},
+                                   {"role": "user", "content": "Real query"}],
+                      "tools": [{"type": "function", "function": self.TOOLS[0]}],
+                      "reasoning_effort": eff}
+            f_ids = self.svc.encode_prompt(*openai_to_messages(follow))
+            self.assertEqual(f_ids[:len(req_anchored["_strata_pin_resolved"]["prefix_ids"])],
+                             req_anchored["_strata_pin_resolved"]["prefix_ids"])
+
+        # Case B: anchor omitted -> renders tools + full system turn before Thinking effort level & user turn
+        req_auto = {
+            "messages": [{"role": "system", "content": static_sys}, {"role": "user", "content": "warmup"}],
+            "tools": [{"type": "function", "function": self.TOOLS[0]}],
+            "max_tokens": 1,
+            "strata_pin": {"name": "meta", "prefill_only": True, "resident": "ram"},
+        }
+        self.svc.prepare(*openai_to_messages(req_auto)[:3], 1, req=req_auto)
+        pin_b = self.tok.decode(req_auto["_strata_pin_resolved"]["prefix_ids"])
+        self.assertIn("tool_declare", pin_b)
+        self.assertIn(static_sys, pin_b)
+        self.assertNotIn("Thinking effort level:", pin_b)
+        self.assertNotIn("<|message_user|>", pin_b)
 
 
 class Pictures(unittest.TestCase):

@@ -122,7 +122,7 @@ the copy to the experts outside VRAM, as before.
 
 On a laptop with an RTX 4070 Laptop (8 GB), a Core i7-14700HX and 32 GB of RAM, on Windows, UD-Q3_K_XL has 1,216 of
 its 3,072 experts on the card and the rest are computed on the CPU. On a card that does not hold every expert, setup
-gives Inkling 2 Mini three settings that read fewer bytes for each token: `--attn-requant q5_0` (the attention's
+gives Inkling 2 Mini three settings that read fewer bytes for each token: `--attn-requant q5_k` (the attention's
 matrices in 5 bits instead of 8), `--loop-bf16` (the loop controllers in BF16 instead of F32) and `--tail-skip 4`.
 A card that holds the whole model gets none of them. Expert swaps stay on: with `--expert-swaps 0` the experts the
 card holds stay the ones it loaded, fewer of a token's experts are found there, and the CPU computes more of them
@@ -150,16 +150,16 @@ is slower on an 8 GB card this way (see the table above).
 ### Setup's four settings, one at a time
 
 These settings make the answers worse to make them faster. Setup adds three of them by itself, without asking,
-whenever the card cannot hold every expert of the size: `--attn-requant q5_0`, `--loop-bf16` and `--tail-skip 4`.
+whenever the card cannot hold every expert of the size: `--attn-requant q5_k`, `--loop-bf16` and `--tail-skip 4`.
 It no longer adds `--expert-swaps 0` (measured below because setup used to); `--inkling-small-card off` (above) leaves the
-three out. `--attn-requant q5_0` stores the attention's matrices in fewer bits and `--loop-bf16` the loop
+three out. `--attn-requant q5_k` stores the attention's matrices in fewer bits and `--loop-bf16` the loop
 controllers: lossy rounding. `--tail-skip 4` does not compute some of a token's experts at all: on the 8 GB cards
 below, with the other three settings, 9% to 27% of a token's expert picks. The answers differ measurably from the model's without them
 (the same most likely token at 94.3-95.0% of the steps with all four, against 98.2-99.0% for a second run without
 them), and with `--tail-skip` the engine's "experts from VRAM" figure counts the skipped experts as found in VRAM, so
 it reads high.
 
-To turn them off, delete `"--attn-requant", "q5_0", "--loop-bf16", "--tail-skip", "4"` from
+To turn them off, delete `"--attn-requant", "q5_k", "--loop-bf16", "--tail-skip", "4"` from
 the `"args"` list of the model's run config, `strata-inkling-<size>.json` in the install's `terminal` folder (for
 example `strata-inkling-ud-q3_k_xl.json`), and restart the server. To keep the rounding but compute every expert,
 change the `4` after `--tail-skip` to `0`, or add `"env": {"STRATA_ROUTE_TAIL_SKIP": "0"}` to the config. Running
@@ -172,7 +172,7 @@ the group ranks it fifth or lower.
 
 | Setting | What it does | Kind |
 | --- | --- | --- |
-| `--attn-requant q5_0` | the attention's matrices in 5 bits instead of 8: fewer bytes a token, and more VRAM for experts | rounding |
+| `--attn-requant q5_k` | the attention's matrices in 5 bits (Q5_K) instead of 8: fewer bytes a token, and more VRAM for experts | rounding |
 | `--loop-bf16` | the loop controllers in BF16 instead of F32 | rounding |
 | `--expert-swaps 0` | no expert moves into VRAM while an answer is written (default 128 on their way at a time for Inkling 2, 64 on Metal) | rounding: the same experts, but more of them on the CPU, which rounds a little differently |
 | `--tail-skip 4` | a token's experts ranked 5th to 8th that are not on the card are left out | **skips computation** |
@@ -271,13 +271,19 @@ from 1.76 to 1.57 ms; with the IQ4_NL file, a 131K context and the experts held 
 about 1e-6 a token at prompts of 40K to 131K. Off by default: it changes the arithmetic.
 
 On a Mac it runs on strata-poly's Metal engine, as a beta. Measured on an Apple M5 Ultra with 256 GB of unified memory,
-UD-Q3_K_XL, the README's benchmark on setup's settings with a 40,960-token context: 256 tokens written, the most likely
-one each time. Other programs were using the GPU at the same time. Two runs of the same prompts given to the engine
-alone wrote 73-74 and 60-61 tokens/s and read 2,411 tokens/s.
+UD-Q3_K_XL (`--metal-optimize --metal-memory balanced`, greedy, the median of three rounds run in turn): a 23-token
+chat prompt, a 3,845-token editing prompt (256 tokens written) and prompts of 8,192 to 65,536 tokens (64 tokens
+written), with setup's default DSpark drafter (`dspark-Inkling-2-Mini-Q8_0.gguf`, which writes the same greedy tokens)
+and without it (`--no-draft` at setup):
 
-| UD-Q3_K_XL | Writes in a short chat | Reads a 32,787-token prompt | Writes after it |
+| Prompt | Reads the prompt | Writes (default, with DSpark) | Writes without DSpark |
 | --- | ---: | ---: | ---: |
-| M5 Ultra | 74 tokens/s | 2,440 tokens/s | 61 tokens/s |
+| **23 tokens** (short chat) | — | 104.7 tokens/s | 85.4 tokens/s |
+| **3,845 tokens** (editing) | 2,451 tokens/s | 178.3 tokens/s | 81.8 tokens/s |
+| **8,192 tokens** | 2,631 tokens/s | 116.2 tokens/s | 76.2 tokens/s |
+| **16,384 tokens** | 2,611 tokens/s | 112.7 tokens/s | 77.1 tokens/s |
+| **32,768 tokens** | 2,442 tokens/s | 107.3 tokens/s | 73.1 tokens/s |
+| **65,536 tokens** | 2,118 tokens/s | 87.5 tokens/s | 67.7 tokens/s |
 
 Given the 128 tokens the CUDA engine wrote after a 4,526-token prompt (UD-Q3_K_XL), it picks the same most likely token
 at 126 of the 128 steps. UD-Q2_K_XL has run there too (73 tokens/s in the short chat). UD-Q4_K_XL has not been measured
@@ -290,7 +296,7 @@ rows took 3.4 s.
 | --- | --- |
 | **Graphics card** | One **NVIDIA** card with **8 GB of VRAM or more**. It has run on an RTX 5090 (32 GB) and on an RTX 4070 Laptop (8 GB). About 3.7 GB are taken before any expert at a 32K context. Or an **AMD RDNA3 / RDNA4 card** (RX 7000 / 9000; see the AMD notes below), or an **Apple Silicon Mac** (beta): it has run on an M5 Ultra. |
 | **RAM** | About **21, 17 or 13 GB** beside an 8 GB card for UD-Q4_K_XL, UD-Q3_K_XL and UD-Q2_K_XL, the installer's estimate. A 32 GB card holds any of them whole. On a Mac, setup takes UD-Q3_K_XL from 32 GB of unified memory and UD-Q2_K_XL below that. |
-| **Disk** | 9.1 to 17.6 GB for the model file. |
+| **Disk** | 9.5 to 18.0 GB (the model file and its 0.4 GB DSpark drafter). |
 | **System** | Linux or Windows 10 / 11, and a current NVIDIA driver (ROCm for an AMD card); or macOS 15 or newer. |
 
 **AMD (HIP):** the engine builds for RDNA3 and RDNA4 (gfx1100, gfx1200, gfx1201). It has run on an RX 9070 XT (gfx1201) on
@@ -324,7 +330,9 @@ DSpark drafter (`dspark-*.gguf`) loads by default on an NVIDIA or AMD card when 
 two thirds of the routed experts stay in VRAM with it; the engine prints one line saying whether it loaded and why. With
 fewer experts in VRAM it is slower (an 8 GB card: 7% slower with IQ4_NL), so it stays off there; on an RX 9070 XT it
 writes 15% faster with IQ4_NL and 21% faster with UD-Q2_K_XL. `--draft-model FILE` loads one anyway, and
-`--draft-model none` or `--no-draft` leaves it out. Several requests at once (`"parallel"`, see [BATCHING.md](../BATCHING.md))
+`--draft-model none` or `--no-draft` leaves it out. Setup downloads the drafter (`dspark-Inkling-2-Mini-Q8_0.gguf`,
+0.4 GB) and writes `--draft-model` on a Mac or an NVIDIA card that holds all of the model's experts (`--no-draft` or
+`--mtp off` at setup leaves it off, `--mtp on` opts in on a card that holds only part of them). Several requests at once (`"parallel"`, see [BATCHING.md](../BATCHING.md))
 are opt-in on an NVIDIA card (up to 16 slots), not with the draft file, not with `--layer-split` and not on AMD. With
 `--tail-skip` (setup's small-card flags) a chat's answer can then depend on the other chats writing at the same time.
 On a Mac the engine takes one request at a time for this model, and the installer writes `"parallel": 1` there. Its
@@ -342,11 +350,12 @@ Add `--model UD-Q3_K_XL` or `--model UD-Q2_K_XL` for a smaller size.
 
 | Size | What it is | Download | RAM beside an 8 GB card |
 | --- | --- | ---: | ---: |
-| **UD-Q4_K_XL** | 4-bit experts, 8-bit where they write ([Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 17.6 GB | about 21 GB |
-| **UD-Q3_K_XL** | 3- and 4-bit experts mixed | 13.6 GB | about 17 GB |
-| **UD-Q2_K_XL** | 1- to 2-bit experts: the smallest | 9.1 GB | about 13 GB |
+| **UD-Q4_K_XL** | 4-bit experts, 8-bit where they write ([Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 18.0 GB | about 21 GB |
+| **UD-Q3_K_XL** | 3- and 4-bit experts mixed | 14.0 GB | about 17 GB |
+| **UD-Q2_K_XL** | 1- to 2-bit experts: the smallest | 9.5 GB | about 13 GB |
 
-The installer downloads the files under the repository's `Mainline_Support` folder, the layout llama.cpp runs
+Each download includes the 0.4 GB DSpark draft model (`dspark-Inkling-2-Mini-Q8_0.gguf`), fetched from the top of the
+repository. The installer downloads the main files under the repository's `Mainline_Support` folder, the layout llama.cpp runs
 (`inkling2_loop`). The files at the top of the repository (architecture `inkling2`, for example UD-IQ3_XXS) are
 Unsloth's layout of the same weights: the engine reads them too. Setup takes them with `--gguf-dir` or
 `--custom-gguf`; the engine run by hand takes the file as its `--model`.

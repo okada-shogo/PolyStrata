@@ -434,6 +434,7 @@ struct Session {
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
     int piece_calls = kPiece;             // generate()'s pieces when it is given `between`
     std::string pinned;                   // --pinned-session: the file serve() pins before its first request
+    std::string pin_dir;                  // --pin-dir: folder of persisted <name>.bin named prefix pins
     std::vector<Engine::CoRead> co_read;  // BCO: prompts for generate()'s first read() to take along
     bool co_done = false;                 // and that read took them
     std::function<void()> after_request;  // STRATA_PROFILE=1: the profile written after each request
@@ -470,7 +471,8 @@ struct Session {
     template<class OnToken, class OnProgress>
     Result generate(const std::vector<int32_t>& ids, const Pictures& pictures, int32_t pad, int64_t turn_at,
                     int64_t max_new, const Sampling& s, const std::atomic<bool>& stop, OnToken on_token,
-                    OnProgress on_progress, const std::function<bool(int64_t)>* between = nullptr) {
+                    OnProgress on_progress, const std::function<bool(int64_t)>* between = nullptr,
+                    bool prefill_only = false) {
         Result r;
         const int64_t n = (int64_t) ids.size();
         engine.prof_phase(strata::poly::prof::kPrompt, true);
@@ -553,7 +555,7 @@ struct Session {
                     co_read.clear();
                 }
                 if (last) engine.end_read();   // the last token, as the answer's, with the whole expert cache
-                engine.eval(ids.data() + i, (int) m, last);
+                engine.eval(ids.data() + i, (int) m, last && !prefill_only);
             }
             kept.read(ids.data() + i, m);
             i += m;
@@ -572,6 +574,10 @@ struct Session {
         kept.prompt_was(n);
         r.prompt_ms = ms_since(t0);
         if (std::strcmp(r.finish, "cancel") == 0) return r;
+        if (prefill_only) {
+            r.finish = "stop";
+            return r;
+        }
 
         engine.prof_phase(strata::poly::prof::kDecode, false);
         t0 = Clock::now();
@@ -612,13 +618,14 @@ struct Session {
                 const bool room = engine.pos() + most <= engine.max_context();
                 const int offered = look && room ? repeats.propose(most - 1, w + 1) : 0;
                 const int match = repeats.last_match();
+                const int repeat_widest = match >= kCopyMatch ? most : std::min(most, kBlockWindow);
                 const int widest = match >= kCopyMatch ? most : std::min(most, block_window);   // this round's window
-                const int k = std::min(offered, widest - 1);
+                const int k = std::min(offered, repeat_widest - 1);
                 // A repeat that fills the window, from a match of a length that has been right nine times in ten,
                 // is taken as it is: the block would mostly say the same, and asking it takes time.  Otherwise the
                 // block guesses, each guess from the one before, while a guess more pays (Guesses).
                 const bool blocks = engine.drafts() && room && !(k == widest - 1 && policy.lookup_rate(match) >= 0.9);
-                const bool ask = guesses.begin(blocks, policy);
+                const bool ask = guesses.begin(blocks, policy, engine.guesses_at_once());
                 // the round's time, as the policy counts it: a window of `in` tokens wrote n of them
                 const auto count = [&](int in, int n) {
                     return guesses.end(in, n, ms_since(round), engine.took_record());
@@ -644,13 +651,15 @@ struct Session {
                 }
                 w[0] = t;
                 if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
+                if (card_picks) engine.eval_picks();
                 engine.window(w, use.t);
                 // logits_of(i) is what follows w[i].  A guess that is what was picked has been through the model
                 // already; the token an answer ends with is shown and never fed, as without guesses.
                 int right = 0;
                 bool more = true;
-                t = pick(engine.logits_of(0));
-                while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
+                t = card_picks ? engine.picked(0) : pick(engine.logits_of(0));
+                while (right < use.t - 1 && t == w[right + 1] && (more = show(t)))
+                    t = card_picks ? engine.picked(++right) : pick(engine.logits_of(++right));
                 engine.keep(right + 1);
                 kept.read(w, right + 1);
                 r.guessed += use.t - 1;
@@ -668,11 +677,11 @@ struct Session {
 // the key image_pad, the token whose runs in the ids are the pictures' places.  turn_at is the place in the ids
 // where the prompt's last turn begins (the server knows the template's turn tokens): a checkpoint goes there.
 bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t& pad, int64_t& turn_at,
-               std::string& pictures, std::vector<int32_t>& ids) {
+               std::string& pictures, std::vector<int32_t>& ids, bool& prefill_only) {
     const bool geni = line.rfind("GENI ", 0) == 0;
+    prefill_only = false;
     char* p = nullptr;
     max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &p, 10);
-    if (max_new < 1) return false;
     pad = -1;
     turn_at = -1;
     for (;;) {   // key=value tokens, then the file and the ids
@@ -698,8 +707,10 @@ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t
         else if (key == "seed") s.seed = std::strtoull(v, nullptr, 10);
         else if (key == "image_pad") pad = (int32_t) std::atoi(v);
         else if (key == "turn_at") turn_at = std::strtoll(v, nullptr, 10);
+        else if (key == "prefill") prefill_only = std::atoi(v) != 0;
         // other keys belong to the other engine and are skipped
     }
+    if (prefill_only ? (max_new != 0 || geni) : max_new < 1) return false;
     pictures.clear();
     if (geni) {
         const char* end = std::strchr(p, ' ');
@@ -761,20 +772,27 @@ std::string session_starts(uint64_t total, uint64_t binds, Get&& get) {
     return {};
 }
 
-// --pinned-session FILE before the first request, and PIN <path> between requests: the file's conversation becomes
-// the pinned one (Conversations::pin()), a system prompt that was read once and saved, in place of one pinned
-// before.  Returns what is wrong with the file, or nothing; then nothing is pinned.  `io`: it could not be read.
-std::string pin_session(Session& ss, const std::string& name, bool& io) {
+bool is_valid_pin_name(const std::string& name) {
+    if (name.empty() || name.size() > 64 || name == "." || name == "..") return false;
+    return std::all_of(name.begin(), name.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '-' || c == '_' || c == '.';
+    });
+}
+
+// --pinned-session FILE before the first request, PIN <path>, and named PIN_LOAD <name> <path> / --pin-dir:
+// pins a saved session beside the conversation cache.  Returns what is wrong with the file, or nothing.
+std::string pin_session_named(Session& ss, const std::string& slot_name, bool resident, const std::string& file_name,
+                              bool& io) {
     namespace fs = std::filesystem;
     using Restored = Conversations<Engine>::Restored;
     const Clock::time_point t0 = Clock::now();
     io = false;
     const auto no = [&](const std::string& why) {
-        ss.kept.unpin();
+        ss.kept.unpin_named(slot_name);
         return why;
     };
     std::error_code ec;
-    const fs::path path = session_path(name);
+    const fs::path path = session_path(file_name);
     const uint64_t total = fs::file_size(path, ec);
     io = true;
     if (ec) return no("the file cannot be read: " + ec.message());
@@ -789,16 +807,119 @@ std::string pin_session(Session& ss, const std::string& name, bool& io) {
         return true;
     };
     if (const std::string why = session_starts(total, session_binds(ss.engine), get); !why.empty()) return no(why);
-    const Restored r = ss.kept.pin(total - kSessionFrame, ss.engine.max_context(), kSessionPiece, get);
+    const Restored r =
+        ss.kept.pin_named(slot_name, resident, total - kSessionFrame, ss.engine.max_context(), kSessionPiece, get);
     if (r == Restored::other) return no("the file is not a whole session of this model within --max-context");
     if (r == Restored::memory) return no("no memory for it");
     uint64_t want = 0;
     if (r == Restored::ok) in.read((char*) &want, 8);
     if (r != Restored::ok || in.gcount() != 8 || want != hash.digest()) return no("the file is damaged");
-    std::fprintf(stderr, "strata-poly: pinned session: %lld tokens, %zu MiB of rows and states beside the conversation "
-                         "cache, read in %.0f ms; a prompt that starts with them goes on from there\n",
-                 (long long) ss.kept.pinned_tokens(), ss.kept.pinned_bytes() >> 20, ms_since(t0));
+    const long long tok = ss.kept.pinned_tokens(slot_name);
+    const size_t bytes = ss.kept.pinned_bytes(slot_name);
+    std::fprintf(stderr, "strata-poly: pinned session%s%s: %lld tokens, %zu MiB (%s) beside the conversation cache, "
+                         "read in %.0f ms; a prompt that starts with them goes on from there\n",
+                 slot_name.empty() ? "" : " ", slot_name.c_str(), tok, bytes >> 20,
+                 resident ? "ram" : "spill", ms_since(t0));
     return {};
+}
+
+std::string pin_session(Session& ss, const std::string& name, bool& io) {
+    return pin_session_named(ss, "", true, name, io);
+}
+
+bool save_pin_file(Session& ss, const std::filesystem::path& path,
+                   strata::core::SessionError& kind, std::string& why) {
+    namespace fs = std::filesystem;
+    using strata::core::SessionError;
+    const uint64_t body = ss.kept.save_bytes();
+    if (body == 0 || ss.engine.pos() != (int64_t) ss.kept.seq().size()) {
+        kind = SessionError::invalid;
+        why = "pinned slot has no active conversation to save";
+        return false;
+    }
+    const uint64_t total = kSessionFrame + body;
+    std::error_code ec;
+    const fs::path dir = path.has_parent_path() ? path.parent_path() : fs::path(".");
+    fs::create_directories(dir, ec);
+    const fs::space_info room = fs::space(dir, ec);
+    if (ec) {
+        kind = SessionError::io;
+        why = "the folder of the file: " + ec.message();
+        return false;
+    }
+    if (room.available < total + (kSessionFreeMib << 20)) {
+        kind = SessionError::storage;
+        why = "the file takes " + std::to_string(total >> 20) + " MiB and has to leave " +
+              std::to_string(kSessionFreeMib) + " MiB free; the disk has " +
+              std::to_string(room.available >> 20) + " MiB";
+        return false;
+    }
+    const uint64_t binds = session_binds(ss.engine);
+    strata::core::SessionHasher hash;
+    fs::path part = path;
+    part += ".part";
+    std::ofstream out(part, std::ios::binary | std::ios::trunc);
+    fs::permissions(part, fs::perms::owner_read | fs::perms::owner_write, ec);
+    const auto put = [&](const void* p, size_t n) {
+        out.write((const char*) p, (std::streamsize) n);
+        hash.update(p, n);
+        return out.good();
+    };
+    bool ok = out.is_open() && put(kSessionMagic, sizeof kSessionMagic) && put(&binds, 8), no_memory = false;
+    try {
+        if (ok && !ss.kept.save(kSessionPiece, put)) ok = false, no_memory = out.good();
+    } catch (const std::exception& e) {
+        ok = false;
+        why = e.what();
+    }
+    const uint64_t h = hash.digest();
+    if (ok) out.write((const char*) &h, 8);
+    out.close();
+    ok = ok && !out.fail();
+    if (ok) {
+        fs::rename(part, path, ec);
+        if (ec) ok = false, why = ec.message();
+    }
+    if (!ok) {
+        fs::remove(part, ec);
+        if (no_memory) {
+            kind = SessionError::memory;
+            why = "no memory to move the pinned rows";
+        } else {
+            const fs::space_info left = fs::space(dir, ec);
+            kind = !ec && left.available < total ? SessionError::storage : SessionError::io;
+            if (why.empty()) why = "the file cannot be written";
+        }
+        return false;
+    }
+    return true;
+}
+
+void load_pin_dir(Session& ss) {
+    namespace fs = std::filesystem;
+    if (ss.pin_dir.empty()) return;
+    std::error_code ec;
+    const fs::path dir = session_path(ss.pin_dir);
+    if (!fs::is_directory(dir, ec)) return;
+    std::vector<fs::path> bins;
+    for (const fs::directory_entry& ent : fs::directory_iterator(dir, ec)) {
+        if (!ent.is_regular_file(ec)) continue;
+        const fs::path& p = ent.path();
+        if (p.extension() == ".bin") bins.push_back(p);
+    }
+    std::sort(bins.begin(), bins.end());
+    for (const fs::path& p : bins) {
+        const auto u8stem = p.stem().u8string();
+        const std::string name(reinterpret_cast<const char*>(u8stem.data()), u8stem.size());
+        if (!is_valid_pin_name(name)) {
+            std::fprintf(stderr, "strata-poly: --pin-dir skipping %s: invalid pin name\n", p.string().c_str());
+            continue;
+        }
+        bool io = false;
+        if (const std::string why = pin_session_named(ss, name, true, p.string(), io); !why.empty()) {
+            std::fprintf(stderr, "strata-poly: --pin-dir %s: %s; skipped\n", p.string().c_str(), why.c_str());
+        }
+    }
 }
 
 // SAVE <path> | RESTORE <path> between requests, answered as the Strata project's engine answers them
@@ -954,14 +1075,15 @@ int serve(Session& ss) {
             std::fprintf(stderr, "strata-poly: --pinned-session %s: %s; the engine starts without it\n",
                          ss.pinned.c_str(), why.c_str());
     }
+    if (!ss.pin_dir.empty()) load_pin_dir(ss);
     engine.trim();
     std::printf("INFO context=%d expert_slots=%d expert_cache_mib=%lld pool_workers=%d conversation_cache_mib=%lld "
                 "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_free_mib=%lld vram_elastic=1 "
-                "batch_slots=%d co_read=%d sessions=1 pinned_tokens=%lld engine=" STRATA_VERSION "\n",
+                "batch_slots=%d co_read=%d sessions=1 pinned_tokens=%lld pinned_slots=%zu engine=" STRATA_VERSION "\n",
                 engine.max_context(), engine.cached_experts(), (long long) (engine.cached_gib() * 1024.0),
                 engine.threads(), (long long) ss.flags.o.park_mib, ss.flags.o.park_slots, ss.flags.min_free_mib,
                 (long long) engine.vram_free_mib(), (int) slots.size(), !slots.empty() && engine.co_reads() ? 1 : 0,
-                (long long) ss.kept.pinned_tokens());
+                (long long) ss.kept.pinned_tokens(), ss.kept.pinned_count());
     std::printf("READY %d stop\n", engine.max_context());
     std::fflush(stdout);
     // READY goes to the server alone: without this line the log of an engine that waits for its first request ends
@@ -1320,7 +1442,7 @@ int serve(Session& ss) {
             const std::string why = slots.empty() ? pin_session(ss, line.substr(4), io)
                                                   : "session files do not support --batch (parallel requests)";
             if (why.empty()) {
-                std::printf("PINNED %lld %zu %.1f\n", (long long) ss.kept.pinned_tokens(), ss.kept.pinned_bytes(),
+                std::printf("PINNED %lld %zu %.1f\n", (long long) ss.kept.pinned_tokens(""), ss.kept.pinned_bytes(""),
                             ms_since(t0));
             } else {
                 std::fprintf(stderr, "strata-poly: session pin %s: %s\n", line.c_str() + 4, why.c_str());
@@ -1329,13 +1451,173 @@ int serve(Session& ss) {
             std::fflush(stdout);
             continue;
         }
+        // PIN_CUR <name> [resident=ram|spill] [save=0|1] [path=<file>]: capture the current KV prefix into a named
+        // host-RAM slot, optionally persisting <pin-dir>/<name>.bin (or <file>).
+        if (line.rfind("PIN_CUR ", 0) == 0) {
+            const Clock::time_point t0 = Clock::now();
+            const auto refuse = [&](strata::core::SessionError kind, const std::string& why) {
+                std::fprintf(stderr, "strata-poly: pin_cur: %s\n", why.c_str());
+                std::printf("SERR %s 0 %s\n", strata::core::session_error_name(kind), why.c_str());
+                std::fflush(stdout);
+            };
+            if (!slots.empty()) {
+                refuse(strata::core::SessionError::invalid, "session files do not support --batch (parallel requests)");
+                continue;
+            }
+            std::string rest = line.substr(8);
+            size_t p = 0;
+            while (p < rest.size() && rest[p] == ' ') ++p;
+            size_t sp = rest.find(' ', p);
+            const std::string slot_name = sp == std::string::npos ? rest.substr(p) : rest.substr(p, sp - p);
+            if (!is_valid_pin_name(slot_name)) {
+                refuse(strata::core::SessionError::invalid, "invalid pin name");
+                continue;
+            }
+            bool resident = true;
+            int save_mode = -1;
+            std::string save_path;
+            bool bad_opt = false;
+            for (size_t cur_pos = sp == std::string::npos ? rest.size() : sp + 1; cur_pos < rest.size();) {
+                while (cur_pos < rest.size() && rest[cur_pos] == ' ') ++cur_pos;
+                if (cur_pos >= rest.size()) break;
+                if (rest.rfind("path=", cur_pos) == cur_pos) {
+                    save_path = rest.substr(cur_pos + 5);
+                    if (save_path.empty()) bad_opt = true;
+                    break;
+                }
+                const size_t nxt = rest.find(' ', cur_pos);
+                const std::string opt = nxt == std::string::npos ? rest.substr(cur_pos) : rest.substr(cur_pos, nxt - cur_pos);
+                if (opt == "resident=ram") resident = true;
+                else if (opt == "resident=spill") resident = false;
+                else if (opt == "save=1") save_mode = 1;
+                else if (opt == "save=0") save_mode = 0;
+                else {
+                    bad_opt = true;
+                    break;
+                }
+                cur_pos = nxt == std::string::npos ? rest.size() : nxt + 1;
+            }
+            if (bad_opt) {
+                refuse(strata::core::SessionError::invalid, "invalid PIN_CUR option");
+                continue;
+            }
+            if ((long long) ss.kept.seq().size() != engine.pos() || ss.kept.seq().empty()) {
+                refuse(strata::core::SessionError::invalid, "no active conversation to pin");
+                continue;
+            }
+            const auto r = ss.kept.pin_current(slot_name, resident);
+            if (r == Conversations<Engine>::Restored::memory) {
+                refuse(strata::core::SessionError::memory, "no memory for pinned prefix");
+                continue;
+            }
+            if (r != Conversations<Engine>::Restored::ok) {
+                refuse(strata::core::SessionError::invalid, "no active conversation to pin");
+                continue;
+            }
+            std::filesystem::path disk_path;
+            if (!save_path.empty()) disk_path = session_path(save_path);
+            else if (save_mode != 0 && !ss.pin_dir.empty()) disk_path = session_path(ss.pin_dir) / (slot_name + ".bin");
+            if (!disk_path.empty()) {
+                strata::core::SessionError kind = strata::core::SessionError::io;
+                std::string why;
+                if (!save_pin_file(ss, disk_path, kind, why)) {
+                    refuse(kind, why);
+                    continue;
+                }
+            } else if (save_mode == 1) {
+                refuse(strata::core::SessionError::invalid, "save=1 needs --pin-dir or path=");
+                continue;
+            }
+            const long long tok = ss.kept.pinned_tokens(slot_name);
+            const size_t bytes = ss.kept.pinned_bytes(slot_name);
+            std::fprintf(stderr, "strata-poly: pinned slot '%s': %lld tokens, %zu MiB (%s) in %.1f ms\n",
+                         slot_name.c_str(), tok, bytes >> 20, resident ? "ram" : "spill", ms_since(t0));
+            std::printf("PINNED %lld %zu %.1f\n", tok, bytes, ms_since(t0));
+            std::fflush(stdout);
+            continue;
+        }
+        // PIN_LOAD <name> <path>: load a persisted session file into a named RAM slot.
+        if (line.rfind("PIN_LOAD ", 0) == 0) {
+            const Clock::time_point t0 = Clock::now();
+            if (!slots.empty()) {
+                std::printf("SERR invalid 0 session files do not support --batch (parallel requests)\n");
+                std::fflush(stdout);
+                continue;
+            }
+            const std::string rest = line.substr(9);
+            size_t p = 0;
+            while (p < rest.size() && rest[p] == ' ') ++p;
+            const size_t sp = rest.find(' ', p);
+            const std::string slot_name = sp == std::string::npos ? rest.substr(p) : rest.substr(p, sp - p);
+            std::string file_path = sp == std::string::npos ? std::string() : rest.substr(sp + 1);
+            size_t fp = 0;
+            while (fp < file_path.size() && file_path[fp] == ' ') ++fp;
+            file_path = file_path.substr(fp);
+            if (!is_valid_pin_name(slot_name) || file_path.empty()) {
+                std::printf("SERR invalid 0 expected: PIN_LOAD <name> <path>\n");
+                std::fflush(stdout);
+                continue;
+            }
+            bool io = false;
+            const std::string why = pin_session_named(ss, slot_name, true, file_path, io);
+            if (why.empty()) {
+                std::printf("PINNED %lld %zu %.1f\n", (long long) ss.kept.pinned_tokens(slot_name),
+                            ss.kept.pinned_bytes(slot_name), ms_since(t0));
+            } else {
+                std::fprintf(stderr, "strata-poly: PIN_LOAD %s: %s\n", slot_name.c_str(), why.c_str());
+                std::printf("SERR %s 0 %s\n", io ? "io" : "invalid", why.c_str());
+            }
+            std::fflush(stdout);
+            continue;
+        }
+        if (line == "UNPIN" || line.rfind("UNPIN ", 0) == 0) {
+            if (line == "UNPIN") {
+                ss.kept.unpin();
+            } else {
+                std::string name = line.substr(6);
+                bool unlink_disk = false;
+                const size_t sp = name.find(' ');
+                if (sp != std::string::npos) {
+                    const std::string opt = name.substr(sp + 1);
+                    name = name.substr(0, sp);
+                    unlink_disk = opt == "unlink=1";
+                }
+                if (is_valid_pin_name(name)) {
+                    ss.kept.unpin_named(name);
+                    if (unlink_disk && !ss.pin_dir.empty()) {
+                        std::error_code ec;
+                        std::filesystem::remove(session_path(ss.pin_dir) / (name + ".bin"), ec);
+                    }
+                }
+            }
+            std::printf("UNPINNED %lld %zu\n", (long long) ss.kept.pinned_tokens(), ss.kept.pinned_bytes());
+            std::fflush(stdout);
+            continue;
+        }
+        if (line == "PINS") {
+            const auto items = ss.kept.pinned_info();
+            for (const auto& item : items) {
+                std::printf("PIN_ITEM %s %lld %zu %s\n", item.name.empty() ? "-" : item.name.c_str(),
+                            (long long) item.tokens, item.bytes, item.resident ? "ram" : "spill");
+            }
+            std::printf("PINS %zu %lld %zu\n", items.size(), (long long) ss.kept.pinned_tokens(),
+                        ss.kept.pinned_bytes());
+            std::fflush(stdout);
+            continue;
+        }
         if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
             std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> image_pad=<id> <file> <id,id,...>\n");
             std::fflush(stdout);
             continue;
         }
-        if (!parse_gen(line, max_new, s, pad, turn_at, file, ids)) {
+        bool req_prefill_only = false;
+        if (!parse_gen(line, max_new, s, pad, turn_at, file, ids, req_prefill_only)) {
             std::printf("ERR bad request\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (req_prefill_only && !slots.empty()) {
+            std::printf("ERR prefill=1 does not support --batch\n");
             std::fflush(stdout);
             continue;
         }
@@ -1431,7 +1713,7 @@ int serve(Session& ss) {
                         }
                         std::fflush(stdout);
                     },
-                    slots.empty() ? nullptr : &between);
+                    slots.empty() ? nullptr : &between, req_prefill_only);
                 co_ok = ss.co_done;
                 ss.co_read.clear();
             }
@@ -2049,6 +2331,9 @@ void usage() {
                  "  --pinned-session FILE  --serve: a session file (SAVE) whose conversation stays for the whole run,\n"
                  "                         a system prompt read once: a prompt that starts with it goes on from\n"
                  "                         its end, whatever took the engine since; it is never pushed out\n"
+                 "  --pin-dir DIR          --serve: directory for named <name>.bin prefix pins persisted by PIN_CUR\n"
+                 "                         and auto-reloaded at startup\n"
+                 "  --pin-cache-mib N      RAM limit in MiB for named pinned prefixes (default 0 = unlimited)\n"
                  "  --batch N              N answers written together, each in a sequence of its own with its own\n"
                  "                         state and attention rows (default 0 = one at a time; at most 16);\n"
                  "                         --slots N is the same\n"
@@ -2085,10 +2370,10 @@ void usage() {
                  "                         little (default 0 = none is; setup gives Qwen3.6 6)\n"
                  "  --route-top N          a token's experts from place N+1 on are left out, in VRAM or not, where\n"
                  "                         the host routes (default 0 = none is)\n"
-                 "  --attn-requant TYPE    Inkling 2: its attention's matrices quantized again to TYPE (q5_0, q4_0\n"
-                 "                         or iq4_nl) at load: fewer bytes a token, and the answers move a little\n"
-                 "                         (default: the file's types; setup gives an 8 GB card q5_0); off or none\n"
-                 "                         says the default (the last --attn-requant counts)\n"
+                 "  --attn-requant TYPE    Inkling 2: its attention's matrices quantized again to TYPE (q5_k, q6_k,\n"
+                 "                         q5_0, q4_0 or iq4_nl) at load: fewer bytes a token, and the answers move\n"
+                 "                         a little (default: the file's types; setup gives an 8 GB card q5_k); off\n"
+                 "                         or none says the default (the last --attn-requant counts)\n"
                  "  --loop-bf16            Inkling 2: its loop controllers' matrices in BF16, not F32;\n"
                  "                         --no-loop-bf16 says the default (F32; the last one counts)\n"
                  "  --prompt-int8          Inkling 2 on an RTX 20 (Turing): its prompt products on the int8 tensor\n"
@@ -2182,7 +2467,7 @@ int main(int argc, char** argv) {
     long long max_new = 32;
     int top_probs = 0, lookup = 3, image_pad = -1, check = 0;
     bool stagger = false;   // --check-stagger
-    std::string images, pinned, bench_out, bench_text_name;
+    std::string images, pinned, pin_dir, bench_out, bench_text_name;
     bool bench_long = false;
     std::vector<int32_t> bench_text;
     std::vector<int32_t> ids, eos, follow;
@@ -2217,6 +2502,8 @@ int main(int argc, char** argv) {
         else if (a == "--vram-elastic-watch-ms") o.vram_watch_ms = std::max(0, std::atoi(val()));
         else if (a == "--expert-profile") o.profile = val();
         else if (a == "--pinned-session") pinned = val();
+        else if (a == "--pin-dir") pin_dir = val();
+        else if (a == "--pin-cache-mib") cache.o.pin_mib = std::atoll(val());
         else if (a == "--no-gpu-experts") o.gpu_experts = false;
         else if (a == "--any-node") o.stay_near = false;
         else if (a == "--lock-experts") o.lock_experts = true;
@@ -2247,7 +2534,7 @@ int main(int argc, char** argv) {
         else if (a == "--tail-skip") o.tail_skip = std::atoi(val());
         else if (a == "--route-top") o.route_top = std::atoi(val());
         else if (a == "--attn-requant") {
-            // off / none: the file's types, so a flag appended to a run config can undo setup's q5_0
+            // off / none: the file's types, so a flag appended to a run config can undo setup's q5_k
             std::string t = val(), low = t;
             for (char& c : low) c = (char) std::tolower((unsigned char) c);
             o.attn_requant = (low == "off" || low == "none") ? std::string() : t;
@@ -2403,6 +2690,7 @@ int main(int argc, char** argv) {
     if (const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP")) o.tail_skip = std::atoi(v);
     const long long most = 1LL << 24;   // MiB: 16 TiB
     if (cache.o.checkpoints < 0 || cache.o.every < 0 || cache.o.park_mib < 0 || cache.o.park_mib > most ||
+        cache.o.pin_mib < 0 || cache.o.pin_mib > most ||
         cache.o.park_slots < 0 || cache.o.park_slots > 1024 || cache.o.park_min < 0 || cache.min_free_mib < 0 ||
         cache.min_free_mib > most) {
         std::fprintf(stderr, "strata-poly: a cache option is negative or too large\n");
@@ -2514,6 +2802,7 @@ int main(int argc, char** argv) {
         }
         Session ss(engine, eos, cache, lookup);
         ss.pinned = pinned;
+        ss.pin_dir = pin_dir;
         int rc = 0;
 #if !defined(STRATA_GPU_METAL)
         // the event profiler (profile.hpp): STRATA_PROFILE=1 in normal use, and --bench-report

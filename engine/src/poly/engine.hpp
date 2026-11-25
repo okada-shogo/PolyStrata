@@ -140,7 +140,7 @@ struct Options {
                                   ///< this share of its token's experts' weight, for every token of the call, is left
                                   ///< out (--skip-weight); 0: tail_skip decides
     std::string attn_requant;     ///< Inkling 2: its attention's six matrices quantized again to this type at load
-                                  ///< (q4_0, q5_0 or iq4_nl; --attn-requant); empty: the file's types
+                                  ///< (q4_0, q5_0, q5_k, q6_k or iq4_nl; --attn-requant); empty: the file's types
     bool loop_bf16 = false;       ///< Inkling 2: its loop controllers' matrices in BF16, not the file's F32 (--loop-bf16)
     int prompt_int8 = -1;         ///< Inkling 2: its prompt products on the int8 tensor cores, as on Ampere, on Turing and
                                   ///< AMD's RDNA3 / RDNA4 (gemm_iq_i8_turing()); -1: the default (Turing off, AMD on);
@@ -399,9 +399,9 @@ public:
     /// a step() takes it back.  picked() is the token either way.
     void step_picks() { step_picks_ = !next_; }
     int32_t picked(int i) const;
-    /// The same for the next eval() of one token with its logits: picked(0) is its most likely token, and logits()
-    /// are not copied to the host (Inkling 2's 201,024 scores are 0.8 MB to copy and to search a token).
-    /// On a layer split the last card picks: it has the logits.
+    /// The same for the next eval() of one token with its logits, or the next window(): picked(i) is row i's most
+    /// likely token, and logits() / logits_of() are not copied to the host (Inkling 2's 201,024 scores are 0.8 MB to
+    /// copy and to search a token).  On a layer split the last card picks: it has the logits.
     void eval_picks() {
         if (next_) next_->eval_picks();
         else eval_picks_ = true;
@@ -604,6 +604,8 @@ protected:
     virtual int widest() const = 0;
     /// The copies of a token's embedding a layer's input starts from.
     virtual int streams() const = 0;
+    /// Clear any per-call state before run(), step(), or read_groups() starts (or unwinds).
+    virtual void reset_call() {}
     /// A layer from its input to its router's copy (a layer without routed experts: to its end).
     virtual void layer_head(Layer& L, int il, int n) = 0;
     /// The routed experts' sum (fo_) into the layer's output.
@@ -1433,6 +1435,7 @@ protected:
     int32_t *d_ex_ = nullptr, *h_ex_ = nullptr;   ///< a prompt batch's rows' experts (ExpertScales), in VRAM and pinned
     int32_t* d_ids_ = nullptr;                    ///< a batch's experts and weights when it routes on the card
     float* d_wts_ = nullptr;
+    void* d_grp_ = nullptr;                       ///< GPU expert dedup table for multi-token moe_card()
     int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card
     float* h_wts_ = nullptr;                      ///< pinned: their weights, for step()'s and window()'s rows (bells())
     /// While moe() takes several rows: their picks from the card (h_ids_, h_wts_), as a token alone routes there

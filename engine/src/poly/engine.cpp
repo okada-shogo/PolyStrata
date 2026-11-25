@@ -2690,8 +2690,9 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     if (o.expert_gpu >= 0 && (!inkling || !o.layer_split.empty()))
         throw std::runtime_error("--expert-gpu is Inkling 2's, on one card beside it (no --layer-split); this is a '" +
                                  name + "' model");
-    if (!o.attn_requant.empty() && o.attn_requant != "q4_0" && o.attn_requant != "q5_0" && o.attn_requant != "iq4_nl")
-        throw std::runtime_error("--attn-requant takes q4_0, q5_0 or iq4_nl");
+    if (!o.attn_requant.empty() && o.attn_requant != "q4_0" && o.attn_requant != "q5_0" &&
+        o.attn_requant != "iq4_nl" && o.attn_requant != "q5_k" && o.attn_requant != "q6_k")
+        throw std::runtime_error("--attn-requant takes q4_0, q5_0, q5_k, q6_k or iq4_nl");
     const auto make = [&]() -> std::unique_ptr<Engine> {
         if (name == "glm5-next" || name == "glm5next") return std::make_unique<Glm5Next>();   // Unsloth: no hyphen
         if (qwen35) return std::make_unique<Qwen35>();
@@ -2845,6 +2846,8 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
         const size_t row = strata::quant::row_bytes((int) guess_type_, n_in), out = row * (size_t) n_out;
         const Dev d{dense_ ? dense_ + dense_at_ : nullptr, guess_type_, (int) n_in, (int) n_out};
         void (*quantize)(const float*, void*, int64_t) = guess_type_ == 6    ? strata::quant::quantize_q5_0_ref
+                                                         : guess_type_ == 13 ? strata::quant::quantize_q5_K_ref
+                                                         : guess_type_ == 14 ? strata::quant::quantize_q6_K_ref
                                                          : guess_type_ == 20 ? strata::quant::quantize_iq4_nl_ref
                                                                              : strata::quant::quantize_q4_0_ref;
         dense_at_ += pad(out) + kTail;
@@ -5294,6 +5297,9 @@ void Engine::alloc() {
                          rows_, cap_rows_, lay.total >> 20, prompt_layout(cap_rows_).total >> 20, cap_rows_);
         d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
+#if !defined(STRATA_GPU_METAL)
+        d_grp_ = dmalloc(kernels::kMmvqIdsGroupBytes, "scratch");
+#endif
         h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
         // the weights of step()'s rows and a window's, back from the card where a token alone routes there (doorbell)
         if (bells() && (opt_.batch > 0 || opt_.window > 1))
@@ -6866,8 +6872,16 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             if (opt_.metal_optimize && n_host > 0)
                 ck(gpu::metal::submit(static_cast<gpu::Stream>(st_)), "submitting cached experts");
 #endif
-            // the next layer's guesses, up while the CPU computes this layer's experts
-            if (ahead_j >= 0 && at == 0) vram_ahead(ahead_j, n, ahead_part);
+            // the next layer's guesses, up while the CPU computes this layer's experts.  vram_ahead() takes the
+            // group uploaded longest ago, once its `read` has passed, and that can be a group this call reads: one
+            // with this layer's guesses from an earlier token, when fewer uploads than groups went up since (a bus
+            // that is often busy).  `read` is marked again after the launches above first, so the upload waits for
+            // them and not for an older call's.
+            if (ahead_j >= 0 && at == 0) {
+                for (int h = 0; h < kAheadGroups; ++h)
+                    if (read >> h & 1u) ck(cudaEventRecord((cudaEvent_t) ahead_[h].read, cs(st_)), "upload ahead");
+                vram_ahead(ahead_j, n, ahead_part);
+            }
             if (n_host > 0) pmark(prof::kWaitCpu);   // the stream's next work is the CPU's experts' sum
         };
 
@@ -7051,11 +7065,18 @@ bool Engine::moe_card(Layer& L, int il, int n) {
 #endif
     const size_t xq_row = kernels::native_q8_1_bytes(n_embd_), ff = (size_t) n_ff_exp_;
     pmark(prof::kExpertsGpu);
+#if !defined(STRATA_GPU_METAL)
+    void* const grp = (n > 1 && rr <= 64 && d_grp_) ? d_grp_ : nullptr;
+    if (grp) kernels::native_mmvq_ids_group(d_ids_, rr, grp, st_);
+#else
+    void* const grp = nullptr;
+#endif
     // a mixed layer's gate and up are each a matrix of n_ff rows of its own type, up's into the second half
-    const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, xq_row, n_used_, g_, 2 * ff, lane_slots_};
+    const kernels::MmvqIds gate_up{table, d_ids_, 0, xq_, xq_row, n_used_, g_, 2 * ff, lane_slots_, grp, grp != nullptr};
     kernels::native_mmvq_ids((int) L.gu_type, gate_up, rr, n_embd_, L.mixed() ? n_ff_exp_ : 2 * n_ff_exp_, st_);
     if (L.mixed()) {
-        const kernels::MmvqIds up{table, d_ids_, L.gu_bytes, xq_, xq_row, n_used_, g_ + ff, 2 * ff, lane_slots_};
+        const kernels::MmvqIds up{table, d_ids_, L.gu_bytes, xq_, xq_row, n_used_, g_ + ff, 2 * ff, lane_slots_, grp,
+                                  grp != nullptr};
         kernels::native_mmvq_ids((int) L.u_type, up, rr, n_embd_, n_ff_exp_, st_);
     }
     const ExpertScales es = expert_scales(L, d_ids_);
@@ -7068,7 +7089,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     if (!L.h_s_down.empty() && !moe_left_scale_) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
     if (!(situ_beta_ > 0)) kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
     const kernels::MmvqIds down{table, d_ids_, L.gu2(), q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
-                                (size_t) n_embd_, lane_slots_};
+                                (size_t) n_embd_, lane_slots_, grp, grp != nullptr};
     kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
     if (moe_sum_later(n)) moe_left_ = true;
     else moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
@@ -8709,6 +8730,9 @@ void Engine::run(const int32_t* tokens, int n) {
 
     // h_r_ and h_cpu_ may still be the source of the previous call's copies
     ck(cudaStreamSynchronize(cs(st_)), "eval");
+    moe_left_ = false;
+    moe_left_scale_ = nullptr;
+    reset_call();
     // Greedy answers have to be a function of the request alone: which experts take the GPU path and which the
     // CPU one decides a layer's sums to the last bit (the two paths add in different orders), so the cache's
     // state at the first layer may not depend on whether an upload happened to have finished.  Every expert on
@@ -8960,8 +8984,11 @@ void Engine::run(const int32_t* tokens, int n) {
                 k.push_back(INT_MIN + c);
                 return k;
             };
-            if (!passes_.count(part(0)))
-                for (int c = 0; il < hi_; ++c) passes_[part(c)] = record(layers(first));
+            if (!passes_.count(part(0))) {
+                std::vector<void*> made;
+                for (int c = 0; il < hi_; ++c) made.push_back(record(layers(first)));
+                for (size_t c = 0; c < made.size(); ++c) passes_[part((int) c)] = made[c];
+            }
             for (int c = 0;; ++c) {
                 const auto it = passes_.find(part(c));
                 if (it == passes_.end()) break;
@@ -9082,6 +9109,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     graph_room();
 
     ck(cudaStreamSynchronize(cs(st_)), "step");
+    moe_left_ = false;
+    moe_left_scale_ = nullptr;
+    reset_call();
     if (n_swap_ > 0) follow(R);
     tok_ = rtok.data();
     windowed_ = false;
@@ -9644,9 +9674,15 @@ void Engine::carry_in(int64_t from, int n) {
 }
 
 void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
+    const bool picks = !next_ && std::exchange(eval_picks_, false) && want_logits && n == 1 && d_picks_;
     OnCard here(device_, split_);
     const ProfCall prof_call(*this, n);
-    run(tokens, n);
+    try {
+        run(tokens, n);
+    } catch (...) {
+        for (Engine* e = next_.get(); e; e = e->next_.get()) e->eval_picks_ = false;
+        throw;
+    }
     if (next_) {
         hand_on(pos_, n, pass_rows(n));
         next_->eval(tokens, n, want_logits);
@@ -9655,7 +9691,6 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         return;
     }
     // The model's output: the last token's for the logits, and every token's for the draft block.
-    const bool picks = std::exchange(eval_picks_, false) && want_logits && n == 1 && d_picks_;
     picks_ = picks;
     if (want_logits || draft_) {
         const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump && !prompt_scratch_;
@@ -10134,6 +10169,9 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
     for (; g > 1 && !(base = carry_take((size_t) g * per * sizeof(float), most)); g = (g + 1) / 2) {
     }
     g = std::max(g, 1);
+    moe_left_ = false;
+    moe_left_scale_ = nullptr;
+    reset_call();
     std::vector<int> order;   // the layer of each run, in the order the calls meet them
     for (int il = lo_; il < hi_; il = next_layer(il)) order.push_back(il);
     const int visits = (int) order.size();
@@ -10149,6 +10187,9 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
         carry_at(nullptr);
         pos_ = pos0;
         shared_ahead_ = false;
+        moe_left_ = false;
+        moe_left_scale_ = nullptr;
+        reset_call();
     };
     try {
         for (int k = 0; k < groups; ++k) {
@@ -10265,7 +10306,11 @@ unsigned Engine::snap_tokens(int t) const {
 // written again when the position gets its real token.  So they leave the state as it was after tokens of the
 // window (snap_, snap_tokens()), and keep() puts back the one after the last token that was right.
 void Engine::window(const int32_t* tokens, int t) {
-    if (t < 1 || t > opt_.window) throw std::logic_error("a window takes 1 to max_window() tokens");
+    const bool picks = !next_ && std::exchange(eval_picks_, false) && d_picks_;
+    if (t < 1 || t > opt_.window) {
+        for (Engine* e = next_.get(); e; e = e->next_.get()) e->eval_picks_ = false;
+        throw std::logic_error("a window takes 1 to max_window() tokens");
+    }
     OnCard here(device_, split_);
     const ProfCall prof_call(*this, t);
     end_read();
@@ -10291,6 +10336,7 @@ void Engine::window(const int32_t* tokens, int t) {
     try {
         run(tokens, t);
     } catch (...) {
+        for (Engine* e = next_.get(); e; e = e->next_.get()) e->eval_picks_ = false;
         windowed_ = false;
         snap_bits_ = 0;
         recorded_ = recorded_ || recorded;
@@ -10307,12 +10353,19 @@ void Engine::window(const int32_t* tokens, int t) {
         next_->window(tokens, t);
         return;
     }
+    picks_ = picks;
     float* h = draft_ ? hn_ + n_embd_ : xn_;
     output_rows(0, t, h);
     lin(output_, h, wlogits_, t);
     finish_logits(wlogits_, t);
-    ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
-       "logits");
+    if (picks) {
+        likeliest_rows(wlogits_, n_vocab_, t, d_picks_, st_);
+        ck(cudaMemcpyAsync(h_picks_, d_picks_, (size_t) t * sizeof(Likeliest), cudaMemcpyDeviceToHost, cs(st_)),
+           "logits");
+    } else {
+        ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
+           "logits");
+    }
     ck(cudaStreamSynchronize(cs(st_)), "window");
     if (timed && !recorded_ && !freeze_experts_) took_way(t, ms_since(t0));
     recorded_ = recorded_ || recorded;

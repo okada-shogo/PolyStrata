@@ -34,6 +34,7 @@ struct MmvqIds;
 /// iq_mmvq(..., ncols = 1) gives for each; iq_mmvq_ids the same for MmvqIds.  native_mmvq_slots() and
 /// native_mmvq_ids() are the entry points.
 void iq_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream);
+void iq_mmvq_ids_group(const int32_t* ids, int count, void* group_buf, void* stream);
 void iq_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
 
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:

@@ -947,8 +947,9 @@ FAMILIES = {
                 # the engine's layer split is not built for Inkling 2 yet: it exits with "Inkling 2 runs on one
                 # card (--layer-split is not supported for it yet)", so setup never offers a pair to this family
                 "one_card": True,
-                # the picture reader: Unsloth's mmproj (strata-vision's inkling2v tower), beside the GGUFs' folder.  On
-                # a Mac the tower has no Metal kernels: setup_mac.py runs it on the CPU ("mac_vision_cpu")
+                # the DSpark draft model and the picture reader sit at the top of the repository (no Mainline_Support/,
+                # no _file suffix).  On a Mac the picture tower has no Metal kernels: setup_mac.py runs it on the CPU
+                "draft_hf": hf("unsloth/Inkling-2-Mini-GGUF"),
                 "mmproj_hf": hf("unsloth/Inkling-2-Mini-GGUF"), "mmproj": "mmproj-F16.gguf", "mac_vision_cpu": True,
                 # the sizes run on a Mac (an M5 Ultra, 256 GB): setup_mac.py takes the first that fits the Mac's memory
                 "mac_measured": ("UD-Q3_K_XL", "UD-Q2_K_XL"),
@@ -959,22 +960,27 @@ FAMILIES = {
                 # (measured with --expert-swaps 0 as well, since dropped: it keeps the experts held as they were loaded,
                 # so the CPU computes more of a token's experts; 16-23% slower writing after a 302-token prompt on the
                 # 8 and 16 GB cards measured)
-                "small_card_args": ["--attn-requant", "q5_0", "--loop-bf16", "--tail-skip", "4"],
-                "models": {"UD-Q4_K_XL": {"about": "4-bit experts (NVFP4, Unsloth Dynamic), 8-bit where they write",
-                                          "download_gb": 17.6, "ram_gb": 21, "arena_gb": 15.797846016,
-                                          "vram_beside_gb": 3.7},
-                           "UD-Q3_K_XL": {"about": "3-bit i-quant and 4-bit experts mixed",
-                                          "download_gb": 13.6, "ram_gb": 17, "arena_gb": 12.198739968,
-                                          "vram_beside_gb": 3.6},
-                           "UD-Q2_K_XL": {"about": "1- to 2-bit experts: the smallest",
-                                          "download_gb": 9.1, "ram_gb": 13, "arena_gb": 7.888306176,
-                                          "vram_beside_gb": 3.5}},
+                "small_card_args": ["--attn-requant", "q5_k", "--loop-bf16", "--tail-skip", "4"],
+                "models": {"UD-Q4_K_XL": {"about": "4-bit experts (NVFP4, Unsloth Dynamic), 8-bit where they write, and DSpark drafter",
+                                          "download_gb": 18.0, "ram_gb": 21, "arena_gb": 15.797846016,
+                                          "vram_beside_gb": 3.7,
+                                          "draft_model": "dspark-Inkling-2-Mini-Q8_0.gguf"},
+                           "UD-Q3_K_XL": {"about": "3-bit i-quant and 4-bit experts mixed, and DSpark drafter",
+                                          "download_gb": 14.0, "ram_gb": 17, "arena_gb": 12.198739968,
+                                          "vram_beside_gb": 3.6,
+                                          "draft_model": "dspark-Inkling-2-Mini-Q8_0.gguf"},
+                           "UD-Q2_K_XL": {"about": "1- to 2-bit experts: the smallest, and DSpark drafter",
+                                          "download_gb": 9.5, "ram_gb": 13, "arena_gb": 7.888306176,
+                                          "vram_beside_gb": 3.5,
+                                          "draft_model": "dspark-Inkling-2-Mini-Q8_0.gguf"}},
                 "sha256": {"Inkling-2-Mini-UD-Q4_K_XL.gguf":
                            (17629760736, "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3"),
                            "Inkling-2-Mini-UD-Q3_K_XL.gguf":
                            (13631779296, "e2d03e8c92ac21cff0e3309b95f40dfd27d1825184f0d2bc09db249797273639"),
                            "Inkling-2-Mini-UD-Q2_K_XL.gguf":
                            (9138716608, "b42841608ea380ddde5a3f1125081357128a3c71b80d006246de4e31292fc6c1"),
+                           "dspark-Inkling-2-Mini-Q8_0.gguf":
+                           (402278560, "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773"),
                            "mmproj-F16.gguf":
                            (639348160, "3bff75ffeb2d6e0371ba7bd42e30d26a7d98aea681fa44b03b5a20891cfa2c5f")}},
     # Flint (llama.cpp's flint): no draft block and no image encoder.  Its window layers' caches are rings, so a context
@@ -8353,7 +8359,8 @@ def warm_start_into(cfg: dict, a) -> None:
 
 # the options setup chooses itself on every run from its answers (context, KV type, pictures, the draft layer, the layer split):
 # a hand edit of one of these is carried by the answers (choices_from_config) or by its own key ("mtp", "vision"), not by user_args
-SETUP_CHOICE_FLAGS = frozenset({"--max-context", "--kv", "--vision", "--mtp", "--spec-min-p", "--batch-mtp", "--layer-split"})
+SETUP_CHOICE_FLAGS = frozenset({"--max-context", "--kv", "--vision", "--mtp", "--spec-min-p", "--batch-mtp", "--layer-split",
+                                "--draft-model", "--no-draft"})
 
 
 def setup_flags() -> frozenset:
@@ -10214,6 +10221,44 @@ def poly_small_card(a, fam, paths) -> str | None:
     return "on"
 
 
+def poly_saved_parallel(paths) -> int:
+    """The saved "parallel" count of an earlier run config of this model, or 1."""
+    for p in paths:
+        if p is None or not p.is_file():
+            continue
+        try:
+            n = json.loads(p.read_text(encoding="utf-8-sig")).get("parallel")
+        except (OSError, ValueError, AttributeError):
+            continue
+        return int(n) if isinstance(n, int) and not isinstance(n, bool) and n >= 1 else 1
+    return 1
+
+
+def poly_draft_on(a, paths) -> bool:
+    """Whether a strata-poly model uses its draft model or draft block: --no-draft or --mtp off turns it off (kept as
+    "mtp": false in the run config); --mtp on turns it back on."""
+    if getattr(a, "no_draft", False) or getattr(a, "mtp", None) == "off":
+        return False
+    if getattr(a, "mtp", None) == "on":
+        return True
+    for p in paths:
+        if p is None or not p.is_file():
+            continue
+        try:
+            saved = json.loads(p.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(saved, dict):
+            continue
+        if saved.get("mtp") is False:
+            return False
+        args = saved.get("args")
+        if isinstance(args, list) and "--no-draft" in args:
+            return False
+        return True
+    return True
+
+
 def poly_asset() -> str:
     """The ready-made strata-poly's asset for this checkout: the engine and the image encoder are both in it."""
     return POLY_ASSET.format(src=source_hash(ENGINE_SOURCES + VISION_SOURCES))
@@ -10720,12 +10765,13 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
 
     # the conversation cache: asked once, then kept as the model's run config has it
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    earlier = adopted if adopted is not None and adopted.name == cfg_path.name else None
     # the attention caches' format (issue 183): --kv when this model has that one, else what its run config had;
     # --kv fp16 goes back to the default
-    kv = a.kv or poly_saved_kv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
+    kv = a.kv or poly_saved_kv([cfg_path, earlier])
     if family not in POLY_KV.get(kv, ()):
         kv = None
-    conv = poly_saved_conv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
+    conv = poly_saved_conv([cfg_path, earlier])
     if conv is None:
         say()
         say("  Conversation cache: a coding agent sends several conversations in turn (the main one, its subagents,")
@@ -10739,6 +10785,18 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         ok(f"conversation cache: 40% of the RAM free once the model is loaded, up to {POLY_CONV_CACHE_MIB} MiB")
     else:
         ok("conversation cache: " + (f"up to {conv} MiB of RAM" if conv else "off (the last conversation is kept)"))
+
+    draft_choice = poly_draft_on(a, [cfg_path, earlier])
+    eff_parallel = (a.parallel if a.parallel >= 2 else 1) if a.parallel is not None else (
+        1 if fam.get("one_request") is True else poly_saved_parallel([cfg_path, earlier]))
+    # Inkling 2's DSpark drafter runs on one NVIDIA card or a Mac, one sequence at a time: skip it automatically on AMD
+    # HIP, with --layer-split, when "parallel" >= 2, or by default on a card that holds only part of the experts
+    # (0.4 GB for the drafter crowds out cached experts; --mtp on opts in).
+    inkling_part = family == "inkling" and not multi and poly_held_gb(d, vram) < d["arena_gb"]
+    skip_inkling_draft = family == "inkling" and (
+        bool(hip) or bool(multi) or bool(a.layer_split) or eff_parallel >= 2
+        or (inkling_part and getattr(a, "mtp", None) != "on"))
+    use_guesser = bool(d.get("draft_model")) and draft_choice and not skip_inkling_draft
 
     # one file, or the numbered files of a split GGUF: the engine is given the first and finds the others by name
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
@@ -10761,10 +10819,12 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             mark(s, "whole (checked against its own tensor directory)")
     gguf = shards[0]
     have_model = all(s.exists() and (done(s) or bool(a.gguf_dir)) for s in shards)
-    # the size's draft model: beside the model's file, or, when --gguf-dir has none, where setup keeps its own
-    guesser = models_dir / Path(d["draft_model"]).name if d.get("draft_model") else None
-    if guesser is not None and a.gguf_dir and not guesser.exists():
+    # the size's draft model: beside the model's file, or, when --gguf-dir / --custom-gguf has none, where setup keeps its own
+    guesser = models_dir / Path(d["draft_model"]).name if use_guesser else None
+    if guesser is not None and (a.gguf_dir or _sg) and not guesser.exists():
         guesser = Path(a.models_dir) / tag / guesser.name
+    if guesser is not None and guesser.exists() and not done(guesser) and whole_shard(guesser):
+        mark(guesser, "whole (checked against its own tensor directory)")
     have_guesser = guesser is None or guesser.exists() and (done(guesser) or bool(a.gguf_dir) or whole_shard(guesser))
     # the image encoder, in the same places
     mmproj = models_dir / fam["mmproj"] if vision != "none" else None
@@ -10781,7 +10841,11 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
                  f"renaming one to exactly {fam['mmproj']}, or deleting the others")
     have_mmproj = mmproj is None or mmproj.exists() and (done(mmproj) or bool(a.gguf_dir) or whole_shard(mmproj))
     on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
-    need = (0 if have_model and have_guesser else max(d["download_gb"] - on_disk, 0)) + \
+    draft_bytes = ({**fam["sha256"], **d.get("sha256", {})}.get(Path(d["draft_model"]).name, (0,))[0]
+                   if d.get("draft_model") else 0)
+    want_gb = (d["download_gb"] + (draft_bytes / 1e9 if _sg and use_guesser else 0.0)
+               - (draft_bytes / 1e9 if not _sg and not use_guesser else 0.0))
+    need = (0 if have_model and have_guesser else max(want_gb - on_disk, 0)) + \
         (0 if have_mmproj else fam["vision_gb"]) + 2
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB" +
@@ -10841,8 +10905,13 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     if guesser is not None:
         if not have_guesser:
             say("  Its draft model lets it guess a few words ahead and check them at once (faster answers).")
-            download(d.get("hf", fam["hf"]) + d["draft_model"], guesser)
-        _skip_or_verify(guesser, guesser.name)
+            draft_base = d.get("draft_hf") or (d["hf"] if "hf" in d else fam.get("draft_hf", fam["hf"]))
+            download(draft_base + d["draft_model"], guesser)
+        if guesser.name in sha:
+            verify_sha256(guesser, *sha[guesser.name],
+                          own=(bool(a.gguf_dir) or bool(_sg)) and guesser.parent == models_dir)
+        else:
+            _skip_or_verify(guesser, guesser.name)
     if mmproj is not None:
         if not have_mmproj:
             download(d.get("mmproj_hf", fam["mmproj_hf"]) + fam["mmproj"], mmproj, "vision encoder")
@@ -10872,7 +10941,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     # GLM's draft block is the model's, one for every size.  A size whose file leaves it out gets it here: the block
     # alone is downloaded, not the file it comes from.
     draft = None
-    if d.get("draft") != "own" and fam.get("draft"):
+    if draft_choice and d.get("draft") != "own" and fam.get("draft"):
         draft = find_in([data, *elsewhere], fam["draft"]) or data / fam["draft"]
         if not draft.exists():
             say("  The draft block lets the model guess a few words ahead and check them at once (faster answers).")
@@ -10882,12 +10951,16 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     if guesser is not None:
         draft = guesser
         ok(f"draft model: {draft}")
+    elif not draft_choice and (d.get("draft_model") or d.get("draft") == "own" or fam.get("draft")):
+        ok("drafting: off (kept in the run config until --mtp on)")
     ok(f"model prepared: {pack}")
 
     step(7, "writing the start script")
     args = ["--model", str(gguf), "--max-context", str(ctx), "--expert-profile", str(profile)]
     if draft:
         args += ["--draft-model", str(draft)]
+    elif not draft_choice and (d.get("draft") == "own" or fam.get("draft")):
+        args.append("--no-draft")
     if conv:
         args += ["--conversation-cache-mib", str(conv)]
     if a.vram_reserve_mib is not None:
@@ -10936,6 +11009,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
            "log": str(ROOT / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if small == "off":
         cfg["small_card"] = "off"                      # kept by a later setup run, on any card (poly_small_card)
+    if not draft_choice:
+        cfg["mtp"] = False                             # kept by a later setup run until --mtp on (poly_draft_on)
     if fam.get("tool_call_recovery"):
         cfg["tool_call_recovery"] = True
         ok("its tool calls are JSON inside the wrapper: they are read with the recovery (tool_call_recovery in the "
@@ -10959,7 +11034,6 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         cfg["api_key"] = a.api_key
     if a.browser is not None:
         cfg["open_browser"] = a.browser
-    earlier = adopted if adopted is not None and adopted.name == cfg_path.name else None
     if vision != "none":
         # the most rows a picture becomes: one of this engine's prompt batches (1,024) holds a picture of Gemma 4's
         vt = vision_tokens(a.vision_tokens, vision, cfg_path if cfg_path.is_file() else earlier)
@@ -10990,7 +11064,16 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         # The config as written ("parallel" asked now or kept from the one before, the person's own options in its
         # args): --tail-skip is decided over a step's rows, which are several chats' tokens (docs/BATCHING.md).  Not
         # on a Mac for a family that answers one request at a time there ("one_request": "mac").
+        if draft_choice:
+            done.pop("mtp", None)
         parallel = int(done.get("parallel") or 1)
+        if family == "inkling" and "--draft-model" in done.get("args", []) and (
+                parallel >= 2 or done.get("layer_split") or "--layer-split" in done.get("args", [])
+                or done.get("backend") == "hip"):
+            a_list = done["args"]
+            while "--draft-model" in a_list:
+                i = a_list.index("--draft-model")
+                del a_list[i:i + 2]
         if fam.get("one_request") is True or (fam.get("one_request") == "mac" and sys.platform == "darwin"):
             return
         if parallel >= 2 and "--tail-skip" in done.get("args", []):
@@ -12214,9 +12297,10 @@ def resolve_custom_gguf(path_str: str, check: bool = False) -> tuple[str, str, l
             return int(m.group(1)) if m else 0
 
         stems: dict[str, list[Path]] = {}
-        for f in sorted(p.iterdir(), key=lambda x: (_shard_idx(x), x.name)):
-            if f.suffix.lower() != ".gguf" or "mmproj" in f.name.lower():
-                continue
+        ggufs = [f for f in sorted(p.iterdir(), key=lambda x: (_shard_idx(x), x.name))
+                 if f.suffix.lower() == ".gguf" and "mmproj" not in f.name.lower()]
+        non_draft = [f for f in ggufs if not f.name.lower().startswith(("dspark-", "mtp-"))]
+        for f in (non_draft or ggufs):
             base = SHARD_NAME.search(f.name)
             key = SHARD_NAME.sub("", f.name) if base else f.stem
             stems.setdefault(key, []).append(f)
@@ -12318,6 +12402,8 @@ def custom_size(sizes: dict, fp: dict, file_bytes: int) -> tuple[dict, str]:
     near = min(sizes, key=lambda m: abs(sizes[m]["arena_gb"] - arena))
     d = {"about": "your own file, a quantization setup does not offer", "download_gb": file_bytes / 1e9,
          "arena_gb": arena, "vram_beside_gb": poly_beside_gb(sizes[near])}
+    if sizes[near].get("draft_model"):
+        d["draft_model"] = sizes[near]["draft_model"]
     d["ram_gb"] = round(poly_ram_need(d, 8.0))           # as the offered sizes' (an 8 GB card's estimate)
     return d, near
 
@@ -12737,8 +12823,8 @@ def main() -> int:
                          "Qwen3.6-35B-A3B on strata-poly, groot = Groot 19B-A3B (experimental; docs/models/groot.md), "
                          "clover = Clover-35B-A3B-Preview, ornith = "
                          "Ornith 1.5, gemma4 = Gemma 4 26B-A4B, tiel = Tiel Coder 35B-A3B, minicpmv = MiniCPM-V 4.7 "
-                         "35B-A3B, ornith122 = Ornith 1.5 122B (docs/BACKENDS.md), inkling = Inkling 2 Mini (experimental, text "
-                         "only; docs/models/inkling.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
+                         "35B-A3B, ornith122 = Ornith 1.5 122B (docs/BACKENDS.md), inkling = Inkling 2 Mini (experimental; "
+                         "docs/models/inkling.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
                          "own engine (UD-Q4_K_XL and up, 32 GB of RAM or more; pictures with --vision, several "
                          "requests at once with --parallel; docs/QWEN36.md), hy4-flash = Tencent Hy4-Flash on "
                          "the Strata project's own engine (SQ-64 / SQ-96 / SQ-128)")
@@ -12882,6 +12968,9 @@ def main() -> int:
                     help="the draft layer (MTP): off starts the model without it, which frees about 1 GB of graphics memory "
                          "for the expert cache and takes less RAM, at the price of speed; it is kept in the run config "
                          "(\"mtp\": false) and a later setup run does not undo it. on: back to the default")
+    ap.add_argument("--no-draft", action="store_true",
+                    help="strata-poly models: start without the draft model or draft block (same as --mtp off; kept as "
+                         "\"mtp\": false in the run config until --mtp on)")
     ap.add_argument("--drafter", choices=["mtp", "dflash2", "dfly2"],
                     help="which drafter this model will use. dflash2: the MTP draft layer's ~5 GB are not downloaded (the DFlash2 drafter is fetched by `strata drafting fetch`); "
                          "the arguments keep the --mtp folder so a later switch to the MTP works. mtp (the default): the draft layer is fetched as before. Nothing is written about it "
@@ -12909,7 +12998,7 @@ def main() -> int:
                          "experts fit on the GPU); auto: when the RAM has room for it")
     ap.add_argument("--inkling-small-card", choices=["on", "off"],
                     help="Inkling 2 Mini on a card that does not hold every expert of the size: on = the small-card "
-                         "settings (--attn-requant q5_0 --loop-bf16 --tail-skip 4: faster, the answers move a "
+                         "settings (--attn-requant q5_k --loop-bf16 --tail-skip 4: faster, the answers move a "
                          "little; the default); off = the high-accuracy mode, without them. A later setup run keeps "
                          "off (\"small_card\" in the run config) until --inkling-small-card on")
     ap.add_argument("--backend", choices=["cuda", "hip", "sycl"],

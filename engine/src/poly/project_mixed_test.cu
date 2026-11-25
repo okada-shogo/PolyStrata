@@ -194,6 +194,68 @@ void quantize_many(int n_in) {
     ck(cudaStreamDestroy(st), "stream");
 }
 
+void check_rows(const Case& c, int ncols) {
+#if defined(__HIPCC__)
+    (void) c;
+    (void) ncols;
+#else
+    cudaStream_t st;
+    ck(cudaStreamCreate(&st), "stream");
+    std::vector<void*> w;
+    void* xq[3];
+    std::vector<float*> ya, yb;
+    k::NativeMmvqMany m{};
+    for (int i = 0; i < 3; ++i) {
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> h((size_t) c.n_in * ncols);
+        for (float& v : h) v = nd(rng);
+        float* x = up(h);
+        ck(cudaMalloc(&xq[i], k::native_q8_1_bytes(c.n_in, ncols)), "malloc");
+        k::native_quantize_q8_1(x, xq[i], c.n_in, ncols, st);
+        ck(cudaStreamSynchronize(st), "quantize");
+        cudaFree(x);
+    }
+    for (size_t j = 0; j < c.types.size(); ++j) {
+        w.push_back(random_weights(c.types[j], c.n_in, c.n_out[j]));
+        float *a, *bb;
+        const size_t n = (size_t) c.n_out[j] * ncols;
+        ck(cudaMalloc(&a, n * sizeof(float)), "malloc");
+        ck(cudaMalloc(&bb, n * sizeof(float)), "malloc");
+        ck(cudaMemset(a, 0xff, n * sizeof(float)), "memset");
+        ck(cudaMemset(bb, 0x7f, n * sizeof(float)), "memset");
+        ya.push_back(a), yb.push_back(bb);
+        m.w[j] = w[j], m.x_q8_1[j] = xq[c.input[j]], m.y[j] = bb, m.n_out[j] = c.n_out[j];
+    }
+    m.count = (int) c.types.size();
+    for (size_t j = 0; j < c.types.size(); ++j)
+        k::native_mmvq(c.types[j], w[j], xq[c.input[j]], ya[j], c.n_in, c.n_out[j], ncols, st);
+    const std::string what = "mixed_rows x" + std::to_string(ncols) + " " + c.name;
+    const bool taken = k::native_mmvq_mixed_rows_fits(c.types.data(), m, c.n_in, ncols) &&
+                       k::native_mmvq_mixed_rows(c.types.data(), m, c.n_in, ncols, st);
+    if (!taken) {
+        std::printf("%-64s not taken  FAIL\n", what.c_str());
+        ++failures;
+    } else {
+        ck(cudaStreamSynchronize(st), "sync");
+        size_t diff = 0, total = 0;
+        for (size_t j = 0; j < c.types.size(); ++j) {
+            std::vector<float> x((size_t) c.n_out[j] * ncols), y((size_t) c.n_out[j] * ncols);
+            ck(cudaMemcpy(x.data(), ya[j], x.size() * 4, cudaMemcpyDeviceToHost), "download");
+            ck(cudaMemcpy(y.data(), yb[j], y.size() * 4, cudaMemcpyDeviceToHost), "download");
+            for (size_t i = 0; i < x.size(); ++i) diff += std::memcmp(&x[i], &y[i], 4) != 0;
+            total += x.size();
+        }
+        std::printf("%-64s %zu of %zu values differ  %s\n", what.c_str(), diff, total, diff ? "FAIL" : "ok");
+        if (diff) ++failures;
+    }
+    for (void* p : w) cudaFree(p);
+    for (void* p : xq) cudaFree(p);
+    for (float* p : ya) cudaFree(p);
+    for (float* p : yb) cudaFree(p);
+    ck(cudaStreamDestroy(st), "stream");
+#endif
+}
+
 // the declines: a type it has no kernel for, a row too short for the one-row-a-block layout
 void declines() {
     k::NativeMmvqMany m{};
@@ -303,6 +365,8 @@ int main(int argc, char** argv) {
     for (const Case& c : many) check(c, true);
     quantize_many(2304);
 #if !defined(__HIPCC__)
+    for (int nc : {2, 3, 4, 5, 6, 7, 8}) check_rows(mixed[3], nc);   // (native_mmvq_mixed_rows(): CUDA only)
+    check_rows(mixed[5], 4);
     declines();
 #endif
     if (do_bench) {
