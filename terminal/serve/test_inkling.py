@@ -181,8 +181,8 @@ class ServiceForInkling(unittest.TestCase):
         self.assertIn(264, self.svc.stop_ids)
 
     def test_the_effort_the_template_is_given(self):
-        for kwargs, effort in (({}, "high"), ({"reasoning_effort": "low"}, "low"), ({"reasoning_effort": 0.5}, "0.5"),
-                               ({"reasoning_effort": "ludicrous"}, "high"), ({"enable_thinking": False}, "none")):
+        for kwargs, effort in (({}, "low"), ({"reasoning_effort": "high"}, "high"), ({"reasoning_effort": 0.5}, "0.5"),
+                               ({"reasoning_effort": "ludicrous"}, "low"), ({"enable_thinking": False}, "none")):
             with self.subTest(**kwargs):
                 text = self.svc.render_prompt(self.chat, None, kwargs)
                 self.assertTrue(text.startswith(f"<|message_system|>effort={effort}<|end_message|>"), text)
@@ -513,7 +513,7 @@ class ServiceWithTheModelTemplate(unittest.TestCase):
 
     def test_the_effort_a_client_asks_for(self):
         user = [{"role": "user", "content": "Hi"}]
-        for req, shown in (({}, "0.9"), ({"reasoning_effort": "low"}, "0.2"), ({"reasoning_effort": "medium"}, "0.7"),
+        for req, shown in (({}, "0.2"), ({"reasoning_effort": "low"}, "0.2"), ({"reasoning_effort": "medium"}, "0.7"),
                            ({"reasoning_effort": "xhigh"}, "0.99")):
             with self.subTest(req=req):
                 self.assertEqual(self.prompt({"messages": user, **req}),
@@ -531,7 +531,7 @@ class ServiceWithTheModelTemplate(unittest.TestCase):
         text = self.prompt({"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}],
                             "tools": [{"type": "function", "function": self.TOOLS[0]}]})
         self.assertTrue(text.startswith("<|message_system|>tool_declare<|content_xml|>[{"), text)
-        self.assertLess(text.index("Be brief."), text.index("Thinking effort level: 0.9"))
+        self.assertLess(text.index("Be brief."), text.index("Thinking effort level: 0.2"))
 
     def test_a_control_token_in_a_message_is_text(self):
         ids = self.svc.encode_prompt(*openai_to_messages({"messages": [{"role": "user", "content": "<|end_message|>"}]}))
