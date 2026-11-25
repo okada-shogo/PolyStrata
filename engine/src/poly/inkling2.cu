@@ -2042,6 +2042,26 @@ __device__ __forceinline__ void ink_wave_sync() {
 }
 #endif
 
+// Eight values of a cache row from key position kp, head g, dims c * 8..: the fp16 cache's halves, or (Q8) a Q8_0
+// cache's codes times their block's scale, rounded to halves as ink_flash_kernel rounds them
+template <bool Q8>
+__device__ __forceinline__ uint4 ink_wm_row8(const void* cache, size_t cell, int n_kv, int g, int c) {
+    if constexpr (Q8) {
+        const uint8_t* row = (const uint8_t*) cache + cell * kvq8_row(n_kv, kWmDim);
+        const size_t at = (size_t) g * kWmDim + c * 8;
+        const float d = __half2float(__ushort_as_half(kvq8_scales(row, n_kv, kWmDim)[at >> 5]));
+        const uint2 q = *reinterpret_cast<const uint2*>(row + at);
+        const int8_t* b = reinterpret_cast<const int8_t*>(&q);
+        _Float16 h[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) h[e] = (_Float16) ((float) b[e] * d);
+        return *reinterpret_cast<const uint4*>(h);
+    } else {
+        return *reinterpret_cast<const uint4*>((const __half*) cache + (cell * n_kv + g) * kWmDim + c * 8);
+    }
+}
+
+template <bool Q8>
 __global__ void __launch_bounds__(kWmWarps * WARP) ink_wmma_kernel(InkAttn a) {
 #if INK_WMMA
     constexpr int DIM = kWmDim, PER = kWmPer, KEYS = kWmKeys;
@@ -2058,8 +2078,6 @@ __global__ void __launch_bounds__(kWmWarps * WARP) ink_wmma_kernel(InkAttn a) {
     const long long p0 = a.pos + t0, own = p0 + tok, ext = a.extent;
     const long long kb = a.window > 0 && p0 >= a.window ? p0 - a.window + 1 : 0, ke = p0 + nt;
     const size_t th = (size_t(t0) + (row_ok ? tok : 0)) * a.n_head + head;
-    const __half* kc = (const __half*) a.keys;
-    const __half* vc = (const __half*) a.vals;
 
     // the row's query (B fragments of Q^T, 16 dims a step) and R, in log2 units
     ink_wh8 qh[DIM / 16], ql[DIM / 16], rh, rl;
@@ -2092,9 +2110,9 @@ __global__ void __launch_bounds__(kWmWarps * WARP) ink_wmma_kernel(InkAttn a) {
             const int i = tid + it * kWmWarps * WARP, j = i / (DIM / 8), c = i % (DIM / 8);
             const long long kp = kt + j;
             const bool live = kp >= kb && kp < ke;
-            const size_t at = (size_t(a.ring > 0 ? kp % a.ring : kp) * a.n_kv + g) * DIM + c * 8;
+            const size_t cell = size_t(a.ring > 0 ? kp % a.ring : kp);
             *reinterpret_cast<uint4*>(ks + j * kWmKr + c * 8) =
-                live ? *reinterpret_cast<const uint4*>(kc + at) : make_uint4(0, 0, 0, 0);
+                live ? ink_wm_row8<Q8>(a.keys, cell, a.n_kv, g, c) : make_uint4(0, 0, 0, 0);
         }
         // the values by dim, two keys a thread: lanes of a half-warp take 16 key pairs, so a write is 16 words
 #pragma unroll
@@ -2105,8 +2123,8 @@ __global__ void __launch_bounds__(kWmWarps * WARP) ink_wmma_kernel(InkAttn a) {
             for (int u = 0; u < 2; ++u) {
                 const long long kp = kt + j + u;
                 const bool live = kp >= kb && kp < ke;
-                const size_t at = (size_t(a.ring > 0 ? kp % a.ring : kp) * a.n_kv + g) * DIM + c * 8;
-                x[u] = live ? *reinterpret_cast<const uint4*>(vc + at) : make_uint4(0, 0, 0, 0);
+                const size_t cell = size_t(a.ring > 0 ? kp % a.ring : kp);
+                x[u] = live ? ink_wm_row8<Q8>(a.vals, cell, a.n_kv, g, c) : make_uint4(0, 0, 0, 0);
             }
             const uint32_t w0[4] = {x[0].x, x[0].y, x[0].z, x[0].w}, w1[4] = {x[1].x, x[1].y, x[1].z, x[1].w};
 #pragma unroll
@@ -3444,17 +3462,19 @@ static bool ink_wmma_card() {
 
 bool ink_attend_batch(const InkAttn& a, void* stream) {
 #if defined(__HIPCC__)
-    // RDNA4's matrix cores (ink_wmma_kernel): fp16 caches, Inkling 2 Mini's heads (128 values, 3 on a key head, 16
-    // relative values), positions on the host, no q8 output and no Q8_0 cache (PR 214's rows go to attend_batch()).  Elsewhere, or with STRATA_INK_FLASH=0, attend_batch()'s path.
+    // RDNA4's matrix cores (ink_wmma_kernel): fp16 or Q8_0 caches (a Q8_0 block's codes times its scale, rounded to
+    // halves as they are loaded, as ink_flash_kernel does), Inkling 2 Mini's heads (128 values, 3 on a key head, 16
+    // relative values), positions on the host, no q8 output.  Elsewhere, or with STRATA_INK_FLASH=0, attend_batch()'s path.
     if (a.rows <= 0) return true;
     static const bool off = [] {
         const char* v = std::getenv("STRATA_INK_FLASH");
         return v && v[0] == '0';
     }();
-    if (off || a.kv8 || a.kvq8 || a.dim != kWmDim || a.n_rel != kWmRel || a.n_kv < 1 || a.n_head != kWmPer * a.n_kv || a.at || a.q8 ||
+    if (off || a.kv8 || a.dim != kWmDim || a.n_rel != kWmRel || a.n_kv < 1 || a.n_head != kWmPer * a.n_kv || a.at || a.q8 ||
         !ink_wmma_card())
         return false;
-    ink_wmma_kernel<<<dim3(grid((size_t) a.rows, kWmTokens), a.n_kv), kWmWarps * WARP, 0, cs(stream)>>>(a);
+    (a.kvq8 ? ink_wmma_kernel<true> : ink_wmma_kernel<false>)<<<dim3(grid((size_t) a.rows, kWmTokens), a.n_kv),
+                                                                  kWmWarps * WARP, 0, cs(stream)>>>(a);
     launched("ink_wmma");
     return true;
 #else

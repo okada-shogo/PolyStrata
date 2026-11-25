@@ -1,7 +1,8 @@
 // poly_inkling2_wmma_test - ink_attend_batch() on RDNA4's matrix cores (ink_wmma_kernel) against an FP64 reference
 // of Inkling 2's prompt attention (the bias by distance, the sink, the window ring, the gate), against ink_attend()'s
 // score / softmax / value / join kernels, and a token's result the same to the bit in calls that start at other
-// tokens.  No GGUF or model.  77: not a gfx12 card (the kernel is not taken there).
+// tokens; with fp16 caches and with Q8_0 caches (--kv q8_0: the reference reads each value as the kernel loads it, its
+// code times its block's scale rounded to a half).  No GGUF or model.  77: not a gfx12 card (the kernel is not taken there).
 #include "inkling2_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -50,8 +52,33 @@ struct Case {
     const char* name;
     int64_t ctx;   // positions before the call's first token
     int rows, window, ring;
-    bool gate;
+    bool gate, q8;
 };
+
+// A cache of halves as a Q8_0 cache (InkAttn::kvq8): each row's n_kv * dim codes, then a half scale a block of 32
+// (its largest magnitude over 127, a code round(x / scale)); `back` becomes what the kernels read, code times scale
+std::vector<uint8_t> to_q8(std::vector<__half>& back, int64_t rows) {
+    const size_t vals = (size_t) kKv * kDim, bytes = ink_kvq8_row(kKv, kDim);
+    std::vector<uint8_t> out((size_t) rows * bytes);
+    for (int64_t r = 0; r < rows; ++r) {
+        __half* x = back.data() + (size_t) r * vals;
+        uint8_t* row = out.data() + (size_t) r * bytes;
+        for (size_t b = 0; b < vals / 32; ++b) {
+            float amax = 0;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(__half2float(x[b * 32 + i])));
+            const __half dh = __float2half(amax / 127.0f);
+            const float d = __half2float(dh), inv = d > 0 ? 1.0f / d : 0.0f;
+            std::memcpy(row + vals + b * 2, &dh, 2);
+            for (int i = 0; i < 32; ++i) {
+                const int code = (int) std::lround(__half2float(x[b * 32 + i]) * inv);
+                const int8_t c = (int8_t) std::max(-127, std::min(127, code));
+                row[b * 32 + i] = (uint8_t) c;
+                x[b * 32 + i] = __float2half((float) c * d);
+            }
+        }
+    }
+    return out;
+}
 
 // The attention of token t (position ctx + t) in doubles: the keys it sees (a window's last `window` or all), the
 // scale on q . k, plus R . the table's row of the distance (below the extent), the sink an extra term of the softmax.
@@ -105,7 +132,10 @@ void run(const Case& c, std::mt19937& gen) {
     const auto q = randv((size_t) c.rows * kHeads * kDim, 1.2f, gen), r = randv((size_t) c.rows * kHeads * kRel, 1.5f, gen),
                sink = randv((size_t) c.rows * kHeads, 2.0f, gen), table = randv((size_t) kExtent * kRel, 0.8f, gen),
                gate = randv((size_t) c.rows * kHeads * kDim, 3.0f, gen);
-    __half *dk = up(kc), *dv = up(vc);
+    std::vector<uint8_t> kq, vq;
+    if (c.q8) kq = to_q8(kc, cache_rows), vq = to_q8(vc, cache_rows);
+    void* dk = c.q8 ? (void*) up(kq) : (void*) up(kc);
+    void* dv = c.q8 ? (void*) up(vq) : (void*) up(vc);
     float *dq = up(q), *dr = up(r), *ds = up(sink), *dt = up(table), *dg = up(gate), *o1 = nullptr, *o2 = nullptr,
           *o3 = nullptr, *score = nullptr;
     const size_t n_out = q.size();
@@ -118,7 +148,7 @@ void run(const Case& c, std::mt19937& gen) {
     a.q = dq, a.r = dr, a.sink = ds, a.keys = (const uint16_t*) dk, a.vals = (const uint16_t*) dv, a.rel_bias = dt;
     a.gate = c.gate ? dg : nullptr, a.out = o1, a.score = score, a.score_n = score_n, a.pos = c.ctx, a.rows = c.rows;
     a.n_head = kHeads, a.n_kv = kKv, a.dim = kDim, a.n_rel = kRel, a.extent = kExtent, a.window = c.window;
-    a.ring = c.ring, a.scale = 1.f / std::sqrt((float) kDim);
+    a.ring = c.ring, a.scale = 1.f / std::sqrt((float) kDim), a.kvq8 = c.q8;
     if (!ink_attend_batch(a, nullptr)) throw std::logic_error("ink_attend_batch() did not take the call");
     // the same tokens from the 23rd on, in a call of their own
     const int shift = std::min(23, c.rows - 1);
@@ -148,14 +178,14 @@ void run(const Case& c, std::mt19937& gen) {
         }
     }
     const double bound = 2e-5;   // what ink_attend()'s float kernels meet
-    std::printf("%-44s %d tokens checked  wmma max abs %.3e  score path %.3e  %s\n", c.name, checked, worst, worst_s,
+    std::printf("%-52s %d tokens checked  wmma max abs %.3e  score path %.3e  %s\n", c.name, checked, worst, worst_s,
                 worst <= bound ? "ok" : "FAIL");
     if (worst > bound) ++failures;
     size_t diff = 0;
     for (size_t i = 0; i < y.size(); ++i) diff += x[off * kDim + i] != y[i];
-    std::printf("%-44s %zu of %zu values differ in 2 calls  %s\n", c.name, diff, y.size(), diff ? "FAIL" : "ok");
+    std::printf("%-52s %zu of %zu values differ in 2 calls  %s\n", c.name, diff, y.size(), diff ? "FAIL" : "ok");
     if (diff) ++failures;
-    for (void* p : {(void*) dk, (void*) dv, (void*) dq, (void*) dr, (void*) ds, (void*) dt, (void*) dg, (void*) o1,
+    for (void* p : {dk, dv, (void*) dq, (void*) dr, (void*) ds, (void*) dt, (void*) dg, (void*) o1,
                     (void*) o2, (void*) o3, (void*) score})
         (void) cudaFree(p);
 }
@@ -168,13 +198,18 @@ int main() {
         std::printf("device: %s (%s)\n", p.name, p.gcnArchName);
         std::mt19937 gen(1234);
         const Case cases[] = {
-            {"full, 107 tokens at 0", 0, 107, 0, 0, false},
-            {"full, 130 tokens after 3000, gate", 3000, 130, 0, 0, true},
-            {"full, 17 tokens after 5", 5, 17, 0, 0, false},
-            {"window 1024, ring 3072, 130 after 3000", 3000, 130, 1024, 3072, false},
-            {"window 1024, ring 1030, wrap, 300 after 900", 900, 300, 1024, 1030, true},
-            {"window 512, ring 2560, 2048 after 2056", 2056, 2048, 512, 2560, false},
-            {"full, 1100 tokens at 0", 0, 1100, 0, 0, true},
+            {"full, 107 tokens at 0", 0, 107, 0, 0, false, false},
+            {"full, 130 tokens after 3000, gate", 3000, 130, 0, 0, true, false},
+            {"full, 17 tokens after 5", 5, 17, 0, 0, false, false},
+            {"window 1024, ring 3072, 130 after 3000", 3000, 130, 1024, 3072, false, false},
+            {"window 1024, ring 1030, wrap, 300 after 900", 900, 300, 1024, 1030, true, false},
+            {"window 512, ring 2560, 2048 after 2056", 2056, 2048, 512, 2560, false, false},
+            {"full, 1100 tokens at 0", 0, 1100, 0, 0, true, false},
+            {"q8_0: full, 107 tokens at 0", 0, 107, 0, 0, false, true},
+            {"q8_0: full, 130 tokens after 3000, gate", 3000, 130, 0, 0, true, true},
+            {"q8_0: window 1024, ring 1030, wrap, 300 after 900", 900, 300, 1024, 1030, true, true},
+            {"q8_0: window 512, ring 2560, 2048 after 2056", 2056, 2048, 512, 2560, false, true},
+            {"q8_0: full, 1100 tokens at 0", 0, 1100, 0, 0, true, true},
         };
         for (const Case& c : cases) run(c, gen);
     } catch (const std::logic_error& e) {
