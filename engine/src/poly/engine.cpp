@@ -1,6 +1,7 @@
 // src/poly/engine.cpp - see the header.  What every architecture shares: the files, the weights' way to VRAM, the
 // routed experts (the cache, the CPU, a prompt batch), the sequence's state, and the calls that feed tokens.
 #include "engine.hpp"
+#include "device_pick.hpp"
 #include "stage_copy.hpp"
 
 #include "deepseek4.hpp"
@@ -613,6 +614,44 @@ private:
     std::exception_ptr err_;
 };
 
+// The devices this process uses, in order; empty where every device is used as it is (CUDA, Metal).  On HIP an
+// integrated device (a Ryzen iGPU that some setups list as device 0) is left out when a discrete one exists, unless HIP_VISIBLE_DEVICES
+// or ROCR_VISIBLE_DEVICES chooses (device_pick.hpp).  Prints one line, once, saying which and why.
+const std::vector<int>& device_ids() {
+    static const std::vector<int> ids = [] {
+#if defined(STRATA_USE_HIP)
+        int n = 0;
+        ck(cudaGetDeviceCount(&n), "cudaGetDeviceCount");
+        std::vector<device_pick::Dev> devs((size_t) std::max(n, 0));
+        for (int i = 0; i < n; ++i) {
+            cudaDeviceProp p{};
+            if (cudaGetDeviceProperties(&p, i) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            devs[(size_t) i].arch = p.gcnArchName;
+            devs[(size_t) i].integrated = p.integrated != 0;
+        }
+        const device_pick::Pick pk = device_pick::pick(devs, device_pick::env_selects_devices());
+        if (n > 0) {
+            std::string list;
+            for (int i : pk.ids) list += (list.empty() ? "" : ",") + std::to_string(i);
+            std::fprintf(stderr, "strata-poly: GPU device %s of %d: %s\n", list.c_str(), n, pk.why.c_str());
+        }
+        return pk.ids;
+#else
+        return std::vector<int>();
+#endif
+    }();
+    return ids;
+}
+
+// The device for the i-th part of a split over `devices` devices, in turn.
+int device_at(int i, int devices) {
+    const std::vector<int>& ids = device_ids();
+    return ids.empty() ? i % devices : ids[(size_t) (i % devices)];
+}
+
 // A card's memory bandwidth in GB/s for split_plan.hpp, from its peak memory clock and bus width; 0 where it is not
 // known (Metal; HIP, whose clocks are not read this way yet).  STRATA_POLY_CARD_GBS=a,b,... gives each card's.
 double card_gbs(int d) {
@@ -692,11 +731,12 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
     std::vector<double> room((size_t) cards);
     SplitCard two[2];
     double all_room = 0;
-    int devices = 1;
-    ck(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
+    const std::vector<int>& dev_ids = device_ids();
+    int devices = (int) dev_ids.size();
+    if (dev_ids.empty()) ck(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
     for (int d = 0; d < cards; ++d) {   // (STRATA_POLY_CARDS: parts on the devices there are, in turn)
         size_t free_b = 0, total_b = 0;
-        ck(cudaSetDevice(d % devices), "cudaSetDevice");
+        ck(cudaSetDevice(device_at(d, devices)), "cudaSetDevice");
         ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
         room[(size_t) d] = std::max((double) free_b - kBeside - (d == cards - 1 ? head : 0.0), double(1ull << 28));
         all_room += room[(size_t) d];
@@ -2667,8 +2707,12 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         throw std::runtime_error(o.model + " is a '" + name + "' model, which this engine does not run");
     };
     int cards = 1, devices = 1;
-    if (!o.layer_split.empty()) ck(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
-    cards = devices;
+    const std::vector<int>& dev_ids = device_ids();
+    devices = (int) dev_ids.size();
+    if (dev_ids.empty() && !o.layer_split.empty()) ck(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
+    devices = std::max(devices, 1);
+    if (!dev_ids.empty()) ck(cudaSetDevice(dev_ids[0]), "cudaSetDevice");   // the engine's first device
+    cards = o.layer_split.empty() ? 1 : devices;
     // STRATA_POLY_CARDS=N: a split's N parts on the devices there are, in turn, so that a split is tried on one card
     if (const char* v = std::getenv("STRATA_POLY_CARDS"); v && !o.layer_split.empty()) cards = std::max(1, std::atoi(v));
     std::vector<int> starts;
@@ -2718,7 +2762,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         e->lo_ = starts[k];
         e->end_ = last ? -1 : starts[k + 1];
         e->split_ = true;
-        ck(cudaSetDevice((swap ? 1 - (int) k : (int) k) % devices), "cudaSetDevice");
+        ck(cudaSetDevice(device_at(swap ? 1 - (int) k : (int) k, devices)), "cudaSetDevice");
         try {
             e->load(so);
         } catch (const std::runtime_error& err) {
@@ -2729,7 +2773,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         else first = std::move(e);
         prev = at;
     }
-    ck(cudaSetDevice(0), "cudaSetDevice");
+    ck(cudaSetDevice(device_at(0, devices)), "cudaSetDevice");
     int k = 0;
     for (const Engine* e = first.get(); e; e = e->next_.get(), ++k)
         std::fprintf(stderr, "strata-poly: layers %d to %d on card %d: %d of %d routed experts in VRAM (%.1f GiB)\n",
