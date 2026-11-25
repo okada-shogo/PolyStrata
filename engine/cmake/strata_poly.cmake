@@ -48,6 +48,8 @@ endif()
 
 # The opt-in lifecycle is a host-only test, including on non-CUDA builds.
 if(STRATA_BUILD_TESTS)
+  add_executable(poly_dspark_layout_test src/poly/dspark_layout_test.cpp)
+  add_test(NAME poly_dspark_layout_test COMMAND poly_dspark_layout_test)
   add_executable(poly_hip_value_split_policy_test src/poly/hip_value_split_policy_test.cpp)
   add_test(NAME poly_hip_value_split_policy_test COMMAND poly_hip_value_split_policy_test)
   add_executable(poly_gdn_mma_control_test src/poly/gdn_mma_control_test.cpp)

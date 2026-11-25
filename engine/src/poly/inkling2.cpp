@@ -1,6 +1,7 @@
 // src/poly/inkling2.cpp - the layers of Inkling 2 with a looped core.  The reference for the math is llama.cpp's
 // inkling2 graph (src/models/inkling2.cpp and inkling2-loop.cpp).
 #include "inkling2.hpp"
+#include "dspark_layout.hpp"
 
 #include "runtime.hpp"
 #include "strata/poly/kernels.hpp"
@@ -319,6 +320,9 @@ void Inkling2::ds_open() {
     };
     const MetaValue* arch = ds_file_->get("general.architecture");
     need(arch && arch->s == "dflash" && ds_file_->find("markov_w1.weight"), "general.architecture dflash, markov_w1");
+    const std::string layout = dspark_layout_problem([&](const char* k) { return ds_file_->get(k) != nullptr; },
+                                                     [&](const char* t) { return ds_file_->find(t) != nullptr; });
+    if (!layout.empty()) throw std::runtime_error(opt_.draft_model + ": " + layout);
     const auto key = [&](const char* k) {
         const MetaValue* v = ds_file_->get(std::string("dflash.") + k);
         need(v != nullptr, std::string("dflash.") + k);
