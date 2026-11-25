@@ -15770,6 +15770,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_I8M_AMPERE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cuda/i8_mma.cuh",
+     "line": 992,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "c94431724d",
+   "first_date": "2026-11-25",
+   "since": null,
+   "last_commit": "c94431724d",
+   "last_date": "2026-11-25",
+   "status": "research",
+   "owner": "",
+   "note": "Inkling 2 on sm_86 (Ampere, Ada with 100 KB of shared memory): the weight types (numbers, comma-separated) whose int8 prompt products use Turing's tile shapes instead of the launcher's own pick; unset: four types chosen by measurement, 0: none. Same answers.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_I8M_RAW",
    "backends": [
     "cuda-hip"
