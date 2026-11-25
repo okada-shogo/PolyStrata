@@ -33,7 +33,7 @@
 // bits against a half's 11), its products straight to dst's rows and its rows read by index as the int8 ones are.
 // NVFP4 takes the int8 kernel only with STRATA_PREFILL_NVFP4=w4a8 (nvfp4_w4a8()), on any card that has it.
 //
-// HIP on RDNA3 / RDNA4: the int8 kernel too, NVFP4 included, as on Ampere (--no-prompt-int8 and STRATA_PF_I8MMA=0 turn it off).
+// HIP on RDNA2 / RDNA3 / RDNA4: the int8 kernel too, NVFP4 included, as on Ampere (--no-prompt-int8 and STRATA_PF_I8MMA=0 turn it off).
 #include "mmq.hpp"
 #if STRATA_POLY_X2
 #include "nvfp4_x2.hpp"
@@ -287,9 +287,9 @@ bool nvfp4_w4a8() {
 }
 
 #ifdef STRATA_MMQ_OWN_HIP
-// The int8 kernel on RDNA3's and RDNA4's matrix cores (i8_mma.cuh's i8m_wmma), for the types and rows it takes, in
-// place of the FP16 tiles and the per-expert dequantize + rocBLAS loop.  On by default; --no-prompt-int8 (Inkling 2) or
-// STRATA_PF_I8MMA=0 (every model) turns it off: the FP16 tiles and the BLAS loop, 0.2.20-poly.4's path.  The
+// The int8 kernel on RDNA3's and RDNA4's matrix cores (i8_mma.cuh's i8m_wmma) and RDNA2's dot4, for the types and
+// rows it takes, in place of the FP16 tiles and the per-expert dequantize + rocBLAS loop.  On by default;
+// --no-prompt-int8 (Inkling 2) or STRATA_PF_I8MMA=0 (every model) turns it off: the FP16 tiles and the BLAS loop, 0.2.20-poly.4's path.  The
 // activations are int8 a 32 values there where the halves keep 11 bits, as on CUDA's Ampere and newer by default (the
 // same kernel's numbers, bit for bit), and as llama.cpp's MMQ, which the HIP build used up to 0.1.45.  NVFP4 goes with
 // it unless STRATA_PREFILL_NVFP4 names a mode (w4a8: the same; any other: the halves).

@@ -2,8 +2,9 @@
 // (gemm_iq_i8_grouped, declared in include/strata/kernels/iq_kernels.hpp), for a matrix of any size.  Included once by
 // i8_mma.cu inside its anonymous namespace, after i8_expert.cuh: a weight sub-block is decoded by that file's
 // i8_load / i8_pack / i8_convert (32 values as 8 words of int8, their integer scales and float base), or read by the
-// loaders here and decoded by i8_pack / i8_convert, Q3_K, Q2_K, IQ1_S, MXFP4 and NVFP4 by the decoders here.  CUDA only, Ampere and newer: mma.sync
-// m16n8k32 and m16n8k16 with s8 operands; Turing when asked (gemm_iq_i8_turing()), by m8n8k16.
+// loaders here and decoded by i8_pack / i8_convert, Q3_K, Q2_K, IQ1_S, MXFP4 and NVFP4 by the decoders here.  CUDA, Ampere and newer: mma.sync
+// m16n8k32 and m16n8k16 with s8 operands; Turing when asked (gemm_iq_i8_turing()), by m8n8k16.  HIP: RDNA3 / RDNA4 by
+// v_wmma_i32_16x16x16_iu8 (I8M_WMMA), RDNA2 by the signed dot4 (I8M_DOT4), the same sums.
 //
 // A block: WR = 64 weight rows of one matrix x up to 16 NJ of its activation rows (blockIdx.y walks a matrix's rows
 // in such chunks).  K goes in stages of 256 values; a type of 32-value blocks (MXFP4's too; NVFP4 and Q2_0: 64) may end inside the last one
@@ -183,6 +184,20 @@ __device__ __forceinline__ void i8m_cp_wait() {
 #else
 #define I8M_WMMA 0
 #endif
+// RDNA2 (gfx1030-gfx1036): no matrix cores, the products on the signed dot4 (v_dot4_i32_i8, __dp4a) instead, the same
+// integer sums.  -DSTRATA_I8M_DOT4_ON_WMMA builds that body for an RDNA3 / RDNA4 pass too (v_dot4_i32_iu8), so that
+// it can be checked and timed on a card here (poly_mmq_paths_test's dumps): a test build only.
+#if defined(STRATA_I8M_DOT4_ON_WMMA) && I8M_WMMA
+#undef I8M_WMMA
+#define I8M_WMMA 0
+#define I8M_DOT4 1
+#elif defined(__HIPCC__) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
+                             defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__))
+#define I8M_DOT4 1
+#else
+#define I8M_DOT4 0
+#endif
+#define I8M_HIP (I8M_WMMA || I8M_DOT4)   // a HIP pass with a body of the kernel (its LDS layout, its reads)
 #if I8M_WMMA
 typedef int i8m_v8 __attribute__((ext_vector_type(8)));
 #if I8M_WMMA == 12
@@ -518,7 +533,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                                                     const float* __restrict__ XS, const int32_t* __restrict__ bounds, int ch_per_e,
                                                     const int32_t* __restrict__ ids, const int32_t* __restrict__ from,
                                                     const long long* __restrict__ at, float* __restrict__ Y, long long ldy) {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750) || I8M_WMMA   // (a pass for an older card compiles this empty: the host asks i8m_arch_kernel / i8m_card first)
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750) || I8M_HIP   // (a pass for an older card compiles this empty: the host asks i8m_arch_kernel / i8m_card first)
     using SM = I8mSmem<T, NJ, WR, RAW>;
     constexpr int MT = SM::MT, LDS = SM::LDS, LDB = SM::LDB, XQ = SM::XQ, XSTR = SM::XSTR;
     // NT threads.  A warp multiplies NA tiles of 16 weight rows (two where the activation rows are many: each piece of
@@ -586,7 +601,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
     const bool w_in = n0 + wr < n_out;
     I8P const blob = I8_GPTR(mat + (size_t) n0 * row_bytes);
     const uint32_t row_off = (uint32_t) ((size_t) wr * row_bytes);
-#if !I8M_WMMA   // (HIP: its own tiles, below)
+#if !I8M_HIP   // (HIP: its own tiles, below)
     // its tensor-core tiles: weight rows i0 + 16 a + g and 8 more, activation rows j0 + g as columns, j0 = 8 (CG n + jp)
     const int warp = tid >> 5, g = (tid & 31) >> 2, tg = tid & 3;
     const int i0 = (warp % RG) * 16 * NA, jp = warp / RG;
@@ -646,10 +661,10 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                 }
                 i8m_cp_commit();
             }
-        } else if (I8M_WMMA || w_in) {
+        } else if (I8M_HIP || w_in) {
 #pragma unroll
             for (int part = 0; part < PER; ++part) {
-#if I8M_WMMA
+#if I8M_HIP
                 // HIP: every read is made, of a place inside the matrix where the sub-block is not there (put() then
                 // stores zeros for it), so that no read sits in a branch: the compiler can then count the reads in
                 // flight and does not wait for all of them (the activations' too) before the next
@@ -674,7 +689,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                 else i8_load<T>(blob, i8_offs<T>(row_off_, ib & 3), 2 * S_ + (ib >> 2), wraw[part]);
             }
         }
-#if I8M_WMMA   // (HIP: no read in a branch, as above; put() zeros what is not there)
+#if I8M_HIP   // (HIP: no read in a branch, as above; put() zeros what is not there)
 #pragma unroll
         for (int n = 0; n < NX; ++n) {
             const int tok = NT / 16 * n + (tid >> 4), col = S * 256 + (tid & 15) * 16;
@@ -771,7 +786,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
         }
 #pragma unroll
         for (int n = 0; n < NX; ++n) {
-#if I8M_WMMA   // (fetch() read something in place of what is not there)
+#if I8M_HIP   // (fetch() read something in place of what is not there)
             {
                 const int tok = NT / 16 * n + (tid >> 4);
                 if (!(tok < ntok && S * 256 + (tid & 15) * 16 < K)) {
@@ -784,7 +799,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
             if constexpr (MIN16) {   // the sum of the thread's 16 codes, times their block's scale
                 const int sum = __dp4a((int) xr[n].w, 0x01010101, __dp4a((int) xr[n].z, 0x01010101,
                                        __dp4a((int) xr[n].y, 0x01010101, __dp4a((int) xr[n].x, 0x01010101, 0))));
-#if I8M_WMMA
+#if I8M_HIP
                 s_x16[(tid & 15) * S16 + i8m_xpos(NT / 16 * n + (tid >> 4))] = x16[n] * (float) sum;
 #else
                 s_x16[(tid & 15) * S16 + NT / 16 * n + (tid >> 4)] = x16[n] * (float) sum;
@@ -796,7 +811,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
             const int i = tid + c * NT;
             if (i < MT * 8) {
                 const int tok = i >> 3;
-#if I8M_WMMA   // HIP: by block, [MT] scales then (a type with a minimum) [MT] scale * sum, a row at i8m_xpos()
+#if I8M_HIP   // HIP: by block, [MT] scales then (a type with a minimum) [MT] scale * sum, a row at i8m_xpos()
                 const bool ok = tok < ntok && here(S, i & 7);
                 float* const p = s_xq + (i & 7) * XSTR + i8m_xpos(tok);
                 p[0] = ok ? xdr[c] : 0.0f;
@@ -955,6 +970,117 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
                 const int n = n0 + 16 * (wn * TN + t) + l16;
                 if (n < n_out) out[n] = acc[u][t][i];
             }
+        }
+    }
+#elif I8M_DOT4
+    // HIP without matrix cores (RDNA2): the products on the signed dot4, __dp4a (v_dot4_i32_i8).  Thread tid takes the
+    // weight rows wg + 16 i (i = 0..3, wg = tid % 16) and the activation rows ag + 16 j (ag = tid / 16, j < MT / 16): a
+    // block's 4 x 8 weight words and 8 activation words a row go from LDS into registers once and into 4 x MT / 16
+    // products.  A product as CUDA's and the WMMA bodies', term for term: per 32-value block (per 16 values for a type
+    // with a scale per 16) its integer sum, exact in any order, then sum * (weight scale * activation scale) added to
+    // the float sum, then the minimum's term, the blocks in their order; so the bits are the same.
+    static_assert(NT == 256 && WR == 64, "the dot4 products are written for 256 threads and 64 weight rows");
+    constexpr int TJ = MT / 16;   // activation rows a thread
+    const int wg = tid & 15, ag = tid >> 4;
+    float acc[4][TJ];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < TJ; ++j) acc[i][j] = 0.0f;
+    const auto dot8 = [](const uint4& xa, const uint4& xb, const uint4& wa, const uint4& wb) {
+        int c = __dp4a((int) xa.w, (int) wa.w, __dp4a((int) xa.z, (int) wa.z, __dp4a((int) xa.y, (int) wa.y, __dp4a((int) xa.x, (int) wa.x, 0))));
+        return __dp4a((int) xb.w, (int) wb.w, __dp4a((int) xb.z, (int) wb.z, __dp4a((int) xb.y, (int) wb.y, __dp4a((int) xb.x, (int) wb.x, c))));
+    };
+    const auto multiply = [&]() {
+        if constexpr (TWO) {
+#pragma unroll 2
+            for (int q = 0; q < 16; ++q) {   // a 16-value part
+                uint4 wq[4];
+                float w[4], m16[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int r = wg + 16 * i;
+                    wq[i] = *(const uint4*) (s_w + r * I8M_LD + 4 * q);
+                    w[i] = s_ws[r * LDS + q];
+                    m16[i] = 0.0f;
+                    if constexpr (MIN16) m16[i] = s_m16[r * LDM + q];
+                }
+#pragma unroll
+                for (int j = 0; j < TJ; ++j) {
+                    const int m = ag + 16 * j;
+                    if (m >= ntok) break;
+                    const uint4 xq = *(const uint4*) (s_x + m * I8M_LD + 4 * q);
+                    const float xs = s_xq[(q >> 1) * XSTR + m];
+                    float sm = 0.0f;
+                    if constexpr (MIN16) sm = s_x16[q * S16 + m];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int c = __dp4a((int) xq.w, (int) wq[i].w, __dp4a((int) xq.z, (int) wq[i].z,
+                                      __dp4a((int) xq.y, (int) wq[i].y, __dp4a((int) xq.x, (int) wq[i].x, 0))));
+                        acc[i][j] = fmaf((float) c, w[i] * xs, acc[i][j]);
+                        if constexpr (MIN16) acc[i][j] = fmaf(m16[i], sm, acc[i][j]);
+                    }
+                }
+            }
+        } else {
+#pragma unroll 1
+            for (int kb = 0; kb < 8; ++kb) {   // a 32-value block
+                uint4 wa[4], wb[4];
+                float w[4], mn[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int r = wg + 16 * i;
+                    wa[i] = *(const uint4*) (s_w + r * I8M_LD + 8 * kb);
+                    wb[i] = *(const uint4*) (s_w + r * I8M_LD + 8 * kb + 4);
+                    mn[i] = 0.0f;
+                    if constexpr (SM::PK) {
+                        const float2 v = *(const float2*) (s_ws + r * LDS + 2 * kb);
+                        w[i] = v.x;
+                        mn[i] = v.y;
+                    } else {
+                        w[i] = s_ws[r * LDS + kb];
+                        if constexpr (HAS_MIN) mn[i] = s_wm[r * LDB + kb];
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < TJ; ++j) {
+                    const int m = ag + 16 * j;
+                    if (m >= ntok) break;
+                    const uint4 xa = *(const uint4*) (s_x + m * I8M_LD + 8 * kb), xb = *(const uint4*) (s_x + m * I8M_LD + 8 * kb + 4);
+                    const float xs = s_xq[kb * XSTR + m];
+                    float sm = 0.0f;
+                    if constexpr (HAS_MIN) sm = s_xq[kb * XSTR + MT + m];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        acc[i][j] = fmaf((float) dot8(xa, xb, wa[i], wb[i]), w[i] * xs, acc[i][j]);
+                        if constexpr (HAS_MIN) acc[i][j] = fmaf(mn[i], sm, acc[i][j]);
+                    }
+                }
+            }
+        }
+    };
+    (void) LDB; (void) XQ; (void) LDM; (void) S16;
+
+    const int stages = (K + 255) / 256;
+    fetch(0);
+    for (int S = 0; S < stages; ++S) {
+        i8m_bar();   // the stage before is multiplied (and the tables are written)
+        put(S);
+        i8m_bar();
+        if (S + 1 < stages) fetch(S + 1);   // read while this stage is multiplied
+        multiply();
+    }
+#pragma unroll
+    for (int j = 0; j < TJ; ++j) {
+        const int m = ag + 16 * j;
+        if (m >= ntok) break;
+        const int id = s_id[m];
+        if (id < 0) continue;
+        float* const out = Y + (size_t) id * (size_t) ldy;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int n = n0 + wg + 16 * i;
+            if (n < n_out) out[n] = acc[i][j];
         }
     }
 #else
@@ -1118,7 +1244,7 @@ __global__ void __launch_bounds__(i8m_threads(T, NJ, WR)) i8m_kernel(const uint8
             }
         }
     }
-#endif   // I8M_WMMA
+#endif   // I8M_WMMA / I8M_DOT4
 #endif
 }
 
@@ -1158,13 +1284,15 @@ I8mCard i8m_card() {
     if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return I8mCard{};
     std::lock_guard<std::mutex> lock(mu);
 #if defined(__HIPCC__)
-    // HIP: RDNA3's and RDNA4's matrix cores (i8m_wmma), arch 1100 or 1200; any other AMD card has no pass of the kernel
+    // HIP: RDNA3's and RDNA4's matrix cores (i8m_wmma), arch 1100 or 1200, and RDNA2's dot4 (I8M_DOT4), arch 1030; any
+    // other AMD card has no pass of the kernel
     if (!known[dev].read) {
         I8mCard c;
         c.read = true;
         cudaDeviceProp p;
         if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
-            c.arch = gfx_arch_is_gfx12_wmma(p.gcnArchName) ? 1200 : gfx_arch_is_gfx11_wmma(p.gcnArchName) ? 1100 : 0;
+            c.arch = gfx_arch_is_gfx12_wmma(p.gcnArchName) ? 1200 : gfx_arch_is_gfx11_wmma(p.gcnArchName) ? 1100
+                   : gfx_arch_is_rdna2(p.gcnArchName) ? 1030 : 0;
             c.shared = (size_t) p.sharedMemPerBlock;
             c.shared_sm = (size_t) p.maxSharedMemoryPerMultiProcessor;
         }
