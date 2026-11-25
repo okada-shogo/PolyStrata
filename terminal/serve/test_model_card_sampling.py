@@ -66,7 +66,7 @@ class ModelCardSampling(unittest.TestCase):
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10).read()
-        return StrataEngine.sampling_keys(self.engine.sampling)
+        return StrataEngine.sampling_keys(self.engine.sampling, any_top_k=getattr(self.engine, "poly_engine", False))
 
     def test_tables(self):
         self.assertEqual(model_card_sampling("qwen4exp", True), {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
@@ -168,17 +168,18 @@ class ModelCardSampling(unittest.TestCase):
         self.assertNotIn("penalty_present", k)
 
     def test_inkling_card_sampling(self):
-        # Inkling 2 Mini's generation_config.json: temperature 1.0, nothing else; top_k 0 is "off" (the engine's
-        # widest list, 64).  Run as strata-poly, whose config has no "arch": the tokenizer names the family.
+        # Inkling 2 Mini's generation_config.json: temperature 1.0, nothing else; top_k 0 is "off" (the whole vocabulary on
+        # strata-poly, 64 candidates on the Strata engines).  Run as strata-poly, whose config has no "arch": the tokenizer names the family.
         self.svc.model_arch = None
         self.assertEqual(self.keys(), "")                                   # not Inkling: no card
         self.svc.call_format = "inkling"
         try:
             self.assertEqual(self.svc.card_arch(), "inkling2")
+            self.engine.poly_engine = True                                  # strata-poly: top_k 0 reaches it as 0
             for body in ({}, {"reasoning_effort": "low"}):
                 k = self.keys(**body)
                 self.assertIn("temperature=1.0", k)
-                self.assertIn("top_k=64", k)
+                self.assertIn("top_k=0", k)
                 self.assertNotIn("top_p", k)                                # 1.0 is off
                 self.assertNotIn("min_p", k)
                 self.assertNotIn("penalty", k)
@@ -192,6 +193,7 @@ class ModelCardSampling(unittest.TestCase):
             self.assertIn("temperature=1.0", self.keys())
         finally:
             self.svc.call_format = "function"
+            del self.engine.poly_engine
 
     def test_inkling_sampled_with_a_drafter(self):
         # Inkling's engine keeps a draft only when it is the token it draws, so a draft model (or an --mtp flag)
