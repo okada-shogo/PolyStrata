@@ -282,6 +282,7 @@ from serve.server_parts.http_api import (  # noqa: F401  (moved unchanged, file 
     explicit_no_key,
     host_allowed,
     host_name,
+    is_inkling_config,
     key_list,
     key_matches,
     lift_reasoning_effort_arg,
@@ -5177,7 +5178,8 @@ class Service:
         strata-<model>.shared-settings.json: from the last time this model ran."""
         self.shared_path = str(Path(config_path).with_suffix("")) + ".shared-settings.json"
         try:
-            self.shared = clean_shared_defaults(json.loads(Path(self.shared_path).read_text(encoding="utf-8")))
+            self.shared = clean_shared_defaults(json.loads(Path(self.shared_path).read_text(encoding="utf-8")),
+                                                inkling=self.call_format == "inkling")
             if self.shared:
                 print("[strata] other apps use the settings: " +
                       ", ".join(f"{k}={v}" for k, v in self.shared.items()), flush=True)
@@ -5703,7 +5705,7 @@ class Service:
 
     def set_shared(self, defaults) -> dict:
         """The settings every client gets for what it leaves out; {} / None = clients use their own again."""
-        self.shared = clean_shared_defaults(defaults)
+        self.shared = clean_shared_defaults(defaults, inkling=self.call_format == "inkling")
         if self.shared_path:
             try:
                 if self.shared:
@@ -9741,7 +9743,8 @@ def model_settings(cfg: dict, overrides: dict | None = None) -> dict:
 
     effort = None
     if cfg.get("reasoning_effort") is not None:        # #1641: the thinking level of requests that name none
-        effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}, hy4=hy4_kind.is_hy4(cfg)).get("reasoning_effort")
+        effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}, hy4=hy4_kind.is_hy4(cfg),
+                                       inkling=is_inkling_config(cfg)).get("reasoning_effort")
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise ValueError(f"anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -10520,7 +10523,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.models_root = Path(a.config).resolve().parent   # the other models' configs are beside this one
     if a.config:                                        # the settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
-        svc.shared = load_shared_settings(svc.shared_path)      # #4933: one unknown key no longer clears the rest
+        svc.shared = load_shared_settings(svc.shared_path, inkling=svc.call_format == "inkling")      # #4933: one unknown key no longer clears the rest
         if svc.shared:
             print("[strata] other apps use the settings: " +
                   ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)

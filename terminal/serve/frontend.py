@@ -179,6 +179,22 @@ def use_family(family: str | None) -> None:
     EFFORT.update(_EFFORT_INKLING if family == "inkling" else _EFFORT_QWEN)
 
 
+def inkling_effort(value) -> bool:
+    """Whether Inkling 2's template takes this value: one of its words, or a number from 0 to 0.99 (0 and false:
+    thinking off; a number may be written as a string, as a config's JSON or a request's field can).  The words and
+    numbers a request may send, checked where the family is known (the run config's effort is read before the
+    tokenizer says which family the server runs)."""
+    if isinstance(value, bool):
+        return value is False
+    if isinstance(value, (int, float)):
+        return 0.0 <= float(value) <= 0.99
+    text = str(value).strip()
+    try:
+        return 0.0 <= float(text) <= 0.99
+    except ValueError:
+        return text.lower() in _EFFORT_INKLING
+
+
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400 on Qwen; Hy4-Flash clamps external client efforts into {no_think, high, max}."""
     if value is None or value == "":

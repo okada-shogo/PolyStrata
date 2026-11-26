@@ -739,6 +739,72 @@ class EffortWordsTest(unittest.TestCase):
             self.F.effort_kwargs(0.1)
 
 
+class ConfigEffortTest(unittest.TestCase):
+    """The run config's own "reasoning_effort" takes the same words and numbers as a request (an Inkling 2 server)."""
+
+    def test_the_config_takes_the_templates_words_and_numbers(self):
+        from serve.server import clean_shared_defaults
+        for given, want in (("minimal", "minimal"), ("low", "low"), ("medium", "medium"), ("high", "high"),
+                            ("xhigh", "xhigh"), ("max", "max"), ("none", "none"), (0, 0.0), (0.2, 0.2),
+                            (0.5, 0.5), (0.99, 0.99), ("0.5", 0.5), (" 0.2 ", 0.2), (False, False)):
+            with self.subTest(given=given):
+                self.assertEqual(clean_shared_defaults({"reasoning_effort": given}, inkling=True),
+                                 {"reasoning_effort": want})
+
+    def test_out_of_range_and_unknown_are_refused(self):
+        from serve.server import clean_shared_defaults
+        for given in (1.0, -0.1, 1, "ludicrous", True):
+            with self.subTest(given=given), self.assertRaises(ValueError):
+                clean_shared_defaults({"reasoning_effort": given}, inkling=True)
+
+    def test_other_families_keep_their_table(self):
+        from serve.server import clean_shared_defaults
+        for given in (0.5, "0.5", "minimal", "xhigh", "max"):
+            with self.subTest(given=given), self.assertRaises(ValueError):
+                clean_shared_defaults({"reasoning_effort": given})
+
+    def test_an_inkling_config_is_recognised_before_its_tokenizer(self):
+        from serve.server import is_inkling_config
+        for cfg in ({"arch": "inkling2"}, {"arch": "inkling2_loop"}, {"model_name": "inkling"},
+                    {"args": ["--model", "/models/Inkling-2-Mini-IQ4_NL.gguf"]},
+                    {"tokenizer": "/models/Inkling-2-Mini/tokenizer"}):
+            with self.subTest(cfg=cfg):
+                self.assertTrue(is_inkling_config(cfg))
+        for cfg in ({}, {"arch": "qwen4exp"}, {"model_name": "qwen3.8-flash-next"},
+                    {"args": ["--model", "/models/Qwen3.8-Flash-Next.gguf"]}):
+            with self.subTest(cfg=cfg):
+                self.assertFalse(is_inkling_config(cfg))
+
+    def test_the_config_path_reaches_the_template(self):
+        from serve.server import MockEngine, Service, model_settings
+        import serve.frontend as F
+        self.assertEqual(model_settings({"model_name": "inkling", "reasoning_effort": 0.5})["config_effort"], 0.5)
+        with self.assertRaises(ValueError):                     # other families keep today's startup check
+            model_settings({"model_name": "qwen", "reasoning_effort": 0.5})
+        # the configured level is what a request that names none renders, as the model's own template renders it
+        F.use_family("inkling")
+        self.addCleanup(F.use_family, None)
+        tok = FullInklingTokens()
+        svc = Service(MockEngine(tok, "hi"), tok, model_template())
+        svc.config_effort = 0.5
+        user = [{"role": "user", "content": "Hi"}]
+        req = svc.with_shared({"messages": user}, "openai")
+        self.assertEqual(req["reasoning_effort"], 0.5)
+        self.assertEqual(svc.render_prompt(*openai_to_messages(req)),
+                         model_template().render(user, reasoning_effort=0.5))
+
+    def test_the_shared_file_keeps_an_inkling_number(self):
+        from serve.server import load_shared_settings
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "strata-inkling2.shared-settings.json"
+            path.write_text(json.dumps({"reasoning_effort": 0.5, "temperature": 1.0, "bogus": 1}), encoding="utf-8")
+            said = []
+            got = load_shared_settings(str(path), warn=said.append, inkling=True)
+            self.assertEqual(got, {"reasoning_effort": 0.5, "temperature": 1.0})
+            self.assertEqual(len(said), 1)                      # the unknown key is named, the others stay
+            self.assertEqual(load_shared_settings(str(path), warn=said.append), {"temperature": 1.0})
+
+
 class EffortsMatchTheModelTemplate(unittest.TestCase):
     """Each effort a client can send renders the same prompt as the model's own template given the same effort."""
     USER = [{"role": "user", "content": "Hi"}]

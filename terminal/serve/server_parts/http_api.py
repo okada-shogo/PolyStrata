@@ -314,7 +314,7 @@ SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "to
                "experimental_speed_projection")
 
 
-def load_shared_settings(path, warn=print) -> dict:
+def load_shared_settings(path, warn=print, inkling: bool = False) -> dict:
     """The settings kept next to a config between starts, read so that one bad key cannot erase the others.
 
     The strict reader below belongs to POST /settings, where a client is there to be told which key is wrong and can
@@ -339,14 +339,15 @@ def load_shared_settings(path, warn=print) -> dict:
     out = {}
     for key, value in doc.items():
         try:
-            out.update(clean_shared_defaults({key: value}))
+            out.update(clean_shared_defaults({key: value}, inkling=inkling))
         except ValueError as e:
             warn(f"[strata] one Chat setting in {path} is skipped ({e}); the others still apply")
     return out
 
 
-def clean_shared_defaults(d, hy4: bool = False) -> dict:
-    """The settings other apps get (POST /settings): only known keys, each checked; ValueError names a bad one."""
+def clean_shared_defaults(d, hy4: bool = False, inkling: bool = False) -> dict:
+    """The settings other apps get (POST /settings): only known keys, each checked; ValueError names a bad one.
+    `hy4` / `inkling`: the family whose effort words and numbers the run config and the shared file may use."""
     if d is None:
         return {}
     if not isinstance(d, dict):
@@ -357,7 +358,19 @@ def clean_shared_defaults(d, hy4: bool = False) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high") + (("max",) if hy4 else ()):    # Hy4's template also has max
+            if inkling:                                       # Inkling 2: its own words, or a number from 0 to 0.99
+                from serve.frontend import inkling_effort
+                if not inkling_effort(value):
+                    raise ValueError("reasoning_effort: none, minimal, low, medium, high, xhigh, max or a number "
+                                     "from 0 to 0.99")
+                if isinstance(value, str):
+                    try:
+                        value = float(value.strip())          # "0.5" as a config's JSON string: the number it means
+                    except ValueError:
+                        pass
+                elif number:
+                    value = float(value)
+            elif value not in ("none", "low", "medium", "high") + (("max",) if hy4 else ()):    # Hy4's template also has max
                 raise ValueError("reasoning_effort: none, low, medium, high or max" if hy4
                                  else "reasoning_effort: none, low, medium or high")
         elif key == "temperature":
@@ -662,6 +675,26 @@ def asks_greedy(*layers) -> bool:
         t = (layer or {}).get("temperature")
         if t is not None:
             return isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0
+    return False
+
+
+def is_inkling_config(cfg: dict | None) -> bool:
+    """An Inkling 2 run config, from what the config itself says before its tokenizer is loaded (the tokenizer's
+    `pre` is what Service.call_format reads): its arch, its model name or tokenizer folder, or the model file its
+    args name.  Used where the effort table must be known earlier, as for the config's own "reasoning_effort"."""
+    if not isinstance(cfg, dict):
+        return False
+    if str(cfg.get("arch") or "").strip().lower() in ("inkling2", "inkling2_loop"):
+        return True
+    if "inkling" in str(cfg.get("model_name") or "").lower():
+        return True
+    if "inkling" in str(cfg.get("tokenizer") or "").lower():
+        return True
+    args = cfg.get("args")
+    if isinstance(args, list):
+        for i, x in enumerate(args[:-1]):
+            if x in ("--model", "-m", "--draft-model") and "inkling" in str(args[i + 1]).lower():
+                return True
     return False
 
 
